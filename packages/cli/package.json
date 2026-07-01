@@ -1,0 +1,29 @@
+{
+  "name": "@accounts/cli",
+  "version": "0.0.1",
+  "description": "Command-line interface for accounts company files",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "bin": {
+    "accounts": "./dist/main.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@accounts/core": "workspace:*",
+    "@accounts/storage": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

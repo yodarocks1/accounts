@@ -289,12 +289,14 @@ A first-class, obsessively-tested onramp — this determines adoption.
 
 ### Phase 0 — Foundation (months 0–2)
 - [ ] Finalize name, license, governance docs (this plan → ratified)
-- [ ] Monorepo scaffold, CI, lint rules (incl. no-float-money), ADR process
-- [ ] Core schema v0: accounts, journal, parties, documents, audit log
-- [ ] Ledger engine with property-based test suite
-- [ ] Minimal REST API + CLI; SQLite storage
-- **Exit criteria:** can create a company file, post balanced entries via
-  API/CLI, and produce a correct trial balance.
+- [x] Monorepo scaffold, CI, lint rules (incl. no-float-money), ADR process
+- [x] Core schema v0: accounts, journal, audit log (parties & documents: Phase 1)
+- [x] Ledger engine with property-based test suite (`@accounts/core`)
+- [x] SQLite storage with DB-level immutability triggers (`@accounts/storage`)
+- [x] CLI: init / account add|list / post / reverse / entries / trial-balance (`@accounts/cli`)
+- [ ] Minimal REST API (`@accounts/server`)
+- **Exit criteria (met via CLI):** can create a company file, post balanced
+  entries, and produce a correct trial balance.
 
 ### Phase 1 — Usable books (months 2–6) → **v0.1 alpha**
 - [ ] Web UI shell: chart of accounts, journal entry, register views
