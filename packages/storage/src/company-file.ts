@@ -8,6 +8,7 @@ import {
   buildConversionLines,
   buildReturnLine,
   computeFulfillment,
+  computeRateReview,
   computeRateSuggestions,
   computeStatement,
   computeTrialBalance,
@@ -16,7 +17,7 @@ import {
   deriveTags,
   planChargeCorrection,
   planPosting,
-  resolveRatePrice,
+  resolveRateForQuantity,
   revisionTotal,
   settle,
   validateApplication,
@@ -55,6 +56,8 @@ import {
   type PostingRole,
   type CustomerQuery,
   type CustomerRate,
+  type RateTier,
+  type RateReviewEntry,
   type Party,
   type NewParty,
   type PartyName,
@@ -630,12 +633,36 @@ export class CompanyFile implements ItemCatalog {
     const evalDate = input.effectiveFrom ?? '9999-12-31';
     const salePrice = this.priceAt(input.itemId, evalDate);
     const cost = this.costAt(input.itemId, evalDate);
-    if (input.rate.kind === 'formula' && input.rate.base === 'cost' && cost === undefined) {
-      throw new LedgerError('INVALID_DOCUMENT', 'Cost-based rate requires cost history for the item');
+    const specs = [input.rate, ...(input.tiers ?? []).map((tier) => tier.rate)];
+    for (const spec of specs) {
+      if (spec.kind === 'formula' && spec.base === 'cost' && cost === undefined) {
+        throw new LedgerError('INVALID_DOCUMENT', 'Cost-based rate requires cost history for the item');
+      }
+      if (spec.kind === 'constant' && spec.unitPrice < 0n) {
+        throw new LedgerError('INVALID_DOCUMENT', 'Rates must not be negative');
+      }
     }
-    if (input.rate.kind === 'constant' && input.rate.unitPrice < 0n) {
-      throw new LedgerError('INVALID_DOCUMENT', 'Rates must not be negative');
+    if (input.rate.kind === 'revoked' && (input.tiers?.length ?? 0) > 0) {
+      throw new LedgerError('INVALID_DOCUMENT', 'A revocation cannot carry tiers');
     }
+    const tiers: RateTier[] = (input.tiers ?? []).map((tier, index) => {
+      if (tier.minQuantityMilli === undefined && tier.multipleQuantityMilli === undefined) {
+        throw new LedgerError('INVALID_DOCUMENT', 'A tier needs a minimum quantity and/or an exact multiple');
+      }
+      if ((tier.minQuantityMilli ?? 1n) <= 0n || (tier.multipleQuantityMilli ?? 1n) <= 0n) {
+        throw new LedgerError('INVALID_QUANTITY', 'Tier quantities must be positive');
+      }
+      return {
+        tierNo: index + 1,
+        minQuantityMilli: tier.minQuantityMilli ?? null,
+        multipleQuantityMilli: tier.multipleQuantityMilli ?? null,
+        kind: tier.rate.kind,
+        unitPrice: tier.rate.kind === 'constant' ? tier.rate.unitPrice : null,
+        base: tier.rate.kind === 'formula' ? tier.rate.base : null,
+        percentMilli: tier.rate.kind === 'formula' ? (tier.rate.percentMilli ?? 0n) : 0n,
+        amountMinor: tier.rate.kind === 'formula' ? (tier.rate.amountMinor ?? 0n) : 0n,
+      };
+    });
     const rate: CustomerRate = {
       rateSeq: 0, // assigned below
       itemId: input.itemId,
@@ -650,6 +677,8 @@ export class CompanyFile implements ItemCatalog {
       amountMinor: input.rate.kind === 'formula' ? (input.rate.amountMinor ?? 0n) : 0n,
       allowBelowCost: input.allowBelowCost ?? defaultAllowBelowCost(salePrice, cost),
       effectiveFrom,
+      effectiveTo: input.effectiveTo ?? null,
+      tiers,
       at: new Date().toISOString(),
     };
     let seq = 0;
@@ -657,8 +686,8 @@ export class CompanyFile implements ItemCatalog {
       const result = this.db
         .prepare(
           `INSERT INTO customer_rates
-             (item_id, party_id, customer_name, account_number, kind, unit_price, base, percent_milli, amount_minor, allow_below_cost, effective_from, at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (item_id, party_id, customer_name, account_number, kind, unit_price, base, percent_milli, amount_minor, allow_below_cost, effective_from, effective_to, at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           rate.itemId,
@@ -672,9 +701,17 @@ export class CompanyFile implements ItemCatalog {
           rate.amountMinor,
           rate.allowBelowCost ? 1 : 0,
           rate.effectiveFrom,
+          rate.effectiveTo,
           rate.at,
         );
       seq = Number(result.lastInsertRowid);
+      const insertTier = this.db.prepare(
+        `INSERT INTO customer_rate_tiers (rate_seq, tier_no, min_quantity_milli, multiple_quantity_milli, kind, unit_price, base, percent_milli, amount_minor)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const tier of tiers) {
+        insertTier.run(seq, tier.tierNo, tier.minQuantityMilli, tier.multipleQuantityMilli, tier.kind, tier.unitPrice, tier.base, tier.percentMilli, tier.amountMinor);
+      }
       this.audit('customer_rate.set', 'customer_rate', String(seq), {
         itemId: rate.itemId,
         customerName: rate.customerName,
@@ -702,6 +739,7 @@ export class CompanyFile implements ItemCatalog {
       amount_minor: bigint;
       allow_below_cost: bigint;
       effective_from: string;
+      effective_to: string | null;
       at: string;
     }
     const row = this.db
@@ -717,6 +755,9 @@ export class CompanyFile implements ItemCatalog {
       | RateRow
       | undefined;
     if (!row) return undefined;
+    // Expiry ends special pricing; a revocation record ends it explicitly.
+    if (row.effective_to !== null && date > row.effective_to) return undefined;
+    if (row.kind === 'revoked') return undefined;
     return {
       rateSeq: Number(row.rate_seq),
       itemId: row.item_id,
@@ -730,14 +771,86 @@ export class CompanyFile implements ItemCatalog {
       amountMinor: row.amount_minor,
       allowBelowCost: row.allow_below_cost === 1n,
       effectiveFrom: row.effective_from,
+      effectiveTo: row.effective_to,
+      tiers: this.rateTiers(Number(row.rate_seq)),
       at: row.at,
     };
   }
 
-  customerPriceAt(itemId: string, customer: CustomerQuery, date: string): bigint | undefined {
+  private rateTiers(rateSeq: number): RateTier[] {
+    interface TierRow {
+      tier_no: bigint;
+      min_quantity_milli: bigint | null;
+      multiple_quantity_milli: bigint | null;
+      kind: RateTier['kind'];
+      unit_price: bigint | null;
+      base: RateTier['base'];
+      percent_milli: bigint;
+      amount_minor: bigint;
+    }
+    const rows = this.db
+      .prepare(`SELECT * FROM customer_rate_tiers WHERE rate_seq = ? ORDER BY tier_no`)
+      .all(rateSeq) as TierRow[];
+    return rows.map((row) => ({
+      tierNo: Number(row.tier_no),
+      minQuantityMilli: row.min_quantity_milli,
+      multipleQuantityMilli: row.multiple_quantity_milli,
+      kind: row.kind,
+      unitPrice: row.unit_price,
+      base: row.base,
+      percentMilli: row.percent_milli,
+      amountMinor: row.amount_minor,
+    }));
+  }
+
+  customerPriceAt(
+    itemId: string,
+    customer: CustomerQuery,
+    date: string,
+    quantityMilli: bigint = 1000n,
+  ): bigint | undefined {
     const rate = this.customerRateAt(itemId, customer, date);
     if (!rate) return undefined;
-    return resolveRatePrice(rate, this.priceAt(itemId, date), this.costAt(itemId, date));
+    return resolveRateForQuantity(rate, quantityMilli, this.priceAt(itemId, date), this.costAt(itemId, date));
+  }
+
+  /** "Who has special pricing and is it still sane" (ADR 0009). */
+  rateReview(asOf: string): RateReviewEntry[] {
+    interface AllRateRow {
+      rate_seq: bigint;
+      item_id: string;
+      party_id: string | null;
+      customer_name: string | null;
+      account_number: string | null;
+      kind: CustomerRate['kind'];
+      unit_price: bigint | null;
+      base: CustomerRate['base'];
+      percent_milli: bigint;
+      amount_minor: bigint;
+      allow_below_cost: bigint;
+      effective_from: string;
+      effective_to: string | null;
+      at: string;
+    }
+    const rows = this.db.prepare(`SELECT * FROM customer_rates ORDER BY rate_seq`).all() as AllRateRow[];
+    const rates: CustomerRate[] = rows.map((row) => ({
+      rateSeq: Number(row.rate_seq),
+      itemId: row.item_id,
+      partyId: row.party_id,
+      customerName: row.customer_name,
+      accountNumber: row.account_number,
+      kind: row.kind,
+      unitPrice: row.unit_price,
+      base: row.base,
+      percentMilli: row.percent_milli,
+      amountMinor: row.amount_minor,
+      allowBelowCost: row.allow_below_cost === 1n,
+      effectiveFrom: row.effective_from,
+      effectiveTo: row.effective_to,
+      tiers: this.rateTiers(Number(row.rate_seq)),
+      at: row.at,
+    }));
+    return computeRateReview(rates, this, asOf);
   }
 
   /** "Should this special rate persist?" questions for a document (call after send). */

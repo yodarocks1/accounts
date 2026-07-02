@@ -5,12 +5,15 @@ import { currencyExponent } from './money.js';
 import { divRoundHalf, QUANTITY_SCALE } from './quantity.js';
 import { computeStatement, daysBetween, type AgingRule, type Statement } from './statement.js';
 import {
+  computeRateReview,
   computeRateSuggestions,
   defaultAllowBelowCost,
   rateMatchesCustomer,
-  resolveRatePrice,
+  resolveRateForQuantity,
   type CustomerRate,
   type NewCustomerRate,
+  type RateReviewEntry,
+  type RateTier,
   type SpecialRateSuggestion,
 } from './customer-rates.js';
 import type { NewParty, Party, PartyName } from './parties.js';
@@ -443,10 +446,15 @@ export interface ItemCatalog {
   costAt(itemId: string, date: string): bigint | undefined;
   /**
    * The customer's standing special rate for the item resolved to a unit
-   * price on `date` (below-cost guard applied), or undefined when the
-   * customer has no rate for it (ADR 0007).
+   * price on `date` for the given quantity (tiers and below-cost guard
+   * applied), or undefined when no rate applies (ADR 0007, ADR 0009).
    */
-  customerPriceAt(itemId: string, customer: CustomerQuery, date: string): bigint | undefined;
+  customerPriceAt(
+    itemId: string,
+    customer: CustomerQuery,
+    date: string,
+    quantityMilli?: bigint,
+  ): bigint | undefined;
 }
 
 /** Recorded value of a free item line: at cost, or sales price if lower (ADR 0005). */
@@ -485,7 +493,9 @@ export function resolveDocumentLines(
       // Pricing order (ADR 0007): explicit price → customer rate → catalog.
       unitPrice =
         line.unitPrice ??
-        (item && customer ? catalog.customerPriceAt(item.id, customer, date) : undefined) ??
+        (item && customer
+          ? catalog.customerPriceAt(item.id, customer, date, line.quantityMilli)
+          : undefined) ??
         (item ? catalog.priceAt(item.id, date) : undefined);
     }
     if (unitPrice === undefined) {
@@ -1252,12 +1262,36 @@ export class DocumentBook implements ItemCatalog {
     const evalDate = input.effectiveFrom ?? '9999-12-31';
     const salePrice = this.priceAt(input.itemId, evalDate);
     const cost = this.costAt(input.itemId, evalDate);
-    if (input.rate.kind === 'formula' && input.rate.base === 'cost' && cost === undefined) {
-      throw new LedgerError('INVALID_DOCUMENT', 'Cost-based rate requires cost history for the item');
+    const specs = [input.rate, ...(input.tiers ?? []).map((tier) => tier.rate)];
+    for (const spec of specs) {
+      if (spec.kind === 'formula' && spec.base === 'cost' && cost === undefined) {
+        throw new LedgerError('INVALID_DOCUMENT', 'Cost-based rate requires cost history for the item');
+      }
+      if (spec.kind === 'constant' && spec.unitPrice < 0n) {
+        throw new LedgerError('INVALID_DOCUMENT', 'Rates must not be negative');
+      }
     }
-    if (input.rate.kind === 'constant' && input.rate.unitPrice < 0n) {
-      throw new LedgerError('INVALID_DOCUMENT', 'Rates must not be negative');
+    if (input.rate.kind === 'revoked' && (input.tiers?.length ?? 0) > 0) {
+      throw new LedgerError('INVALID_DOCUMENT', 'A revocation cannot carry tiers');
     }
+    const tiers: RateTier[] = (input.tiers ?? []).map((tier, index) => {
+      if (tier.minQuantityMilli === undefined && tier.multipleQuantityMilli === undefined) {
+        throw new LedgerError('INVALID_DOCUMENT', 'A tier needs a minimum quantity and/or an exact multiple');
+      }
+      if ((tier.minQuantityMilli ?? 1n) <= 0n || (tier.multipleQuantityMilli ?? 1n) <= 0n) {
+        throw new LedgerError('INVALID_QUANTITY', 'Tier quantities must be positive');
+      }
+      return {
+        tierNo: index + 1,
+        minQuantityMilli: tier.minQuantityMilli ?? null,
+        multipleQuantityMilli: tier.multipleQuantityMilli ?? null,
+        kind: tier.rate.kind,
+        unitPrice: tier.rate.kind === 'constant' ? tier.rate.unitPrice : null,
+        base: tier.rate.kind === 'formula' ? tier.rate.base : null,
+        percentMilli: tier.rate.kind === 'formula' ? (tier.rate.percentMilli ?? 0n) : 0n,
+        amountMinor: tier.rate.kind === 'formula' ? (tier.rate.amountMinor ?? 0n) : 0n,
+      };
+    });
     const rate: CustomerRate = {
       rateSeq: this.rates.length + 1,
       itemId: input.itemId,
@@ -1272,6 +1306,8 @@ export class DocumentBook implements ItemCatalog {
       amountMinor: input.rate.kind === 'formula' ? (input.rate.amountMinor ?? 0n) : 0n,
       allowBelowCost: input.allowBelowCost ?? defaultAllowBelowCost(salePrice, cost),
       effectiveFrom,
+      effectiveTo: input.effectiveTo ?? null,
+      tiers,
       at: at ?? new Date().toISOString(),
     };
     this.rates.push(rate);
@@ -1292,13 +1328,28 @@ export class DocumentBook implements ItemCatalog {
         best = rate;
       }
     }
+    if (!best) return undefined;
+    // Expiry ends special pricing (fall back to catalog, not older rates);
+    // a revocation record ends it explicitly (ADR 0009).
+    if (best.effectiveTo !== null && date > best.effectiveTo) return undefined;
+    if (best.kind === 'revoked') return undefined;
     return best;
   }
 
-  customerPriceAt(itemId: string, customer: CustomerQuery, date: string): bigint | undefined {
+  customerPriceAt(
+    itemId: string,
+    customer: CustomerQuery,
+    date: string,
+    quantityMilli: bigint = 1000n,
+  ): bigint | undefined {
     const rate = this.customerRateAt(itemId, customer, date);
     if (!rate) return undefined;
-    return resolveRatePrice(rate, this.priceAt(itemId, date), this.costAt(itemId, date));
+    return resolveRateForQuantity(rate, quantityMilli, this.priceAt(itemId, date), this.costAt(itemId, date));
+  }
+
+  /** "Who has special pricing and is it still sane" (ADR 0009). */
+  rateReview(asOf: string): RateReviewEntry[] {
+    return computeRateReview(this.rates, this, asOf);
   }
 
   /** "Should this special rate persist?" questions for a document (call after send). */

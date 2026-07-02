@@ -106,6 +106,44 @@ describe('return policy persists (Tier 2)', () => {
   });
 });
 
+describe('price breaks and rate hygiene persist (Tier 2)', () => {
+  it('tiers (threshold + exact multiples), expiry, revocation, and review survive reopening', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    file.setCustomerRate({
+      itemId: widget.id, ...acme,
+      rate: { kind: 'constant', unitPrice: 2400n },
+      tiers: [
+        { minQuantityMilli: 50_000n, rate: { kind: 'constant', unitPrice: 2200n } },
+        { multipleQuantityMilli: 12_000n, rate: { kind: 'constant', unitPrice: 2000n } }, // full boxes of 12
+      ],
+      effectiveTo: '2026-12-31',
+    });
+
+    file.close();
+    file = CompanyFile.open(books);
+
+    const priced = (quantityMilli: bigint, number: string, date = '2026-07-01') =>
+      file.createDocument({
+        type: 'invoice', number, date, ...acme,
+        lines: [{ itemId: widget.id, description: 'Widget', quantityMilli }],
+      }).current.lines[0]!.unitPrice;
+
+    expect(priced(5_000n, 'INV-B1')).toBe(2400n);   // loose
+    expect(priced(24_000n, 'INV-B2')).toBe(2000n);  // 2 full boxes
+    expect(priced(25_000n, 'INV-B3')).toBe(2400n);  // broken box
+    expect(priced(60_000n, 'INV-B4')).toBe(2000n);  // boxes beat the 50+ tier
+    expect(priced(5_000n, 'INV-B5', '2027-01-15')).toBe(2500n); // expired → catalog
+
+    // Revocation ends pricing explicitly.
+    file.setCustomerRate({ itemId: widget.id, ...acme, rate: { kind: 'revoked' }, effectiveFrom: '2026-08-01' });
+    expect(priced(24_000n, 'INV-B6', '2026-08-02')).toBe(2500n);
+
+    const review = file.rateReview('2026-08-02');
+    expect(review).toHaveLength(1);
+    expect(review[0]!.active).toBe(false); // the revocation is the standing record
+  });
+});
+
 describe('pre-migration backup (Tier 2)', () => {
   it('snapshots the file before applying migrations', () => {
     // Build a v1-era file, then open it (triggers full migration + backup).

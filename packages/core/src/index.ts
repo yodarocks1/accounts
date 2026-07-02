@@ -95,10 +95,16 @@ export {
   type RateSpec,
   type NewCustomerRate,
   type SpecialRateSuggestion,
+  type RateTier,
+  type NewRateTier,
+  type RateReviewEntry,
   defaultAllowBelowCost,
   rateMatchesCustomer,
   resolveRatePrice,
+  resolveRateForQuantity,
+  marginPercentMilli,
   computeRateSuggestions,
+  computeRateReview,
 } from './customer-rates.js';
 export {
   type AgingRule,

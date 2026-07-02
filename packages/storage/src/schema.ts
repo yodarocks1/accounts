@@ -427,7 +427,74 @@ ALTER TABLE document_revision_lines ADD COLUMN return_condition TEXT
   CHECK (return_condition IS NULL OR return_condition IN ('unopened','opened','damaged'));
 `;
 
+const V11_SQL = `
+-- Tier 2 (ADR 0009 part 2): rates gain expiry and revocation, so the
+-- customer_rates CHECKs must change — SQLite requires a rebuild.
+DROP TRIGGER customer_rates_no_update;
+DROP TRIGGER customer_rates_no_delete;
+DROP INDEX idx_customer_rates_item;
+
+CREATE TABLE customer_rates_v11 (
+  rate_seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id          TEXT NOT NULL REFERENCES items(id),
+  party_id         TEXT REFERENCES parties(id),
+  customer_name    TEXT,
+  account_number   TEXT,
+  kind             TEXT NOT NULL CHECK (kind IN ('constant','formula','revoked')),
+  unit_price       INTEGER CHECK (unit_price IS NULL OR unit_price >= 0),
+  base             TEXT CHECK (base IN ('sale','cost')),
+  percent_milli    INTEGER NOT NULL DEFAULT 0,
+  amount_minor     INTEGER NOT NULL DEFAULT 0,
+  allow_below_cost INTEGER NOT NULL CHECK (allow_below_cost IN (0,1)),
+  effective_from   TEXT NOT NULL,
+  effective_to     TEXT,
+  at               TEXT NOT NULL,
+  CHECK (customer_name IS NOT NULL OR account_number IS NOT NULL OR party_id IS NOT NULL),
+  CHECK ((kind = 'constant') = (unit_price IS NOT NULL)),
+  CHECK ((kind = 'formula') = (base IS NOT NULL))
+) STRICT;
+
+INSERT INTO customer_rates_v11
+    (rate_seq, item_id, party_id, customer_name, account_number, kind, unit_price, base, percent_milli, amount_minor, allow_below_cost, effective_from, effective_to, at)
+  SELECT rate_seq, item_id, party_id, customer_name, account_number, kind, unit_price, base, percent_milli, amount_minor, allow_below_cost, effective_from, NULL, at
+  FROM customer_rates;
+
+DROP TABLE customer_rates;
+ALTER TABLE customer_rates_v11 RENAME TO customer_rates;
+
+CREATE INDEX idx_customer_rates_item ON customer_rates(item_id, effective_from);
+
+CREATE TRIGGER customer_rates_no_update BEFORE UPDATE ON customer_rates
+BEGIN SELECT RAISE(ABORT, 'customer rates are immutable; append a newer rate'); END;
+
+CREATE TRIGGER customer_rates_no_delete BEFORE DELETE ON customer_rates
+BEGIN SELECT RAISE(ABORT, 'customer rates are immutable; append a newer rate'); END;
+
+-- Quantity price breaks: thresholds and/or exact multiples (box/pallet).
+CREATE TABLE customer_rate_tiers (
+  rate_seq                INTEGER NOT NULL REFERENCES customer_rates(rate_seq),
+  tier_no                 INTEGER NOT NULL,
+  min_quantity_milli      INTEGER CHECK (min_quantity_milli IS NULL OR min_quantity_milli > 0),
+  multiple_quantity_milli INTEGER CHECK (multiple_quantity_milli IS NULL OR multiple_quantity_milli > 0),
+  kind                    TEXT NOT NULL CHECK (kind IN ('constant','formula')),
+  unit_price              INTEGER CHECK (unit_price IS NULL OR unit_price >= 0),
+  base                    TEXT CHECK (base IN ('sale','cost')),
+  percent_milli           INTEGER NOT NULL DEFAULT 0,
+  amount_minor            INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (rate_seq, tier_no),
+  CHECK (min_quantity_milli IS NOT NULL OR multiple_quantity_milli IS NOT NULL),
+  CHECK ((kind = 'constant') = (unit_price IS NOT NULL)),
+  CHECK ((kind = 'formula') = (base IS NOT NULL))
+) STRICT;
+
+CREATE TRIGGER customer_rate_tiers_no_update BEFORE UPDATE ON customer_rate_tiers
+BEGIN SELECT RAISE(ABORT, 'rate tiers are immutable; append a newer rate'); END;
+
+CREATE TRIGGER customer_rate_tiers_no_delete BEFORE DELETE ON customer_rate_tiers
+BEGIN SELECT RAISE(ABORT, 'rate tiers are immutable; append a newer rate'); END;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

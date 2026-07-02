@@ -341,6 +341,12 @@ A first-class, obsessively-tested onramp — this determines adoption.
 - [x] Customer special rates: persist-this-rate suggestions after send,
       constant/formula rates (% or $ off sale / over cost), below-cost
       checkbox with loss-leader default (ADR 0007)
+- [x] Payments & credit application, terms with due-date aging, ledger
+      posting via account roles, Party entity (ADR 0008)
+- [x] Return policy (conditions incl. unopened, restocking fees, window,
+      quantity guard), rate expiry/revocation/review, quantity price
+      breaks incl. exact multiples, approval gates, pre-migration
+      backups (ADR 0009)
 - [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging

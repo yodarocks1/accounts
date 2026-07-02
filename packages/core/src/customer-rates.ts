@@ -23,7 +23,8 @@ export interface CustomerRate {
   readonly partyId: string | null;
   readonly customerName: string | null;
   readonly accountNumber: string | null;
-  readonly kind: 'constant' | 'formula';
+  /** 'revoked' explicitly ends special pricing from effectiveFrom (ADR 0009). */
+  readonly kind: 'constant' | 'formula' | 'revoked';
   /** Constant rates only. */
   readonly unitPrice: bigint | null;
   /** Formula rates only. */
@@ -35,7 +36,34 @@ export interface CustomerRate {
   /** May the resolved price drop below the item's cost? (ADR 0007 checkbox) */
   readonly allowBelowCost: boolean;
   readonly effectiveFrom: string;
+  /** Last date this rate applies; expiry falls back to the catalog (ADR 0009). */
+  readonly effectiveTo: string | null;
+  /** Quantity price breaks (ADR 0009): lowest applicable price wins. */
+  readonly tiers: readonly RateTier[];
   readonly at: string;
+}
+
+/**
+ * A quantity price break: applies when the line quantity meets the threshold
+ * and/or is an exact multiple (full box / pallet). At least one condition.
+ */
+export interface RateTier {
+  readonly tierNo: number;
+  /** "This many or more" (scale-3 quantity). */
+  readonly minQuantityMilli: bigint | null;
+  /** "Exact multiples only" — e.g. a full box of 12 (scale-3 quantity). */
+  readonly multipleQuantityMilli: bigint | null;
+  readonly kind: 'constant' | 'formula';
+  readonly unitPrice: bigint | null;
+  readonly base: RateBase | null;
+  readonly percentMilli: bigint;
+  readonly amountMinor: bigint;
+}
+
+export interface NewRateTier {
+  minQuantityMilli?: bigint;
+  multipleQuantityMilli?: bigint;
+  rate: RateSpec;
 }
 
 export type RateSpec =
@@ -47,7 +75,9 @@ export interface NewCustomerRate {
   partyId?: string;
   customerName?: string;
   accountNumber?: string;
-  rate: RateSpec;
+  rate: RateSpec | { kind: 'revoked' };
+  /** Quantity price breaks; lowest applicable price wins (ADR 0009). */
+  tiers?: NewRateTier[];
   /**
    * Defaults to false — unless the item's typical sales price is below its
    * cost on the effective date (ADR 0007).
@@ -55,6 +85,8 @@ export interface NewCustomerRate {
   allowBelowCost?: boolean;
   /** Defaults to the beginning of time. */
   effectiveFrom?: string;
+  /** Last date the rate applies (ADR 0009). */
+  effectiveTo?: string;
 }
 
 /** ADR 0007 default: only loss-leader items may default below cost. */
@@ -102,6 +134,37 @@ export function resolveRatePrice(
 }
 
 /**
+ * Resolve a rate for a specific line quantity (ADR 0009): among the base rate
+ * and every tier whose threshold/multiple condition the quantity meets, the
+ * lowest resulting price wins. Revoked rates resolve to nothing.
+ */
+export function resolveRateForQuantity(
+  rate: Pick<
+    CustomerRate,
+    'kind' | 'unitPrice' | 'base' | 'percentMilli' | 'amountMinor' | 'allowBelowCost' | 'tiers'
+  >,
+  quantityMilli: bigint,
+  salePrice: bigint,
+  cost: bigint | undefined,
+): bigint | undefined {
+  if (rate.kind === 'revoked') return undefined;
+  let best = resolveRatePrice(rate, salePrice, cost);
+  for (const tier of rate.tiers) {
+    if (tier.minQuantityMilli !== null && quantityMilli < tier.minQuantityMilli) continue;
+    if (tier.multipleQuantityMilli !== null && quantityMilli % tier.multipleQuantityMilli !== 0n) continue;
+    const price = resolveRatePrice({ ...tier, allowBelowCost: rate.allowBelowCost }, salePrice, cost);
+    if (price < best) best = price;
+  }
+  return best;
+}
+
+/** Scale-3 margin percent of a price over cost, or null when unknowable. */
+export function marginPercentMilli(price: bigint, cost: bigint | undefined): bigint | null {
+  if (cost === undefined || price <= 0n) return null;
+  return divRoundHalf((price - cost) * PERCENT_SCALE, price);
+}
+
+/**
  * One "should this special rate persist?" question (ADR 0007). Produced when
  * a line was priced differently from what the system would have charged; the
  * proposed rate is prefilled with the most common answer — a constant at the
@@ -122,6 +185,8 @@ export interface SpecialRateSuggestion {
   readonly defaultAllowBelowCost: boolean;
   /** True when the given price is under cost — the UI should flag this. */
   readonly belowCost: boolean;
+  /** Scale-3 margin of the given price over cost (ADR 0009), when known. */
+  readonly marginPercentMilli: bigint | null;
   readonly proposedRate: NewCustomerRate;
 }
 
@@ -149,7 +214,8 @@ export function computeRateSuggestions(
     const item = catalog.getItem(line.itemId);
     if (!item) continue;
     const catalogPrice = catalog.priceAt(line.itemId, current.date);
-    const expectedPrice = catalog.customerPriceAt(line.itemId, customer, current.date) ?? catalogPrice;
+    const expectedPrice =
+      catalog.customerPriceAt(line.itemId, customer, current.date, line.quantityMilli) ?? catalogPrice;
     const givenPrice = perUnitCustomerPrice(line);
     if (givenPrice === expectedPrice) continue;
     seen.add(line.itemId);
@@ -165,6 +231,7 @@ export function computeRateSuggestions(
       cost,
       defaultAllowBelowCost: defaultAllowBelowCost(catalogPrice, cost),
       belowCost: cost !== undefined && givenPrice < cost,
+      marginPercentMilli: marginPercentMilli(givenPrice, cost),
       proposedRate: {
         itemId: line.itemId,
         customerName: current.customerName,
@@ -177,4 +244,65 @@ export function computeRateSuggestions(
     });
   }
   return suggestions;
+}
+
+
+/** One row of the "who has special pricing" report (ADR 0009). */
+export interface RateReviewEntry {
+  readonly rate: CustomerRate;
+  readonly itemName: string;
+  readonly salePrice: bigint;
+  readonly cost: bigint | undefined;
+  /** Resolved for a single unit; undefined when revoked. */
+  readonly resolvedPrice: bigint | undefined;
+  readonly marginPercentMilli: bigint | null;
+  /** Effective as of the review date (not superseded, expired, or revoked). */
+  readonly active: boolean;
+}
+
+/**
+ * Review every customer's special pricing as of a date: the winning rate per
+ * (item, customer) with current sale price, cost, resolved price, and margin.
+ */
+export function computeRateReview(
+  rates: readonly CustomerRate[],
+  catalog: ItemCatalog,
+  asOf: string,
+): RateReviewEntry[] {
+  const winners = new Map<string, CustomerRate>();
+  for (const rate of rates) {
+    if (rate.effectiveFrom > asOf) continue;
+    const key = `${rate.itemId}|${rate.partyId ?? ''}|${rate.accountNumber ?? ''}|${rate.customerName ?? ''}`;
+    const current = winners.get(key);
+    if (
+      !current ||
+      rate.effectiveFrom > current.effectiveFrom ||
+      (rate.effectiveFrom === current.effectiveFrom && rate.rateSeq > current.rateSeq)
+    ) {
+      winners.set(key, rate);
+    }
+  }
+  const entries: RateReviewEntry[] = [];
+  for (const rate of winners.values()) {
+    const item = catalog.getItem(rate.itemId);
+    if (!item) continue;
+    const salePrice = catalog.priceAt(rate.itemId, asOf);
+    const cost = catalog.costAt(rate.itemId, asOf);
+    const expired = rate.effectiveTo !== null && asOf > rate.effectiveTo;
+    const resolvedPrice =
+      expired || rate.kind === 'revoked'
+        ? undefined
+        : resolveRateForQuantity(rate, 1000n, salePrice, cost);
+    entries.push({
+      rate,
+      itemName: item.name,
+      salePrice,
+      cost,
+      resolvedPrice,
+      marginPercentMilli: resolvedPrice === undefined ? null : marginPercentMilli(resolvedPrice, cost),
+      active: !expired && rate.kind !== 'revoked',
+    });
+  }
+  entries.sort((a, b) => (a.itemName === b.itemName ? a.rate.rateSeq - b.rate.rateSeq : a.itemName < b.itemName ? -1 : 1));
+  return entries;
 }
