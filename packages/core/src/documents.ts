@@ -1080,7 +1080,7 @@ export class DocumentBook implements ItemCatalog {
     if (input.customerName === undefined && input.accountNumber === undefined && input.partyId === undefined) {
       throw new LedgerError('INVALID_DOCUMENT', 'A rate needs a party, customer name, or account number');
     }
-    if (input.partyId !== undefined) this.requireParty(input.partyId);
+    const rateParty = input.partyId !== undefined ? this.requireParty(input.partyId) : undefined;
     const effectiveFrom = input.effectiveFrom ?? '0000-01-01';
     // The below-cost default judges the item as of the rate's effective date;
     // for an open-ended rate, judge it by the latest known price and cost.
@@ -1096,9 +1096,10 @@ export class DocumentBook implements ItemCatalog {
     const rate: CustomerRate = {
       rateSeq: this.rates.length + 1,
       itemId: input.itemId,
-      partyId: input.partyId ?? null,
-      customerName: input.customerName ?? null,
-      accountNumber: input.accountNumber ?? null,
+      partyId: rateParty?.id ?? null,
+      // Snapshot of the party's identity at grant time; matching is party-first.
+      customerName: input.customerName ?? rateParty?.name ?? null,
+      accountNumber: input.accountNumber ?? rateParty?.accountNumber ?? null,
       kind: input.rate.kind,
       unitPrice: input.rate.kind === 'constant' ? input.rate.unitPrice : null,
       base: input.rate.kind === 'formula' ? input.rate.base : null,
