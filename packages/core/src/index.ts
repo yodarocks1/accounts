@@ -27,8 +27,10 @@ export {
 export { type TrialBalanceRow, type TrialBalance, computeTrialBalance } from './trial-balance.js';
 export { Ledger } from './ledger.js';
 export { QUANTITY_SCALE, parseQuantity, formatQuantity, divRoundHalf } from './quantity.js';
+export { allocateProportional } from './allocation.js';
 export {
   DOCUMENT_TYPES,
+  CONVERSION_TARGETS,
   type DocumentType,
   type DocumentStatus,
   type RevisionKind,
@@ -42,16 +44,28 @@ export {
   type DocumentChanges,
   type Item,
   type ItemPrice,
+  type PriceKind,
   type NewItem,
   type RevisionContent,
   type ItemCatalog,
+  type LineClosure,
+  type NewLineClosure,
+  type LineFulfillment,
+  type ConversionLine,
+  type ConversionSpec,
   resolveDocumentLines,
   resolveRevisionKind,
   deriveTags,
   documentLabel,
   lineTotal,
+  customerLineTotal,
   revisionTotal,
+  recordedLineTotals,
   validateRevisionContent,
   viewDocument,
+  computeFulfillment,
+  validateConversion,
+  buildConversionLines,
+  planChargeCorrection,
   DocumentBook,
 } from './documents.js';

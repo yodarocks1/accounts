@@ -159,7 +159,47 @@ CREATE TRIGGER document_revision_lines_no_delete BEFORE DELETE ON document_revis
 BEGIN SELECT RAISE(ABORT, 'document revisions are immutable'); END;
 `;
 
+const V3_SQL = `
+-- ADR 0005: price history gains a kind (sale price vs item cost).
+ALTER TABLE item_prices ADD COLUMN kind TEXT NOT NULL DEFAULT 'sale' CHECK (kind IN ('sale','cost'));
+
+-- ADR 0005: stable line identity, conversion links, adjustments, free flags.
+ALTER TABLE document_revision_lines ADD COLUMN line_id TEXT;
+ALTER TABLE document_revision_lines ADD COLUMN source_line_id TEXT;
+ALTER TABLE document_revision_lines ADD COLUMN adjustment INTEGER NOT NULL DEFAULT 0 CHECK (adjustment <= 0);
+ALTER TABLE document_revision_lines ADD COLUMN free INTEGER NOT NULL DEFAULT 0 CHECK (free IN (0,1));
+ALTER TABLE document_revision_lines ADD COLUMN substituted INTEGER NOT NULL DEFAULT 0 CHECK (substituted IN (0,1));
+
+-- Backfill positional line identities for pre-v3 rows (same line_no keeps the
+-- same identity across revisions). Immutability triggers are lifted for the
+-- one-time backfill and restored immediately after.
+DROP TRIGGER document_revision_lines_no_update;
+UPDATE document_revision_lines SET line_id = document_id || '#' || line_no WHERE line_id IS NULL;
+CREATE TRIGGER document_revision_lines_no_update BEFORE UPDATE ON document_revision_lines
+BEGIN SELECT RAISE(ABORT, 'document revisions are immutable'); END;
+
+-- ADR 0005: explicit line closures (unfulfilled / substituted), append-only.
+CREATE TABLE document_line_closures (
+  document_id    TEXT NOT NULL REFERENCES documents(id),
+  closure_seq    INTEGER NOT NULL,
+  line_id        TEXT NOT NULL,
+  kind           TEXT NOT NULL CHECK (kind IN ('unfulfilled','substituted')),
+  quantity_milli INTEGER NOT NULL CHECK (quantity_milli > 0),
+  reason         TEXT,
+  at             TEXT NOT NULL,
+  PRIMARY KEY (document_id, closure_seq)
+) STRICT;
+
+CREATE TRIGGER document_line_closures_no_update BEFORE UPDATE ON document_line_closures
+BEGIN SELECT RAISE(ABORT, 'line closures are immutable'); END;
+
+CREATE TRIGGER document_line_closures_no_delete BEFORE DELETE ON document_line_closures
+BEGIN SELECT RAISE(ABORT, 'line closures are immutable'); END;
+
+CREATE INDEX idx_documents_source ON documents(source_document_id);
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

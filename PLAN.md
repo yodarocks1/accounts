@@ -192,6 +192,20 @@ tags and full history.
   are effective-dated, append-only history; documents snapshot the unit price
   into each line when the line is written.
 
+**Conversion & adjustment semantics (ADR 0005):**
+
+- Estimates convert to sales orders or invoices; sales orders convert to
+  invoices. Conversions may be **partial** and carry **line-level links**
+  (`sourceLineId`) from target back to source. Lines may be explicitly
+  **closed** — unfulfilled or with a substitution — and substitutions may
+  change the price or keep it.
+- **Charge corrections** on sent invoices only ever reduce the total; the
+  reduction spreads pro rata across lines but never takes a line below
+  `quantity × min(item cost, sales price)`.
+- **Free items** show as free to the customer but are recorded at
+  min(cost, sales price), with all recorded amounts scaled so the recorded
+  total equals what was actually charged.
+
 ### 6.3 Parties & items
 
 - **Party** — unified contact (customer and/or vendor roles), addresses, terms,
@@ -319,6 +333,8 @@ A first-class, obsessively-tested onramp — this determines adoption.
 - [ ] Web UI shell: chart of accounts, journal entry, register views
 - [x] Document revision machinery: estimates, sales orders, invoices with
       correction/substitution tagging and snapshot pricing (ADR 0004)
+- [x] Conversions with line-level links, partial fulfillment, closures,
+      charge corrections with cost floors, free items (ADR 0005)
 - [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging

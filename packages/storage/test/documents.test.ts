@@ -151,6 +151,118 @@ describe('schema migrations', () => {
   });
 });
 
+describe('conversions, closures, and adjustments persist (ADR 0005)', () => {
+  it('partial conversion chain with line links and fulfillment survives reopening', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    const estimate = file.createDocument({
+      type: 'estimate', number: 'EST-1', date: '2026-07-01',
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 10000n, lineId: 'E1' }],
+    });
+    file.sendDocument(estimate.id);
+    const order = file.convertDocument(estimate.id, { type: 'sales_order', number: 'SO-1', date: '2026-07-02' });
+    expect(order.current.lines[0]!.sourceLineId).toBe('E1');
+    file.sendDocument(order.id);
+
+    const orderLineId = order.current.lines[0]!.lineId;
+    file.convertDocument(order.id, {
+      type: 'invoice', number: 'INV-1', date: '2026-07-03',
+      lines: [{ sourceLineId: orderLineId, quantityMilli: 4000n }],
+    });
+    file.closeLine(order.id, { lineId: orderLineId, kind: 'unfulfilled', quantityMilli: 1000n, reason: 'reduced' });
+
+    file.close();
+    file = CompanyFile.open(books);
+
+    const state = file.fulfillment(order.id)[0]!;
+    expect(state.convertedMilli).toBe(4000n);
+    expect(state.closedMilli).toBe(1000n);
+    expect(state.openMilli).toBe(5000n);
+    expect(state.status).toBe('partial');
+    expect(file.fulfillment(estimate.id)[0]!.status).toBe('fulfilled');
+    expect(file.lineClosures(order.id)[0]!.reason).toBe('reduced');
+  });
+
+  it('substitution conversions tag target and consume the source line', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    const gadget = file.createItem({ name: 'Gadget', currency: 'USD', unitPrice: 4000n });
+    const order = file.createDocument({
+      type: 'sales_order', number: 'SO-2', date: '2026-07-01',
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n, lineId: 'L1' }],
+    });
+    file.sendDocument(order.id);
+    const invoice = file.convertDocument(order.id, {
+      type: 'invoice', number: 'INV-2', date: '2026-07-02',
+      lines: [{ sourceLineId: 'L1', substitution: { itemId: gadget.id, description: 'Gadget instead', unitPrice: 3000n } }],
+    });
+    expect(invoice.tags).toEqual(['with substitutions']);
+    expect(invoice.current.lines[0]!.substituted).toBe(true);
+    expect(invoice.current.lines[0]!.unitPrice).toBe(3000n);
+    expect(file.fulfillment(order.id)[0]!.status).toBe('fulfilled');
+  });
+
+  it('charge corrections persist with floors honored', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    const gadget = file.createItem({ name: 'Gadget', currency: 'USD', unitPrice: 4000n, cost: 3000n });
+    const invoice = file.createDocument({
+      type: 'invoice', number: 'INV-3', date: '2026-07-01',
+      lines: [
+        { itemId: widget.id, description: 'Widget', quantityMilli: 4000n, lineId: 'L1' }, // 100.00, floor 40.00
+        { itemId: gadget.id, description: 'Gadget', quantityMilli: 2500n, lineId: 'L2' }, // 100.00, floor 75.00
+      ],
+    });
+    file.sendDocument(invoice.id);
+    const corrected = file.chargeCorrection(invoice.id, 12000n, 'charged $120');
+    expect(corrected.total).toBe(12000n);
+    expect(corrected.tags).toEqual(['with corrections']);
+
+    file.close();
+    file = CompanyFile.open(books);
+    const reloaded = file.viewDocument(invoice.id);
+    expect(reloaded.total).toBe(12000n);
+    expect(reloaded.current.lines.map((line) => line.adjustment)).toEqual([-5500n, -2500n]);
+    expect(() => file.chargeCorrection(invoice.id, 11000n)).toThrowError(/floors already total/);
+    expect(() => file.chargeCorrection(invoice.id, 20000n)).toThrowError(/only reduce/);
+  });
+
+  it('free items persist: customer sees free, books scale to the actual total', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    const gadget = file.createItem({ name: 'Gadget', currency: 'USD', unitPrice: 4000n });
+    const invoice = file.createDocument({
+      type: 'invoice', number: 'INV-4', date: '2026-07-01',
+      lines: [
+        { itemId: gadget.id, description: 'Gadget', quantityMilli: 3000n, lineId: 'L1' },
+        { itemId: widget.id, description: 'Widget (free)', quantityMilli: 1000n, free: true, lineId: 'L2' },
+      ],
+    });
+    expect(invoice.total).toBe(12000n);
+    expect(invoice.current.lines[1]!.unitPrice).toBe(1000n); // recorded at cost
+
+    file.close();
+    file = CompanyFile.open(books);
+    const reloaded = file.viewDocument(invoice.id);
+    expect(reloaded.current.lines[1]!.free).toBe(true);
+    expect(reloaded.recordedLineTotals.reduce((a, b) => a + b, 0n)).toBe(12000n);
+    expect(reloaded.recordedLineTotals[1]!).toBe(923n);
+  });
+
+  it('closures are immutable at the database level', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    const order = file.createDocument({
+      type: 'sales_order', number: 'SO-3', date: '2026-07-01',
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n, lineId: 'L1' }],
+    });
+    file.sendDocument(order.id);
+    file.closeLine(order.id, { lineId: 'L1', kind: 'unfulfilled' });
+    const raw = new Database(books);
+    try {
+      expect(() => raw.prepare(`UPDATE document_line_closures SET quantity_milli = 1`).run()).toThrowError(/immutable/);
+      expect(() => raw.prepare(`DELETE FROM document_line_closures`).run()).toThrowError(/immutable/);
+    } finally {
+      raw.close();
+    }
+  });
+});
+
 describe('conformance against the in-memory DocumentBook', () => {
   it('replays the same operations and reaches the same views', () => {
     const reference = new DocumentBook();
@@ -161,22 +273,22 @@ describe('conformance against the in-memory DocumentBook', () => {
       type: 'invoice',
       number: 'INV-C1',
       date: '2026-07-01',
-      lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n }],
+      lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n, lineId: 'L1' }],
     });
     reference.createDocument(
       {
         type: 'invoice',
         number: 'INV-C1',
         date: '2026-07-01',
-        lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n }],
+        lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n, lineId: 'L1' }],
       },
       sqlInvoice.id,
     );
 
     file.sendDocument(sqlInvoice.id);
     reference.sendDocument(sqlInvoice.id);
-    file.changeDocument(sqlInvoice.id, { reason: 'price fix', lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n, unitPrice: 2400n }] });
-    reference.changeDocument(sqlInvoice.id, { reason: 'price fix', lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n, unitPrice: 2400n }] });
+    file.changeDocument(sqlInvoice.id, { reason: 'price fix', lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n, unitPrice: 2400n, lineId: 'L1' }] });
+    reference.changeDocument(sqlInvoice.id, { reason: 'price fix', lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n, unitPrice: 2400n, lineId: 'L1' }] });
 
     const sqlView = file.viewDocument(sqlInvoice.id);
     const referenceView = reference.view(sqlInvoice.id);

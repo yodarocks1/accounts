@@ -17,7 +17,13 @@ export type LedgerErrorCode =
   | 'DOCUMENT_LOCKED'
   | 'INVALID_REVISION_KIND'
   | 'INVALID_DOCUMENT'
-  | 'INVALID_STATUS';
+  | 'INVALID_STATUS'
+  | 'INVALID_ALLOCATION'
+  | 'PRICE_FLOOR'
+  | 'CHARGE_INCREASE'
+  | 'INVALID_CONVERSION'
+  | 'UNKNOWN_LINE'
+  | 'LINE_OVERDRAWN';
 
 export class LedgerError extends Error {
   constructor(
