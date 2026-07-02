@@ -93,8 +93,16 @@ describe('return policy persists (Tier 2)', () => {
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n, unitPrice: 500n }],
     });
     file.sendDocument(approved.id);
-    expect(() => file.chargeCorrection(approved.id, 400n)).toThrowError(/requires an approver/);
-    file.chargeCorrection(approved.id, 400n, 'fix', 'owner');
+
+    // Charge corrections are gated too (on a normally priced invoice — the
+    // below-cost one floors at its own price and can't go lower, per ADR 0005).
+    const normal = file.createDocument({
+      type: 'invoice', number: 'INV-4', date: '2026-06-01', ...acme,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
+    });
+    file.sendDocument(normal.id);
+    expect(() => file.chargeCorrection(normal.id, 2000n)).toThrowError(/requires an approver/);
+    file.chargeCorrection(normal.id, 2000n, 'fix', 'owner');
   });
 });
 
