@@ -535,7 +535,17 @@ DROP TABLE posting_accounts;
 ALTER TABLE posting_accounts_v12 RENAME TO posting_accounts;
 `;
 
+const V13_SQL = `
+-- Tier 3 (ADR 0010 part 2): per-kind auto-numbering sequences.
+CREATE TABLE number_sequences (
+  kind       TEXT PRIMARY KEY CHECK (kind IN ('estimate','sales_order','invoice','credit_memo','payment')),
+  prefix     TEXT NOT NULL,
+  next_value INTEGER NOT NULL CHECK (next_value >= 1),
+  width      INTEGER NOT NULL CHECK (width >= 1)
+) STRICT;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

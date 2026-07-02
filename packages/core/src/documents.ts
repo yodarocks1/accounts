@@ -210,7 +210,8 @@ export interface ConversionLine {
 
 export interface ConversionSpec {
   type: DocumentType;
-  number: string;
+  /** Omit to draw from the type's number sequence (ADR 0010 part 2). */
+  number?: string;
   date: string;
   /** Customer fields inherit from the source document unless overridden. */
   customerName?: string;
@@ -245,6 +246,28 @@ export interface NewTaxRate {
 
 /** When an item requires a deposit on sales orders (ADR 0010 part 3). */
 export type DepositPolicy = 'never' | 'always' | 'when_out_of_stock';
+
+/** What auto-numbering sequences exist for (ADR 0010 part 2). */
+export type SequenceKind = DocumentType | 'payment';
+
+export interface NumberSequence {
+  readonly kind: SequenceKind;
+  readonly prefix: string;
+  readonly next: number;
+  readonly width: number;
+}
+
+export interface NewNumberSequence {
+  prefix: string;
+  /** Defaults to 1. */
+  next?: number;
+  /** Zero-padding width; defaults to 4 (INV-0001). */
+  width?: number;
+}
+
+export function formatSequenceNumber(sequence: Pick<NumberSequence, 'prefix' | 'width'>, value: number): string {
+  return `${sequence.prefix}${String(value).padStart(sequence.width, '0')}`;
+}
 
 /** Condition of a returned item (ADR 0009); unopened usually fees lowest. */
 export const RETURN_CONDITIONS = ['unopened', 'opened', 'damaged'] as const;
@@ -924,7 +947,8 @@ export interface ReturnItem {
 }
 
 export interface NewReturn {
-  number: string;
+  /** Omit to draw from the credit_memo sequence (ADR 0010 part 2). */
+  number?: string;
   date: string;
   customerName?: string;
   accountNumber?: string;
@@ -1065,7 +1089,8 @@ export function planChargeCorrection(
 
 export interface NewDocument {
   type: DocumentType;
-  number: string;
+  /** Omit to draw from the type's number sequence (ADR 0010 part 2). */
+  number?: string;
   date: string;
   lines: NewDocumentLine[];
   /** Required unless partyId supplies it. */
@@ -1128,6 +1153,36 @@ export class DocumentBook implements ItemCatalog {
   private readonly partyNames = new Map<string, PartyName[]>();
   private returnPolicyValue: ReturnPolicy = {};
   private approvalPolicy = new Set<ApprovalAction>();
+  private readonly sequences = new Map<SequenceKind, NumberSequence>();
+
+  // ── Auto-numbering (ADR 0010 part 2) ──────────────────────────────────
+
+  setNumberSequence(kind: SequenceKind, input: NewNumberSequence): NumberSequence {
+    const sequence: NumberSequence = {
+      kind,
+      prefix: input.prefix,
+      next: input.next ?? 1,
+      width: input.width ?? 4,
+    };
+    if (!Number.isInteger(sequence.next) || sequence.next < 1 || !Number.isInteger(sequence.width) || sequence.width < 1) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Sequence next/width must be positive integers');
+    }
+    this.sequences.set(kind, sequence);
+    return sequence;
+  }
+
+  numberSequence(kind: SequenceKind): NumberSequence | undefined {
+    return this.sequences.get(kind);
+  }
+
+  private drawNumber(kind: SequenceKind): string {
+    const sequence = this.sequences.get(kind);
+    if (!sequence) {
+      throw new LedgerError('INVALID_DOCUMENT', `No number provided and no sequence configured for ${kind}`);
+    }
+    this.sequences.set(kind, { ...sequence, next: sequence.next + 1 });
+    return formatSequenceNumber(sequence, sequence.next);
+  }
 
   // ── Policies (ADR 0009) ───────────────────────────────────────────────
 
@@ -1557,12 +1612,8 @@ export class DocumentBook implements ItemCatalog {
     if (!DOCUMENT_TYPES.includes(input.type)) {
       throw new LedgerError('INVALID_DOCUMENT', `Invalid document type: ${String(input.type)}`);
     }
-    const numberKey = `${input.type}:${input.number}`;
-    if (!input.number.trim()) {
+    if (input.number !== undefined && !input.number.trim()) {
       throw new LedgerError('INVALID_DOCUMENT', 'Document number must not be empty');
-    }
-    if (this.numbers.has(numberKey)) {
-      throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Number already in use: ${input.number}`);
     }
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
@@ -1597,10 +1648,15 @@ export class DocumentBook implements ItemCatalog {
         (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
       );
     }
+    const number = input.number?.trim() ?? this.drawNumber(input.type);
+    const numberKey = `${input.type}:${number}`;
+    if (this.numbers.has(numberKey)) {
+      throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Number already in use: ${number}`);
+    }
     const document: DocumentRecord = {
       id,
       type: input.type,
-      number: input.number.trim(),
+      number,
       status: 'draft',
       sourceDocumentId: input.sourceDocumentId ?? null,
       partyId: customer.partyId,
@@ -1712,7 +1768,7 @@ export class DocumentBook implements ItemCatalog {
     return this.createDocument(
       {
         type: spec.type,
-        number: spec.number,
+        ...(spec.number !== undefined ? { number: spec.number } : {}),
         date: spec.date,
         lines,
         sourceDocumentId: sourceId,
@@ -1755,7 +1811,7 @@ export class DocumentBook implements ItemCatalog {
     return this.createDocument(
       {
         type: 'credit_memo',
-        number: input.number,
+        ...(input.number !== undefined ? { number: input.number } : {}),
         date: input.date,
         lines,
         customerName: customer.customerName,
@@ -1808,12 +1864,13 @@ export class DocumentBook implements ItemCatalog {
       throw new LedgerError('INVALID_ALLOCATION', 'Payment amounts must be positive');
     }
     const customer = this.resolveCustomer(input);
-    if ([...this.payments.values()].some((payment) => payment.number === input.number)) {
-      throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Payment number already in use: ${input.number}`);
+    const number = input.number ?? this.drawNumber('payment');
+    if ([...this.payments.values()].some((payment) => payment.number === number)) {
+      throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Payment number already in use: ${number}`);
     }
     const payment: Payment = {
       id,
-      number: input.number,
+      number,
       date: input.date,
       partyId: customer.partyId,
       customerName: customer.customerName,

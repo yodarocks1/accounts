@@ -23,7 +23,8 @@ export interface Payment {
 }
 
 export interface NewPayment {
-  number: string;
+  /** Omit to draw from the payment number sequence (ADR 0010 part 2). */
+  number?: string;
   date: string;
   /** Required unless partyId supplies it. */
   customerName?: string;

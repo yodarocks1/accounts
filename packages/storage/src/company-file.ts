@@ -69,6 +69,10 @@ import {
   type TaxRate,
   type NewTaxRate,
   type DepositPolicy,
+  type SequenceKind,
+  type NumberSequence,
+  type NewNumberSequence,
+  formatSequenceNumber,
   type NewCustomerRate,
   type SpecialRateSuggestion,
   type AgingRule,
@@ -583,6 +587,48 @@ export class CompanyFile implements ItemCatalog {
     return this.getItem(itemId)!;
   }
 
+  // ── Auto-numbering (ADR 0010 part 2) ─────────────────────────────────────
+
+  setNumberSequence(kind: SequenceKind, input: NewNumberSequence): NumberSequence {
+    const sequence: NumberSequence = {
+      kind,
+      prefix: input.prefix,
+      next: input.next ?? 1,
+      width: input.width ?? 4,
+    };
+    if (!Number.isInteger(sequence.next) || sequence.next < 1 || !Number.isInteger(sequence.width) || sequence.width < 1) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Sequence next/width must be positive integers');
+    }
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO number_sequences (kind, prefix, next_value, width) VALUES (?, ?, ?, ?)
+           ON CONFLICT(kind) DO UPDATE SET prefix = excluded.prefix, next_value = excluded.next_value, width = excluded.width`,
+        )
+        .run(kind, sequence.prefix, sequence.next, sequence.width);
+      this.audit('sequence.set', 'number_sequence', kind, { prefix: sequence.prefix, next: sequence.next, width: sequence.width });
+    })();
+    return sequence;
+  }
+
+  numberSequence(kind: SequenceKind): NumberSequence | undefined {
+    const row = this.db
+      .prepare(`SELECT prefix, next_value AS next, width FROM number_sequences WHERE kind = ?`)
+      .get(kind) as { prefix: string; next: bigint; width: bigint } | undefined;
+    if (!row) return undefined;
+    return { kind, prefix: row.prefix, next: Number(row.next), width: Number(row.width) };
+  }
+
+  /** Draw and consume the next number (call inside the insert transaction). */
+  private drawNumber(kind: SequenceKind): string {
+    const sequence = this.numberSequence(kind);
+    if (!sequence) {
+      throw new LedgerError('INVALID_DOCUMENT', `No number provided and no sequence configured for ${kind}`);
+    }
+    this.db.prepare(`UPDATE number_sequences SET next_value = next_value + 1 WHERE kind = ?`).run(kind);
+    return formatSequenceNumber(sequence, sequence.next);
+  }
+
   // ── Tax rates (ADR 0010) ─────────────────────────────────────────────────
 
   /** Append a tax rate; existing documents keep their snapshots. */
@@ -1058,7 +1104,7 @@ export class CompanyFile implements ItemCatalog {
   // ── Documents (ADR 0004) ────────────────────────────────────────────────
 
   createDocument(input: NewDocument): DocumentView {
-    if (!input.number.trim()) {
+    if (input.number !== undefined && !input.number.trim()) {
       throw new LedgerError('INVALID_DOCUMENT', 'Document number must not be empty');
     }
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
@@ -1097,6 +1143,7 @@ export class CompanyFile implements ItemCatalog {
     }
     const id = randomUUID();
     this.db.transaction(() => {
+      const number = input.number?.trim() ?? this.drawNumber(input.type);
       try {
         this.db
           .prepare(
@@ -1106,7 +1153,7 @@ export class CompanyFile implements ItemCatalog {
           .run(
             id,
             input.type,
-            input.number.trim(),
+            number,
             input.sourceDocumentId ?? null,
             inherited.includes('with corrections') ? 1 : 0,
             inherited.includes('with substitutions') ? 1 : 0,
@@ -1115,7 +1162,7 @@ export class CompanyFile implements ItemCatalog {
           );
       } catch (error) {
         if (error instanceof Error && error.message.includes('UNIQUE constraint failed: documents.type, documents.number')) {
-          throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Number already in use: ${input.number}`);
+          throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Number already in use: ${number}`);
         }
         throw error;
       }
@@ -1132,7 +1179,7 @@ export class CompanyFile implements ItemCatalog {
         memo: input.memo ?? null,
         lines,
       });
-      this.audit('document.created', 'document', id, { type: input.type, number: input.number });
+      this.audit('document.created', 'document', id, { type: input.type, number });
     })();
     return this.viewDocument(id);
   }
@@ -1228,7 +1275,7 @@ export class CompanyFile implements ItemCatalog {
     const previous = source.revisions[source.revisions.length - 1]!;
     return this.createDocument({
       type: spec.type,
-      number: spec.number,
+      ...(spec.number !== undefined ? { number: spec.number } : {}),
       date: spec.date,
       lines,
       sourceDocumentId: sourceId,
@@ -1268,7 +1315,7 @@ export class CompanyFile implements ItemCatalog {
     );
     return this.createDocument({
       type: 'credit_memo',
-      number: input.number,
+      ...(input.number !== undefined ? { number: input.number } : {}),
       date: input.date,
       lines,
       customerName: customer.customerName,
@@ -1591,7 +1638,7 @@ export class CompanyFile implements ItemCatalog {
     const customer = this.resolveCustomer(input);
     const payment: Payment = {
       id: randomUUID(),
-      number: input.number,
+      number: input.number ?? '', // resolved inside the transaction
       date: input.date,
       partyId: customer.partyId,
       customerName: customer.customerName,
@@ -1602,7 +1649,9 @@ export class CompanyFile implements ItemCatalog {
       amountMinor: input.amount,
       status: 'received',
     };
+    let resolvedNumber = payment.number;
     this.db.transaction(() => {
+      resolvedNumber = input.number ?? this.drawNumber('payment');
       try {
         this.db
           .prepare(
@@ -1611,7 +1660,7 @@ export class CompanyFile implements ItemCatalog {
           )
           .run(
             payment.id,
-            payment.number,
+            resolvedNumber,
             payment.date,
             payment.partyId,
             payment.customerName,
@@ -1623,12 +1672,12 @@ export class CompanyFile implements ItemCatalog {
           );
       } catch (error) {
         if (error instanceof Error && error.message.includes('UNIQUE constraint failed: payments.number')) {
-          throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Payment number already in use: ${input.number}`);
+          throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Payment number already in use: ${resolvedNumber}`);
         }
         throw error;
       }
       this.audit('payment.recorded', 'payment', payment.id, {
-        number: payment.number,
+        number: resolvedNumber,
         amount: payment.amountMinor.toString(),
         customerName: payment.customerName,
       });
@@ -1644,14 +1693,14 @@ export class CompanyFile implements ItemCatalog {
         this.info().baseCurrency,
         payment.date,
         this.postingAccounts(),
-        `Payment ${payment.number} (${payment.customerName})`,
+        `Payment ${resolvedNumber} (${payment.customerName})`,
       );
       if (plan) {
         const entry = this.postEntry(plan);
         this.recordPosting('payment', payment.id, entry.id, 'post');
       }
     })();
-    return payment;
+    return { ...payment, number: resolvedNumber };
   }
 
   getPayment(id: string): Payment | undefined {

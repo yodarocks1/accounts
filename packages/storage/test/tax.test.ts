@@ -21,6 +21,28 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+describe('auto-numbering persists (Tier 3)', () => {
+  it('draws transactional numbers per kind and survives reopening', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    const lines = [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }];
+    file.setNumberSequence('invoice', { prefix: 'INV-', next: 100, width: 5 });
+    file.setNumberSequence('payment', { prefix: 'PMT-' });
+
+    expect(file.createDocument({ type: 'invoice', date: '2026-07-01', ...acme, lines }).number).toBe('INV-00100');
+    expect(file.createDocument({ type: 'invoice', date: '2026-07-01', ...acme, lines }).number).toBe('INV-00101');
+    expect(file.recordPayment({ date: '2026-07-02', ...acme, amount: 100n }).number).toBe('PMT-0001');
+
+    file.close();
+    file = CompanyFile.open(books);
+    expect(file.numberSequence('invoice')!.next).toBe(102);
+    expect(file.createDocument({ type: 'invoice', date: '2026-07-01', ...acme, lines }).number).toBe('INV-00102');
+
+    expect(() =>
+      file.createDocument({ type: 'estimate', date: '2026-07-01', ...acme, lines }),
+    ).toThrowError(/no sequence configured/);
+  });
+});
+
 describe('sales tax persists (Tier 3)', () => {
   it('snapshots rates onto lines, taxes settlements, and posts the split', () => {
     file.setTaxRate({ code: 'TX', name: 'State tax', percentMilli: 8_250n });
