@@ -28,7 +28,9 @@ export type LedgerErrorCode =
   | 'NO_PURCHASE_HISTORY'
   | 'RETURN_EXCEEDS_PURCHASE'
   | 'RETURN_WINDOW'
-  | 'APPROVAL_REQUIRED';
+  | 'APPROVAL_REQUIRED'
+  | 'UNKNOWN_TAX_CODE'
+  | 'DEPOSIT_REQUIRED';
 
 export class LedgerError extends Error {
   constructor(

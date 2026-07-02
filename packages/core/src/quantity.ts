@@ -6,6 +6,9 @@ import { LedgerError } from './errors.js';
  */
 export const QUANTITY_SCALE = 1000n;
 
+/** Scale-3 percentage: 100% = 100_000n; −10% = −10_000n. */
+export const PERCENT_SCALE = 100_000n;
+
 const QUANTITY_STRING = /^(-?)(\d+)(?:\.(\d{1,3}))?$/;
 
 export function parseQuantity(input: string): bigint {

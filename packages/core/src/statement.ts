@@ -5,7 +5,7 @@ import {
   dueDateOf,
   matchesCustomer,
   matchesCustomerOrParty,
-  revisionTotal,
+  revisionGrandTotal,
   type CustomerQuery,
   type DocumentRecord,
   type DocumentTag,
@@ -160,7 +160,7 @@ export function computeStatement(
 
     if (record.type === 'invoice') {
       const settlement = settle(
-        revisionTotal(current),
+        revisionGrandTotal(current),
         appliedToInvoice(applications, record.id, isSourceActive, asOf),
       );
       const dueDate = dueDateOf(current);
@@ -173,7 +173,7 @@ export function computeStatement(
         date: current.date,
         dueDate,
         poNumber: current.poNumber,
-        originalTotal: revisionTotal(record.revisions[0]!),
+        originalTotal: revisionGrandTotal(record.revisions[0]!),
         currentTotal: settlement.total,
         corrections: record.revisions
           .filter((revision) => revision.kind === 'correction')
@@ -181,7 +181,7 @@ export function computeStatement(
             revisionNo: revision.revisionNo,
             at: revision.at,
             reason: revision.reason,
-            total: revisionTotal(revision),
+            total: revisionGrandTotal(revision),
           })),
         paidAmount: settlement.paid,
         openAmount: settlement.open,
@@ -191,7 +191,7 @@ export function computeStatement(
         tags,
       });
     } else if (record.type === 'credit_memo') {
-      const total = revisionTotal(current);
+      const total = revisionGrandTotal(current);
       const applied =
         record.settlement === 'account'
           ? appliedFromSource(applications, 'credit_memo', record.id, asOf)

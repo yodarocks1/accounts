@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { allocateProportional } from './allocation.js';
 import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
-import { divRoundHalf, QUANTITY_SCALE } from './quantity.js';
+import { divRoundHalf, PERCENT_SCALE, QUANTITY_SCALE } from './quantity.js';
 import { computeStatement, daysBetween, type AgingRule, type Statement } from './statement.js';
 import {
   computeRateReview,
@@ -74,6 +74,10 @@ export interface DocumentLine {
   readonly sourceLineId: string | null;
   /** Condition of a returned item on credit-memo lines (ADR 0009). */
   readonly returnCondition: ReturnCondition | null;
+  /** Tax code applied to this line, or null when untaxed (ADR 0010). */
+  readonly taxCode: string | null;
+  /** Snapshot of the rate effective on the document date (scale-3 %). */
+  readonly taxPercentMilli: bigint;
 }
 
 export interface NewDocumentLine {
@@ -90,6 +94,10 @@ export interface NewDocumentLine {
   sourceDocumentId?: string;
   sourceLineId?: string;
   returnCondition?: ReturnCondition;
+  /** undefined = item default; null = force untaxed (ADR 0010). */
+  taxCode?: string | null;
+  /** Explicit snapshot override (used when copying purchase tax on returns). */
+  taxPercentMilli?: bigint;
 }
 
 export interface DocumentRevision {
@@ -140,8 +148,12 @@ export interface DocumentView {
   readonly tags: readonly DocumentTag[];
   /** e.g. "INV-0001 (with corrections)" */
   readonly label: string;
-  /** What the customer owes/paid: free lines at zero, others at face + adjustment. */
+  /** What the customer owes/paid: subtotal + tax (ADR 0010). */
   readonly total: bigint;
+  /** Pre-tax customer amount. */
+  readonly subtotal: bigint;
+  readonly taxTotal: bigint;
+  readonly taxBreakdown: readonly TaxBreakdownEntry[];
   /**
    * Per-line amounts as booked: free lines at min(cost, sales price) with all
    * lines scaled so these sum exactly to `total` (ADR 0005). Aligned with
@@ -212,6 +224,28 @@ export interface ConversionSpec {
 
 export type PriceKind = 'sale' | 'cost';
 
+/** An effective-dated tax rate, append-only like item prices (ADR 0010). */
+export interface TaxRate {
+  readonly taxSeq: number;
+  readonly code: string;
+  readonly name: string;
+  /** Scale-3 percent: 8.25% = 8_250n. */
+  readonly percentMilli: bigint;
+  readonly effectiveFrom: string;
+  readonly at: string;
+}
+
+export interface NewTaxRate {
+  code: string;
+  name?: string;
+  percentMilli: bigint;
+  /** Defaults to the beginning of time. */
+  effectiveFrom?: string;
+}
+
+/** When an item requires a deposit on sales orders (ADR 0010 part 3). */
+export type DepositPolicy = 'never' | 'always' | 'when_out_of_stock';
+
 /** Condition of a returned item (ADR 0009); unopened usually fees lowest. */
 export const RETURN_CONDITIONS = ['unopened', 'opened', 'damaged'] as const;
 export type ReturnCondition = (typeof RETURN_CONDITIONS)[number];
@@ -243,6 +277,12 @@ export interface Item {
   readonly id: string;
   readonly name: string;
   readonly currency: string;
+  /** Default tax code for lines selling this item (ADR 0010). */
+  readonly taxCode: string | null;
+  /** Deposit requirement on sales orders (ADR 0010 part 3). */
+  readonly depositPolicy: DepositPolicy;
+  /** Manual stock flag until inventory tracking lands (ADR 0010 part 3). */
+  readonly inStock: boolean;
 }
 
 export interface ItemPrice {
@@ -364,11 +404,46 @@ export function customerLineTotal(
   return line.free ? 0n : lineTotal(line) + line.adjustment;
 }
 
-/** What the customer owes for the revision. */
+/** Pre-tax customer subtotal for the revision. */
 export function revisionTotal(revision: Pick<DocumentRevision, 'lines'>): bigint {
   let total = 0n;
   for (const line of revision.lines) total += customerLineTotal(line);
   return total;
+}
+
+export interface TaxBreakdownEntry {
+  readonly taxCode: string;
+  readonly percentMilli: bigint;
+  readonly taxableAmount: bigint;
+  readonly tax: bigint;
+}
+
+/**
+ * Tax per (code, percent) group, rounded half-up once per group (ADR 0010).
+ * Derived entirely from line snapshots — rate changes never reach back.
+ */
+export function revisionTaxBreakdown(revision: Pick<DocumentRevision, 'lines'>): TaxBreakdownEntry[] {
+  const groups = new Map<string, { taxCode: string; percentMilli: bigint; taxableAmount: bigint }>();
+  for (const line of revision.lines) {
+    if (line.taxCode === null || line.taxPercentMilli === 0n) continue;
+    const key = `${line.taxCode}|${line.taxPercentMilli}`;
+    const group = groups.get(key) ?? { taxCode: line.taxCode, percentMilli: line.taxPercentMilli, taxableAmount: 0n };
+    group.taxableAmount += customerLineTotal(line);
+    groups.set(key, group);
+  }
+  return [...groups.values()].map((group) => ({
+    ...group,
+    tax: divRoundHalf(group.taxableAmount * group.percentMilli, PERCENT_SCALE),
+  }));
+}
+
+export function revisionTax(revision: Pick<DocumentRevision, 'lines'>): bigint {
+  return revisionTaxBreakdown(revision).reduce((sum, entry) => sum + entry.tax, 0n);
+}
+
+/** What the customer owes: subtotal plus tax (ADR 0010). */
+export function revisionGrandTotal(revision: Pick<DocumentRevision, 'lines'>): bigint {
+  return revisionTotal(revision) + revisionTax(revision);
 }
 
 /**
@@ -428,6 +503,9 @@ export function validateRevisionContent(content: RevisionContent): string {
     if (!line.free && lineTotal(line) + line.adjustment < 0n) {
       throw new LedgerError('INVALID_DOCUMENT', 'Adjustment cannot push a line below zero');
     }
+    if (line.taxPercentMilli < 0n) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Tax rates must not be negative');
+    }
     currencyExponent(line.currency);
     if (currency === undefined) currency = line.currency;
     else if (currency !== line.currency) {
@@ -455,6 +533,8 @@ export interface ItemCatalog {
     date: string,
     quantityMilli?: bigint,
   ): bigint | undefined;
+  /** The scale-3 percent of a tax code effective on `date` (ADR 0010). */
+  taxRateAt(code: string, date: string): bigint | undefined;
 }
 
 /** Recorded value of a free item line: at cost, or sales price if lower (ADR 0005). */
@@ -478,6 +558,7 @@ export function resolveDocumentLines(
   catalog: ItemCatalog,
   previousLines?: readonly DocumentLine[],
   customer?: CustomerQuery,
+  taxExempt = false,
 ): DocumentLine[] {
   return lines.map((line, index) => {
     const previous = previousLines?.[index];
@@ -508,6 +589,25 @@ export function resolveDocumentLines(
     if (item && currency !== item.currency) {
       throw new LedgerError('CURRENCY_MISMATCH', `Item ${item.name} is priced in ${item.currency}`);
     }
+    // Tax (ADR 0010): explicit code (null = force untaxed) → previous → item
+    // default; a snapshot of the percent effective today rides the line.
+    let taxCode: string | null;
+    if (taxExempt) taxCode = null;
+    else if (line.taxCode !== undefined) taxCode = line.taxCode;
+    else if (previous !== undefined) taxCode = previous.taxCode;
+    else taxCode = item?.taxCode ?? null;
+    let taxPercentMilli = 0n;
+    if (taxCode !== null) {
+      const snapshot =
+        line.taxPercentMilli ??
+        (line.taxCode === undefined && previous !== undefined && previous.taxCode === taxCode
+          ? previous.taxPercentMilli
+          : catalog.taxRateAt(taxCode, date));
+      if (snapshot === undefined) {
+        throw new LedgerError('UNKNOWN_TAX_CODE', `No tax rate for code ${taxCode} effective on ${date}`);
+      }
+      taxPercentMilli = snapshot;
+    }
     return {
       lineId: line.lineId ?? previous?.lineId ?? randomUUID(),
       itemId: item?.id ?? null,
@@ -521,6 +621,8 @@ export function resolveDocumentLines(
       sourceDocumentId: line.sourceDocumentId ?? previous?.sourceDocumentId ?? null,
       sourceLineId: line.sourceLineId ?? previous?.sourceLineId ?? null,
       returnCondition: line.returnCondition ?? previous?.returnCondition ?? null,
+      taxCode,
+      taxPercentMilli,
     };
   });
 }
@@ -602,7 +704,10 @@ export function viewDocument(
     current,
     tags,
     label: documentLabel(document.number, tags),
-    total: revisionTotal(current),
+    total: revisionGrandTotal(current),
+    subtotal: revisionTotal(current),
+    taxTotal: revisionTax(current),
+    taxBreakdown: revisionTaxBreakdown(current),
     recordedLineTotals: recordedLineTotals(current.lines),
     currency: current.lines[0]!.currency,
     revisionCount: document.revisions.length,
@@ -895,6 +1000,11 @@ export function buildReturnLine(
     currency: catalogItem.currency,
     ...(adjustment !== 0n ? { adjustment } : {}),
     returnCondition: condition,
+    // Refund the tax the customer actually paid (ADR 0010): copy the
+    // purchase line's snapshot; explicit-price returns fall back to defaults.
+    ...(purchase
+      ? { taxCode: purchase.line.taxCode, taxPercentMilli: purchase.line.taxPercentMilli }
+      : {}),
     ...(purchase
       ? { sourceDocumentId: purchase.record.id, sourceLineId: purchase.line.lineId }
       : {}),
@@ -993,6 +1103,10 @@ export interface NewItem {
   currency: string;
   unitPrice: bigint;
   cost?: bigint;
+  taxCode?: string;
+  depositPolicy?: DepositPolicy;
+  /** Defaults to true. */
+  inStock?: boolean;
   /** Defaults to the beginning of time. */
   effectiveFrom?: string;
 }
@@ -1092,6 +1206,7 @@ export class DocumentBook implements ItemCatalog {
       name: input.name.trim(),
       accountNumber: input.accountNumber ?? null,
       termsDays: validateTermsDays(input.termsDays) ?? null,
+      taxExempt: input.taxExempt ?? false,
       createdAt: at ?? new Date().toISOString(),
     };
     this.parties.set(id, party);
@@ -1138,7 +1253,14 @@ export class DocumentBook implements ItemCatalog {
     customerName?: string;
     accountNumber?: string;
     termsDays?: number;
-  }): { partyId: string | null; customerName: string; accountNumber?: string; termsDays?: number } {
+    taxExempt?: boolean;
+  }): {
+    partyId: string | null;
+    customerName: string;
+    accountNumber?: string;
+    termsDays?: number;
+    taxExempt: boolean;
+  } {
     const party = input.partyId !== undefined ? this.requireParty(input.partyId) : undefined;
     const customerName = input.customerName ?? party?.name;
     if (customerName === undefined || !customerName.trim()) {
@@ -1151,6 +1273,7 @@ export class DocumentBook implements ItemCatalog {
       customerName: customerName.trim(),
       ...(accountNumber !== undefined ? { accountNumber } : {}),
       ...(termsDays !== undefined ? { termsDays } : {}),
+      taxExempt: input.taxExempt ?? party?.taxExempt ?? false,
     };
   }
 
@@ -1161,7 +1284,14 @@ export class DocumentBook implements ItemCatalog {
       throw new LedgerError('UNKNOWN_ITEM', 'Item name must not be empty');
     }
     currencyExponent(input.currency);
-    const item: Item = { id, name: input.name.trim(), currency: input.currency };
+    const item: Item = {
+      id,
+      name: input.name.trim(),
+      currency: input.currency,
+      taxCode: input.taxCode ?? null,
+      depositPolicy: input.depositPolicy ?? 'never',
+      inStock: input.inStock ?? true,
+    };
     this.items.set(id, item);
     this.prices.set(id, []);
     this.setPrice(id, input.unitPrice, input.effectiveFrom ?? '0000-01-01');
@@ -1243,6 +1373,60 @@ export class DocumentBook implements ItemCatalog {
 
   priceHistory(itemId: string): readonly ItemPrice[] {
     return this.prices.get(itemId) ?? [];
+  }
+
+  /** Manual stock flag until inventory tracking lands (ADR 0010 part 3). */
+  setItemStock(itemId: string, inStock: boolean): Item {
+    const item = this.items.get(itemId);
+    if (!item) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${itemId}`);
+    }
+    const updated: Item = { ...item, inStock };
+    this.items.set(itemId, updated);
+    return updated;
+  }
+
+  // ── Tax rates (ADR 0010) ──────────────────────────────────────────────
+
+  private readonly taxRates: TaxRate[] = [];
+
+  /** Append a tax rate; existing documents keep their snapshots. */
+  setTaxRate(input: NewTaxRate, at?: string): TaxRate {
+    if (!input.code.trim()) {
+      throw new LedgerError('UNKNOWN_TAX_CODE', 'Tax code must not be empty');
+    }
+    if (input.percentMilli < 0n) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Tax rates must not be negative');
+    }
+    const rate: TaxRate = {
+      taxSeq: this.taxRates.length + 1,
+      code: input.code.trim(),
+      name: input.name ?? input.code.trim(),
+      percentMilli: input.percentMilli,
+      effectiveFrom: input.effectiveFrom ?? '0000-01-01',
+      at: at ?? new Date().toISOString(),
+    };
+    this.taxRates.push(rate);
+    return rate;
+  }
+
+  taxRateAt(code: string, date: string): bigint | undefined {
+    let best: TaxRate | undefined;
+    for (const rate of this.taxRates) {
+      if (rate.code !== code || rate.effectiveFrom > date) continue;
+      if (
+        !best ||
+        rate.effectiveFrom > best.effectiveFrom ||
+        (rate.effectiveFrom === best.effectiveFrom && rate.taxSeq > best.taxSeq)
+      ) {
+        best = rate;
+      }
+    }
+    return best?.percentMilli;
+  }
+
+  listTaxRates(): readonly TaxRate[] {
+    return this.taxRates;
   }
 
   // ── Customer special rates (ADR 0007) ─────────────────────────────────
@@ -1364,8 +1548,9 @@ export class DocumentBook implements ItemCatalog {
     date: string,
     previousLines?: readonly DocumentLine[],
     customer?: CustomerQuery,
+    taxExempt = false,
   ): DocumentLine[] {
-    return resolveDocumentLines(lines, date, this, previousLines, customer);
+    return resolveDocumentLines(lines, date, this, previousLines, customer, taxExempt);
   }
 
   createDocument(input: NewDocument, id: string = randomUUID(), at?: string): DocumentView {
@@ -1383,11 +1568,17 @@ export class DocumentBook implements ItemCatalog {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
     const customer = this.resolveCustomer(input);
-    const lines = this.resolveLines(input.lines, input.date, undefined, {
-      customerName: customer.customerName,
-      ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
-      ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
-    });
+    const lines = this.resolveLines(
+      input.lines,
+      input.date,
+      undefined,
+      {
+        customerName: customer.customerName,
+        ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
+        ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
+      },
+      customer.taxExempt,
+    );
     let inheritedTags: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
       const source = this.documents.get(input.sourceDocumentId);
@@ -1692,7 +1883,7 @@ export class DocumentBook implements ItemCatalog {
     return {
       customerName: current.customerName,
       accountNumber: current.accountNumber,
-      total: revisionTotal(current),
+      total: revisionGrandTotal(current),
     };
   }
 
@@ -1755,7 +1946,7 @@ export class DocumentBook implements ItemCatalog {
       (kind, id) => this.isSourceActive(kind, id),
       asOf,
     );
-    return settle(revisionTotal(current), paid);
+    return settle(revisionGrandTotal(current), paid);
   }
 
   listApplications(): readonly CreditApplication[] {

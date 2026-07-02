@@ -18,6 +18,8 @@ import {
   planChargeCorrection,
   planPosting,
   resolveRateForQuantity,
+  revisionGrandTotal,
+  revisionTax,
   revisionTotal,
   settle,
   validateApplication,
@@ -64,6 +66,9 @@ import {
   type ReturnPolicy,
   type ReturnCondition,
   type ApprovalAction,
+  type TaxRate,
+  type NewTaxRate,
+  type DepositPolicy,
   type NewCustomerRate,
   type SpecialRateSuggestion,
   type AgingRule,
@@ -387,13 +392,14 @@ export class CompanyFile implements ItemCatalog {
       name: input.name.trim(),
       accountNumber: input.accountNumber ?? null,
       termsDays: validateTermsDays(input.termsDays) ?? null,
+      taxExempt: input.taxExempt ?? false,
       createdAt: new Date().toISOString(),
     };
     this.db.transaction(() => {
       try {
         this.db
-          .prepare(`INSERT INTO parties (id, account_number, terms_days, created_at) VALUES (?, ?, ?, ?)`)
-          .run(party.id, party.accountNumber, party.termsDays, party.createdAt);
+          .prepare(`INSERT INTO parties (id, account_number, terms_days, tax_exempt, created_at) VALUES (?, ?, ?, ?, ?)`)
+          .run(party.id, party.accountNumber, party.termsDays, party.taxExempt ? 1 : 0, party.createdAt);
       } catch (error) {
         if (error instanceof Error && error.message.includes('UNIQUE constraint failed: parties.account_number')) {
           throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Account number already in use: ${party.accountNumber}`);
@@ -429,17 +435,18 @@ export class CompanyFile implements ItemCatalog {
   getParty(id: string): Party | undefined {
     const row = this.db
       .prepare(
-        `SELECT p.id, p.account_number AS accountNumber, p.terms_days AS termsDays, p.created_at AS createdAt,
+        `SELECT p.id, p.account_number AS accountNumber, p.terms_days AS termsDays, p.tax_exempt AS taxExempt, p.created_at AS createdAt,
                 (SELECT name FROM party_names WHERE party_id = p.id ORDER BY name_seq DESC LIMIT 1) AS name
          FROM parties p WHERE p.id = ?`,
       )
-      .get(id) as { id: string; accountNumber: string | null; termsDays: bigint | null; createdAt: string; name: string } | undefined;
+      .get(id) as { id: string; accountNumber: string | null; termsDays: bigint | null; taxExempt: bigint; createdAt: string; name: string } | undefined;
     if (!row) return undefined;
     return {
       id: row.id,
       name: row.name,
       accountNumber: row.accountNumber,
       termsDays: row.termsDays === null ? null : Number(row.termsDays),
+      taxExempt: row.taxExempt === 1n,
       createdAt: row.createdAt,
     };
   }
@@ -472,7 +479,14 @@ export class CompanyFile implements ItemCatalog {
     customerName?: string;
     accountNumber?: string;
     termsDays?: number;
-  }): { partyId: string | null; customerName: string; accountNumber?: string; termsDays?: number } {
+    taxExempt?: boolean;
+  }): {
+    partyId: string | null;
+    customerName: string;
+    accountNumber?: string;
+    termsDays?: number;
+    taxExempt: boolean;
+  } {
     const party = input.partyId !== undefined ? this.requireParty(input.partyId) : undefined;
     const customerName = input.customerName ?? party?.name;
     if (customerName === undefined || !customerName.trim()) {
@@ -485,6 +499,7 @@ export class CompanyFile implements ItemCatalog {
       customerName: customerName.trim(),
       ...(accountNumber !== undefined ? { accountNumber } : {}),
       ...(termsDays !== undefined ? { termsDays } : {}),
+      taxExempt: input.taxExempt ?? party?.taxExempt ?? false,
     };
   }
 
@@ -509,11 +524,18 @@ export class CompanyFile implements ItemCatalog {
     if (!input.name.trim()) {
       throw new LedgerError('UNKNOWN_ITEM', 'Item name must not be empty');
     }
-    const item: Item = { id: randomUUID(), name: input.name.trim(), currency: input.currency };
+    const item: Item = {
+      id: randomUUID(),
+      name: input.name.trim(),
+      currency: input.currency,
+      taxCode: input.taxCode ?? null,
+      depositPolicy: input.depositPolicy ?? 'never',
+      inStock: input.inStock ?? true,
+    };
     this.db.transaction(() => {
       this.db
-        .prepare(`INSERT INTO items (id, name, currency) VALUES (?, ?, ?)`)
-        .run(item.id, item.name, item.currency);
+        .prepare(`INSERT INTO items (id, name, currency, tax_code, deposit_policy, in_stock) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(item.id, item.name, item.currency, item.taxCode, item.depositPolicy, item.inStock ? 1 : 0);
       this.insertPrice(item.id, 'sale', input.unitPrice, input.effectiveFrom ?? '0000-01-01');
       if (input.cost !== undefined) {
         this.insertPrice(item.id, 'cost', input.cost, input.effectiveFrom ?? '0000-01-01');
@@ -524,14 +546,103 @@ export class CompanyFile implements ItemCatalog {
   }
 
   getItem(id: string): Item | undefined {
-    const row = this.db.prepare(`SELECT id, name, currency FROM items WHERE id = ?`).get(id) as
-      | Item
-      | undefined;
-    return row;
+    interface ItemRow {
+      id: string;
+      name: string;
+      currency: string;
+      tax_code: string | null;
+      deposit_policy: DepositPolicy;
+      in_stock: bigint;
+    }
+    const row = this.db.prepare(`SELECT * FROM items WHERE id = ?`).get(id) as ItemRow | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      name: row.name,
+      currency: row.currency,
+      taxCode: row.tax_code,
+      depositPolicy: row.deposit_policy,
+      inStock: row.in_stock === 1n,
+    };
   }
 
   listItems(): Item[] {
-    return this.db.prepare(`SELECT id, name, currency FROM items ORDER BY name`).all() as Item[];
+    const rows = this.db.prepare(`SELECT id FROM items ORDER BY name`).all() as { id: string }[];
+    return rows.map((row) => this.getItem(row.id)!);
+  }
+
+  /** Manual stock flag until inventory tracking lands (ADR 0010 part 3). */
+  setItemStock(itemId: string, inStock: boolean): Item {
+    if (!this.getItem(itemId)) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${itemId}`);
+    }
+    this.db.transaction(() => {
+      this.db.prepare(`UPDATE items SET in_stock = ? WHERE id = ?`).run(inStock ? 1 : 0, itemId);
+      this.audit('item.stock_set', 'item', itemId, { inStock });
+    })();
+    return this.getItem(itemId)!;
+  }
+
+  // ── Tax rates (ADR 0010) ─────────────────────────────────────────────────
+
+  /** Append a tax rate; existing documents keep their snapshots. */
+  setTaxRate(input: NewTaxRate): TaxRate {
+    if (!input.code.trim()) {
+      throw new LedgerError('UNKNOWN_TAX_CODE', 'Tax code must not be empty');
+    }
+    if (input.percentMilli < 0n) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Tax rates must not be negative');
+    }
+    const rate = {
+      code: input.code.trim(),
+      name: input.name ?? input.code.trim(),
+      percentMilli: input.percentMilli,
+      effectiveFrom: input.effectiveFrom ?? '0000-01-01',
+      at: new Date().toISOString(),
+    };
+    let seq = 0;
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(`INSERT INTO tax_rates (code, name, percent_milli, effective_from, at) VALUES (?, ?, ?, ?, ?)`)
+        .run(rate.code, rate.name, rate.percentMilli, rate.effectiveFrom, rate.at);
+      seq = Number(result.lastInsertRowid);
+      this.audit('tax.rate_set', 'tax_rate', rate.code, {
+        percentMilli: rate.percentMilli.toString(),
+        effectiveFrom: rate.effectiveFrom,
+      });
+    })();
+    return { taxSeq: seq, ...rate };
+  }
+
+  taxRateAt(code: string, date: string): bigint | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT percent_milli AS percentMilli FROM tax_rates
+         WHERE code = ? AND effective_from <= ?
+         ORDER BY effective_from DESC, tax_seq DESC LIMIT 1`,
+      )
+      .get(code, date) as { percentMilli: bigint } | undefined;
+    return row?.percentMilli;
+  }
+
+  listTaxRates(): TaxRate[] {
+    interface TaxRow {
+      tax_seq: bigint;
+      code: string;
+      name: string;
+      percent_milli: bigint;
+      effective_from: string;
+      at: string;
+    }
+    const rows = this.db.prepare(`SELECT * FROM tax_rates ORDER BY tax_seq`).all() as TaxRow[];
+    return rows.map((row) => ({
+      taxSeq: Number(row.tax_seq),
+      code: row.code,
+      name: row.name,
+      percentMilli: row.percent_milli,
+      effectiveFrom: row.effective_from,
+      at: row.at,
+    }));
   }
 
   /** Append a sales-price record; never touches existing documents (ADR 0004). */
@@ -954,11 +1065,18 @@ export class CompanyFile implements ItemCatalog {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
     const customer = this.resolveCustomer(input);
-    const lines = resolveDocumentLines(input.lines, input.date, this, undefined, {
-      customerName: customer.customerName,
-      ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
-      ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
-    });
+    const lines = resolveDocumentLines(
+      input.lines,
+      input.date,
+      this,
+      undefined,
+      {
+        customerName: customer.customerName,
+        ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
+        ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
+      },
+      customer.taxExempt,
+    );
     let inherited: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
       const source = this.getDocumentRecord(input.sourceDocumentId);
@@ -1335,6 +1453,8 @@ export class CompanyFile implements ItemCatalog {
       source_document_id: string | null;
       source_line_id: string | null;
       return_condition: ReturnCondition | null;
+      tax_code: string | null;
+      tax_percent_milli: bigint;
     }
     const lineRows = this.db
       .prepare(`SELECT * FROM document_revision_lines WHERE document_id = ? ORDER BY revision_no, line_no`)
@@ -1382,6 +1502,8 @@ export class CompanyFile implements ItemCatalog {
           sourceDocumentId: line.source_document_id ?? (line.source_line_id !== null ? row.source_document_id : null),
           sourceLineId: line.source_line_id,
           returnCondition: line.return_condition,
+          taxCode: line.tax_code,
+          taxPercentMilli: line.tax_percent_milli,
         })),
       })),
     };
@@ -1433,8 +1555,8 @@ export class CompanyFile implements ItemCatalog {
       );
     const insertLine = this.db.prepare(
       `INSERT INTO document_revision_lines
-         (document_id, revision_no, line_no, line_id, item_id, description, quantity_milli, unit_price, currency, adjustment, free, substituted, source_document_id, source_line_id, return_condition)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (document_id, revision_no, line_no, line_id, item_id, description, quantity_milli, unit_price, currency, adjustment, free, substituted, source_document_id, source_line_id, return_condition, tax_code, tax_percent_milli)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     revision.lines.forEach((line, index) => {
       insertLine.run(
@@ -1453,6 +1575,8 @@ export class CompanyFile implements ItemCatalog {
         line.sourceDocumentId,
         line.sourceLineId,
         line.returnCondition,
+        line.taxCode,
+        line.taxPercentMilli,
       );
     });
   }
@@ -1721,7 +1845,7 @@ export class CompanyFile implements ItemCatalog {
     return {
       customerName: current.customerName,
       accountNumber: current.accountNumber,
-      total: revisionTotal(current),
+      total: revisionGrandTotal(current),
     };
   }
 
@@ -1735,7 +1859,7 @@ export class CompanyFile implements ItemCatalog {
       (kind, id) => this.isSourceActive(kind, id),
       asOf,
     );
-    return settle(revisionTotal(current), paid);
+    return settle(revisionGrandTotal(current), paid);
   }
 
   // ── Ledger posting (Tier 1, ADR 0008 part 3) ────────────────────────────
@@ -1833,6 +1957,7 @@ export class CompanyFile implements ItemCatalog {
       current.date,
       this.postingAccounts(),
       `${record.number} (${current.customerName})`,
+      revisionTax(current),
     );
     if (!plan) return;
     const entry = this.postEntry(plan);

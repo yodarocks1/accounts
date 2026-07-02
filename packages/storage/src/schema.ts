@@ -494,7 +494,48 @@ CREATE TRIGGER customer_rate_tiers_no_delete BEFORE DELETE ON customer_rate_tier
 BEGIN SELECT RAISE(ABORT, 'rate tiers are immutable; append a newer rate'); END;
 `;
 
+const V12_SQL = `
+-- Tier 3 (ADR 0010 part 1): sales tax. Rates are append-only history;
+-- lines snapshot the code + percent effective on the document date.
+CREATE TABLE tax_rates (
+  tax_seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+  code           TEXT NOT NULL CHECK (length(trim(code)) > 0),
+  name           TEXT NOT NULL,
+  percent_milli  INTEGER NOT NULL CHECK (percent_milli >= 0),
+  effective_from TEXT NOT NULL,
+  at             TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX idx_tax_rates_code ON tax_rates(code, effective_from);
+
+CREATE TRIGGER tax_rates_no_update BEFORE UPDATE ON tax_rates
+BEGIN SELECT RAISE(ABORT, 'tax rates are immutable; append a newer rate'); END;
+
+CREATE TRIGGER tax_rates_no_delete BEFORE DELETE ON tax_rates
+BEGIN SELECT RAISE(ABORT, 'tax rates are immutable; append a newer rate'); END;
+
+ALTER TABLE items ADD COLUMN tax_code TEXT;
+ALTER TABLE items ADD COLUMN deposit_policy TEXT NOT NULL DEFAULT 'never'
+  CHECK (deposit_policy IN ('never','always','when_out_of_stock'));
+ALTER TABLE items ADD COLUMN in_stock INTEGER NOT NULL DEFAULT 1 CHECK (in_stock IN (0,1));
+
+ALTER TABLE document_revision_lines ADD COLUMN tax_code TEXT;
+ALTER TABLE document_revision_lines ADD COLUMN tax_percent_milli INTEGER NOT NULL DEFAULT 0
+  CHECK (tax_percent_milli >= 0);
+
+ALTER TABLE parties ADD COLUMN tax_exempt INTEGER NOT NULL DEFAULT 0 CHECK (tax_exempt IN (0,1));
+
+-- posting_accounts gains the sales_tax_payable role (CHECK rebuild).
+CREATE TABLE posting_accounts_v12 (
+  role       TEXT PRIMARY KEY CHECK (role IN ('accounts_receivable','sales_income','cash','sales_tax_payable')),
+  account_id TEXT NOT NULL REFERENCES accounts(id)
+) STRICT;
+INSERT INTO posting_accounts_v12 SELECT role, account_id FROM posting_accounts;
+DROP TABLE posting_accounts;
+ALTER TABLE posting_accounts_v12 RENAME TO posting_accounts;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

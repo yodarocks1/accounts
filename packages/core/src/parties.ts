@@ -11,6 +11,8 @@ export interface Party {
   readonly accountNumber: string | null;
   /** Default payment terms for new documents. */
   readonly termsDays: number | null;
+  /** Exempt customers get no tax codes on their documents (ADR 0010). */
+  readonly taxExempt: boolean;
   readonly createdAt: string;
 }
 
@@ -18,6 +20,7 @@ export interface NewParty {
   name: string;
   accountNumber?: string;
   termsDays?: number;
+  taxExempt?: boolean;
 }
 
 export interface PartyName {

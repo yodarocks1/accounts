@@ -1,14 +1,12 @@
 import { LedgerError } from './errors.js';
-import { divRoundHalf } from './quantity.js';
+import { divRoundHalf, PERCENT_SCALE } from './quantity.js';
+export { PERCENT_SCALE };
 import {
   perUnitCustomerPrice,
   type CustomerQuery,
   type DocumentRecord,
   type ItemCatalog,
 } from './documents.js';
-
-/** Scale-3 percentage: 100% = 100_000n; −10% = −10_000n. */
-export const PERCENT_SCALE = 100_000n;
 
 export type RateBase = 'sale' | 'cost';
 
