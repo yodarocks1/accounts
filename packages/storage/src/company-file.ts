@@ -5,11 +5,14 @@ import {
   buildConversionLines,
   buildReturnLine,
   computeFulfillment,
+  computeRateSuggestions,
   computeStatement,
   computeTrialBalance,
   currencyExponent,
+  defaultAllowBelowCost,
   deriveTags,
   planChargeCorrection,
+  resolveRatePrice,
   resolveDocumentLines,
   resolveRevisionKind,
   validateConversion,
@@ -39,6 +42,9 @@ import {
   type NewReturn,
   type PriceKind,
   type CustomerQuery,
+  type CustomerRate,
+  type NewCustomerRate,
+  type SpecialRateSuggestion,
   type AgingRule,
   type Statement,
   type TrialBalance,
@@ -455,6 +461,129 @@ export class CompanyFile implements ItemCatalog {
     return rows.map((row) => ({ ...row, priceSeq: Number(row.priceSeq) }));
   }
 
+  // ── Customer special rates (ADR 0007) ───────────────────────────────────
+
+  /** Persist a standing special rate — the "yes" answer to a suggestion. */
+  setCustomerRate(input: NewCustomerRate): CustomerRate {
+    if (!this.getItem(input.itemId)) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${input.itemId}`);
+    }
+    if (input.customerName === undefined && input.accountNumber === undefined) {
+      throw new LedgerError('INVALID_DOCUMENT', 'A rate needs a customer name or account number');
+    }
+    const effectiveFrom = input.effectiveFrom ?? '0000-01-01';
+    const evalDate = input.effectiveFrom ?? '9999-12-31';
+    const salePrice = this.priceAt(input.itemId, evalDate);
+    const cost = this.costAt(input.itemId, evalDate);
+    if (input.rate.kind === 'formula' && input.rate.base === 'cost' && cost === undefined) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Cost-based rate requires cost history for the item');
+    }
+    if (input.rate.kind === 'constant' && input.rate.unitPrice < 0n) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Rates must not be negative');
+    }
+    const rate: CustomerRate = {
+      rateSeq: 0, // assigned below
+      itemId: input.itemId,
+      customerName: input.customerName ?? null,
+      accountNumber: input.accountNumber ?? null,
+      kind: input.rate.kind,
+      unitPrice: input.rate.kind === 'constant' ? input.rate.unitPrice : null,
+      base: input.rate.kind === 'formula' ? input.rate.base : null,
+      percentMilli: input.rate.kind === 'formula' ? (input.rate.percentMilli ?? 0n) : 0n,
+      amountMinor: input.rate.kind === 'formula' ? (input.rate.amountMinor ?? 0n) : 0n,
+      allowBelowCost: input.allowBelowCost ?? defaultAllowBelowCost(salePrice, cost),
+      effectiveFrom,
+      at: new Date().toISOString(),
+    };
+    let seq = 0;
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO customer_rates
+             (item_id, customer_name, account_number, kind, unit_price, base, percent_milli, amount_minor, allow_below_cost, effective_from, at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          rate.itemId,
+          rate.customerName,
+          rate.accountNumber,
+          rate.kind,
+          rate.unitPrice,
+          rate.base,
+          rate.percentMilli,
+          rate.amountMinor,
+          rate.allowBelowCost ? 1 : 0,
+          rate.effectiveFrom,
+          rate.at,
+        );
+      seq = Number(result.lastInsertRowid);
+      this.audit('customer_rate.set', 'customer_rate', String(seq), {
+        itemId: rate.itemId,
+        customerName: rate.customerName,
+        accountNumber: rate.accountNumber,
+        kind: rate.kind,
+        allowBelowCost: rate.allowBelowCost,
+        effectiveFrom: rate.effectiveFrom,
+      });
+    })();
+    return { ...rate, rateSeq: seq };
+  }
+
+  /** Latest rate for (item, customer) effective on `date`; later records win. */
+  customerRateAt(itemId: string, customer: CustomerQuery, date: string): CustomerRate | undefined {
+    interface RateRow {
+      rate_seq: bigint;
+      item_id: string;
+      customer_name: string | null;
+      account_number: string | null;
+      kind: CustomerRate['kind'];
+      unit_price: bigint | null;
+      base: CustomerRate['base'];
+      percent_milli: bigint;
+      amount_minor: bigint;
+      allow_below_cost: bigint;
+      effective_from: string;
+      at: string;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT * FROM customer_rates
+         WHERE item_id = ? AND effective_from <= ?
+           AND ((account_number IS NOT NULL AND account_number = ?)
+             OR (account_number IS NULL AND customer_name = ?))
+         ORDER BY effective_from DESC, rate_seq DESC LIMIT 1`,
+      )
+      .get(itemId, date, customer.accountNumber ?? null, customer.customerName ?? null) as
+      | RateRow
+      | undefined;
+    if (!row) return undefined;
+    return {
+      rateSeq: Number(row.rate_seq),
+      itemId: row.item_id,
+      customerName: row.customer_name,
+      accountNumber: row.account_number,
+      kind: row.kind,
+      unitPrice: row.unit_price,
+      base: row.base,
+      percentMilli: row.percent_milli,
+      amountMinor: row.amount_minor,
+      allowBelowCost: row.allow_below_cost === 1n,
+      effectiveFrom: row.effective_from,
+      at: row.at,
+    };
+  }
+
+  customerPriceAt(itemId: string, customer: CustomerQuery, date: string): bigint | undefined {
+    const rate = this.customerRateAt(itemId, customer, date);
+    if (!rate) return undefined;
+    return resolveRatePrice(rate, this.priceAt(itemId, date), this.costAt(itemId, date));
+  }
+
+  /** "Should this special rate persist?" questions for a document (call after send). */
+  suggestSpecialRates(documentId: string): SpecialRateSuggestion[] {
+    return computeRateSuggestions(this.requireDocumentRecord(documentId), this);
+  }
+
   // ── Documents (ADR 0004) ────────────────────────────────────────────────
 
   createDocument(input: NewDocument): DocumentView {
@@ -464,7 +593,10 @@ export class CompanyFile implements ItemCatalog {
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
-    const lines = resolveDocumentLines(input.lines, input.date, this);
+    const lines = resolveDocumentLines(input.lines, input.date, this, undefined, {
+      customerName: input.customerName,
+      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+    });
     let inherited: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
       const source = this.getDocumentRecord(input.sourceDocumentId);
@@ -521,11 +653,15 @@ export class CompanyFile implements ItemCatalog {
     const kind = resolveRevisionKind(document.type, document.status, changes.kind);
     const previous = document.revisions[document.revisions.length - 1]!;
     const date = changes.date ?? previous.date;
+    const customerName = changes.customerName ?? previous.customerName;
+    const accountNumber = changes.accountNumber ?? previous.accountNumber;
     const lines =
       changes.lines !== undefined
-        ? resolveDocumentLines(changes.lines, date, this, previous.lines)
+        ? resolveDocumentLines(changes.lines, date, this, previous.lines, {
+            customerName,
+            ...(accountNumber !== null ? { accountNumber } : {}),
+          })
         : [...previous.lines];
-    const customerName = changes.customerName ?? previous.customerName;
     validateRevisionContent({ date, lines, customerName });
     // ADR 0006: never orphan downstream links or over-consume a shrunk line.
     validateLineConsumption(lines, this.fulfillment(id));

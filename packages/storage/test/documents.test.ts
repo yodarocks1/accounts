@@ -353,6 +353,82 @@ describe('returns, statements, customer identity (ADR 0006)', () => {
   });
 });
 
+describe('customer special rates persist (ADR 0007)', () => {
+  const acme = { customerName: 'Acme LLC', accountNumber: 'A-100' };
+
+  it('suggests, saves, applies, and survives reopening', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    const invoice = file.createDocument({
+      type: 'invoice', number: 'INV-RT1', date: '2026-07-01', ...acme,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n, unitPrice: 2000n }],
+    });
+    file.sendDocument(invoice.id);
+
+    const suggestions = file.suggestSpecialRates(invoice.id);
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0]!.givenPrice).toBe(2000n);
+    expect(suggestions[0]!.defaultAllowBelowCost).toBe(false);
+
+    const rate = file.setCustomerRate(suggestions[0]!.proposedRate);
+    expect(rate.allowBelowCost).toBe(false);
+
+    file.close();
+    file = CompanyFile.open(books);
+
+    // Applies to new documents after reopening…
+    const next = file.createDocument({
+      type: 'invoice', number: 'INV-RT2', date: '2026-07-05', ...acme,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n }],
+    });
+    expect(next.current.lines[0]!.unitPrice).toBe(2000n);
+    // …and the question has retired itself.
+    file.sendDocument(next.id);
+    expect(file.suggestSpecialRates(next.id)).toHaveLength(0);
+    // Other customers still pay list.
+    const other = file.createDocument({
+      type: 'invoice', number: 'INV-RT3', date: '2026-07-05', customerName: 'Someone Else',
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
+    });
+    expect(other.current.lines[0]!.unitPrice).toBe(2500n);
+  });
+
+  it('formula rates resolve against price history; below-cost clamps apply', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    file.setCustomerRate({
+      itemId: widget.id, ...acme,
+      rate: { kind: 'formula', base: 'cost', percentMilli: 20_000n }, // cost + 20% = 12.00
+    });
+    const invoice = file.createDocument({
+      type: 'invoice', number: 'INV-RT4', date: '2026-07-01', ...acme,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
+    });
+    expect(invoice.current.lines[0]!.unitPrice).toBe(1200n);
+
+    // A deep discount clamps at cost when the checkbox is off.
+    file.setCustomerRate({
+      itemId: widget.id, ...acme,
+      rate: { kind: 'constant', unitPrice: 100n }, effectiveFrom: '2026-08-01', allowBelowCost: false,
+    });
+    const clamped = file.createDocument({
+      type: 'invoice', number: 'INV-RT5', date: '2026-08-02', ...acme,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
+    });
+    expect(clamped.current.lines[0]!.unitPrice).toBe(1000n);
+  });
+
+  it('rates are immutable at the database level', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    file.setCustomerRate({ itemId: widget.id, ...acme, rate: { kind: 'constant', unitPrice: 2000n } });
+    const raw = new Database(books);
+    try {
+      expect(() => raw.prepare(`UPDATE customer_rates SET unit_price = 1`).run()).toThrowError(/immutable/);
+      expect(() => raw.prepare(`DELETE FROM customer_rates`).run()).toThrowError(/immutable/);
+    } finally {
+      raw.close();
+    }
+  });
+});
+
 describe('conformance against the in-memory DocumentBook', () => {
   it('replays the same operations and reaches the same views', () => {
     const reference = new DocumentBook();

@@ -4,6 +4,15 @@ import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
 import { divRoundHalf, QUANTITY_SCALE } from './quantity.js';
 import { computeStatement, type AgingRule, type Statement } from './statement.js';
+import {
+  computeRateSuggestions,
+  defaultAllowBelowCost,
+  rateMatchesCustomer,
+  resolveRatePrice,
+  type CustomerRate,
+  type NewCustomerRate,
+  type SpecialRateSuggestion,
+} from './customer-rates.js';
 
 export const DOCUMENT_TYPES = ['estimate', 'sales_order', 'invoice', 'credit_memo'] as const;
 export type DocumentType = (typeof DOCUMENT_TYPES)[number];
@@ -364,6 +373,12 @@ export interface ItemCatalog {
   priceAt(itemId: string, date: string): bigint;
   /** Latest cost effective on `date`, or undefined if the item has no cost history. */
   costAt(itemId: string, date: string): bigint | undefined;
+  /**
+   * The customer's standing special rate for the item resolved to a unit
+   * price on `date` (below-cost guard applied), or undefined when the
+   * customer has no rate for it (ADR 0007).
+   */
+  customerPriceAt(itemId: string, customer: CustomerQuery, date: string): bigint | undefined;
 }
 
 /** Recorded value of a free item line: at cost, or sales price if lower (ADR 0005). */
@@ -386,6 +401,7 @@ export function resolveDocumentLines(
   date: string,
   catalog: ItemCatalog,
   previousLines?: readonly DocumentLine[],
+  customer?: CustomerQuery,
 ): DocumentLine[] {
   return lines.map((line, index) => {
     const previous = previousLines?.[index];
@@ -398,7 +414,11 @@ export function resolveDocumentLines(
     if (free && item) {
       unitPrice = freeRecordedUnitPrice(item.id, date, catalog);
     } else {
-      unitPrice = line.unitPrice ?? (item ? catalog.priceAt(item.id, date) : undefined);
+      // Pricing order (ADR 0007): explicit price → customer rate → catalog.
+      unitPrice =
+        line.unitPrice ??
+        (item && customer ? catalog.customerPriceAt(item.id, customer, date) : undefined) ??
+        (item ? catalog.priceAt(item.id, date) : undefined);
     }
     if (unitPrice === undefined) {
       throw new LedgerError('INVALID_DOCUMENT', 'Lines without an item need an explicit unitPrice');
@@ -815,6 +835,7 @@ export class DocumentBook implements ItemCatalog {
   private readonly documents = new Map<string, DocumentRecord>();
   private readonly closures = new Map<string, LineClosure[]>();
   private readonly numbers = new Set<string>();
+  private readonly rates: CustomerRate[] = [];
 
   // ── Items & price history ─────────────────────────────────────────────
 
@@ -907,14 +928,83 @@ export class DocumentBook implements ItemCatalog {
     return this.prices.get(itemId) ?? [];
   }
 
+  // ── Customer special rates (ADR 0007) ─────────────────────────────────
+
+  /** Persist a standing special rate — the "yes" answer to a suggestion. */
+  setCustomerRate(input: NewCustomerRate, at?: string): CustomerRate {
+    if (!this.items.has(input.itemId)) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${input.itemId}`);
+    }
+    if (input.customerName === undefined && input.accountNumber === undefined) {
+      throw new LedgerError('INVALID_DOCUMENT', 'A rate needs a customer name or account number');
+    }
+    const effectiveFrom = input.effectiveFrom ?? '0000-01-01';
+    // The below-cost default judges the item as of the rate's effective date;
+    // for an open-ended rate, judge it by the latest known price and cost.
+    const evalDate = input.effectiveFrom ?? '9999-12-31';
+    const salePrice = this.priceAt(input.itemId, evalDate);
+    const cost = this.costAt(input.itemId, evalDate);
+    if (input.rate.kind === 'formula' && input.rate.base === 'cost' && cost === undefined) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Cost-based rate requires cost history for the item');
+    }
+    if (input.rate.kind === 'constant' && input.rate.unitPrice < 0n) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Rates must not be negative');
+    }
+    const rate: CustomerRate = {
+      rateSeq: this.rates.length + 1,
+      itemId: input.itemId,
+      customerName: input.customerName ?? null,
+      accountNumber: input.accountNumber ?? null,
+      kind: input.rate.kind,
+      unitPrice: input.rate.kind === 'constant' ? input.rate.unitPrice : null,
+      base: input.rate.kind === 'formula' ? input.rate.base : null,
+      percentMilli: input.rate.kind === 'formula' ? (input.rate.percentMilli ?? 0n) : 0n,
+      amountMinor: input.rate.kind === 'formula' ? (input.rate.amountMinor ?? 0n) : 0n,
+      allowBelowCost: input.allowBelowCost ?? defaultAllowBelowCost(salePrice, cost),
+      effectiveFrom,
+      at: at ?? new Date().toISOString(),
+    };
+    this.rates.push(rate);
+    return rate;
+  }
+
+  /** Latest rate for (item, customer) effective on `date`; later records win. */
+  customerRateAt(itemId: string, customer: CustomerQuery, date: string): CustomerRate | undefined {
+    let best: CustomerRate | undefined;
+    for (const rate of this.rates) {
+      if (rate.itemId !== itemId || rate.effectiveFrom > date) continue;
+      if (!rateMatchesCustomer(rate, customer)) continue;
+      if (
+        !best ||
+        rate.effectiveFrom > best.effectiveFrom ||
+        (rate.effectiveFrom === best.effectiveFrom && rate.rateSeq > best.rateSeq)
+      ) {
+        best = rate;
+      }
+    }
+    return best;
+  }
+
+  customerPriceAt(itemId: string, customer: CustomerQuery, date: string): bigint | undefined {
+    const rate = this.customerRateAt(itemId, customer, date);
+    if (!rate) return undefined;
+    return resolveRatePrice(rate, this.priceAt(itemId, date), this.costAt(itemId, date));
+  }
+
+  /** "Should this special rate persist?" questions for a document (call after send). */
+  suggestSpecialRates(documentId: string): SpecialRateSuggestion[] {
+    return computeRateSuggestions(this.requireDocument(documentId), this);
+  }
+
   // ── Documents ─────────────────────────────────────────────────────────
 
   private resolveLines(
     lines: NewDocumentLine[],
     date: string,
     previousLines?: readonly DocumentLine[],
+    customer?: CustomerQuery,
   ): DocumentLine[] {
-    return resolveDocumentLines(lines, date, this, previousLines);
+    return resolveDocumentLines(lines, date, this, previousLines, customer);
   }
 
   createDocument(input: NewDocument, id: string = randomUUID(), at?: string): DocumentView {
@@ -931,7 +1021,10 @@ export class DocumentBook implements ItemCatalog {
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
-    const lines = this.resolveLines(input.lines, input.date);
+    const lines = this.resolveLines(input.lines, input.date, undefined, {
+      customerName: input.customerName,
+      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+    });
     let inheritedTags: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
       const source = this.documents.get(input.sourceDocumentId);
@@ -980,11 +1073,15 @@ export class DocumentBook implements ItemCatalog {
     const kind = resolveRevisionKind(document.type, document.status, changes.kind);
     const previous = document.revisions[document.revisions.length - 1]!;
     const date = changes.date ?? previous.date;
+    const customerName = changes.customerName ?? previous.customerName;
+    const accountNumber = changes.accountNumber ?? previous.accountNumber;
     const lines =
       changes.lines !== undefined
-        ? this.resolveLines(changes.lines, date, previous.lines)
+        ? this.resolveLines(changes.lines, date, previous.lines, {
+            customerName,
+            ...(accountNumber !== null ? { accountNumber } : {}),
+          })
         : [...previous.lines];
-    const customerName = changes.customerName ?? previous.customerName;
     validateRevisionContent({ date, lines, customerName });
     // ADR 0006: never orphan downstream links or over-consume a shrunk line.
     validateLineConsumption(lines, this.fulfillment(id));

@@ -79,6 +79,18 @@ export {
   DocumentBook,
 } from './documents.js';
 export {
+  PERCENT_SCALE,
+  type RateBase,
+  type CustomerRate,
+  type RateSpec,
+  type NewCustomerRate,
+  type SpecialRateSuggestion,
+  defaultAllowBelowCost,
+  rateMatchesCustomer,
+  resolveRatePrice,
+  computeRateSuggestions,
+} from './customer-rates.js';
+export {
   type AgingRule,
   type Statement,
   type StatementInvoice,

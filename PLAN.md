@@ -338,6 +338,9 @@ A first-class, obsessively-tested onramp — this determines adoption.
 - [x] Link-integrity guards, returns & credit memos with last-purchase
       pricing, customer statements with aging, customer/PO identity on all
       transactions (ADR 0006)
+- [x] Customer special rates: persist-this-rate suggestions after send,
+      constant/formula rates (% or $ off sale / over cost), below-cost
+      checkbox with loss-leader default (ADR 0007)
 - [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging

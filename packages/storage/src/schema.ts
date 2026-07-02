@@ -249,7 +249,37 @@ ALTER TABLE document_revisions ADD COLUMN po_number TEXT;
 ALTER TABLE document_revision_lines ADD COLUMN source_document_id TEXT;
 `;
 
+const V5_SQL = `
+-- ADR 0007: customer special rates — append-only, effective-dated, one of
+-- constant unit price or base×(100%+percent)+amount against sale/cost.
+CREATE TABLE customer_rates (
+  rate_seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id          TEXT NOT NULL REFERENCES items(id),
+  customer_name    TEXT,
+  account_number   TEXT,
+  kind             TEXT NOT NULL CHECK (kind IN ('constant','formula')),
+  unit_price       INTEGER CHECK (unit_price IS NULL OR unit_price >= 0),
+  base             TEXT CHECK (base IN ('sale','cost')),
+  percent_milli    INTEGER NOT NULL DEFAULT 0,
+  amount_minor     INTEGER NOT NULL DEFAULT 0,
+  allow_below_cost INTEGER NOT NULL CHECK (allow_below_cost IN (0,1)),
+  effective_from   TEXT NOT NULL,
+  at               TEXT NOT NULL,
+  CHECK (customer_name IS NOT NULL OR account_number IS NOT NULL),
+  CHECK ((kind = 'constant') = (unit_price IS NOT NULL)),
+  CHECK ((kind = 'formula') = (base IS NOT NULL))
+) STRICT;
+
+CREATE INDEX idx_customer_rates_item ON customer_rates(item_id, effective_from);
+
+CREATE TRIGGER customer_rates_no_update BEFORE UPDATE ON customer_rates
+BEGIN SELECT RAISE(ABORT, 'customer rates are immutable; append a newer rate'); END;
+
+CREATE TRIGGER customer_rates_no_delete BEFORE DELETE ON customer_rates
+BEGIN SELECT RAISE(ABORT, 'customer rates are immutable; append a newer rate'); END;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
