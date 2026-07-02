@@ -96,7 +96,22 @@ export {
   type StatementInvoice,
   type StatementCredit,
   type StatementCorrection,
+  type StatementPayment,
   DEFAULT_AGING_RULES,
   ageLabelFor,
   computeStatement,
 } from './statement.js';
+export {
+  type Payment,
+  type NewPayment,
+  type ApplicationSourceKind,
+  type CreditApplication,
+  type NewApplication,
+  type InvoiceSettlement,
+  activeApplications,
+  appliedFromSource,
+  appliedToInvoice,
+  settle,
+  sameCustomer,
+  validateApplication,
+} from './payments.js';

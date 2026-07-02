@@ -279,7 +279,59 @@ CREATE TRIGGER customer_rates_no_delete BEFORE DELETE ON customer_rates
 BEGIN SELECT RAISE(ABORT, 'customer rates are immutable; append a newer rate'); END;
 `;
 
+const V6_SQL = `
+-- Tier 1: payments and credit application. Payments are immutable except for
+-- voiding; applications are append-only and undone by reversal records.
+CREATE TABLE payments (
+  id             TEXT PRIMARY KEY,
+  number         TEXT NOT NULL UNIQUE,
+  date           TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  customer_name  TEXT NOT NULL CHECK (length(trim(customer_name)) > 0),
+  account_number TEXT,
+  po_number      TEXT,
+  memo           TEXT,
+  method         TEXT,
+  amount         INTEGER NOT NULL CHECK (amount > 0),
+  status         TEXT NOT NULL CHECK (status IN ('received','void'))
+) STRICT;
+
+CREATE TRIGGER payments_status_only_update BEFORE UPDATE ON payments
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.number IS NOT OLD.number
+  OR NEW.date IS NOT OLD.date
+  OR NEW.customer_name IS NOT OLD.customer_name
+  OR NEW.account_number IS NOT OLD.account_number
+  OR NEW.po_number IS NOT OLD.po_number
+  OR NEW.memo IS NOT OLD.memo
+  OR NEW.method IS NOT OLD.method
+  OR NEW.amount IS NOT OLD.amount
+BEGIN SELECT RAISE(ABORT, 'only payment status may change'); END;
+
+CREATE TRIGGER payments_no_delete BEFORE DELETE ON payments
+BEGIN SELECT RAISE(ABORT, 'payments are never deleted; void them'); END;
+
+CREATE TABLE credit_applications (
+  application_seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_kind              TEXT NOT NULL CHECK (source_kind IN ('payment','credit_memo')),
+  source_id                TEXT NOT NULL,
+  invoice_id               TEXT NOT NULL REFERENCES documents(id),
+  amount                   INTEGER NOT NULL CHECK (amount > 0),
+  date                     TEXT NOT NULL,
+  at                       TEXT NOT NULL,
+  reverses_application_seq INTEGER UNIQUE REFERENCES credit_applications(application_seq)
+) STRICT;
+
+CREATE INDEX idx_credit_applications_invoice ON credit_applications(invoice_id);
+CREATE INDEX idx_credit_applications_source ON credit_applications(source_kind, source_id);
+
+CREATE TRIGGER credit_applications_no_update BEFORE UPDATE ON credit_applications
+BEGIN SELECT RAISE(ABORT, 'applications are immutable; reverse them'); END;
+
+CREATE TRIGGER credit_applications_no_delete BEFORE DELETE ON credit_applications
+BEGIN SELECT RAISE(ABORT, 'applications are immutable; reverse them'); END;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

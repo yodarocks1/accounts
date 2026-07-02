@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
   LedgerError,
+  appliedFromSource,
+  appliedToInvoice,
   buildConversionLines,
   buildReturnLine,
   computeFulfillment,
@@ -13,6 +15,9 @@ import {
   deriveTags,
   planChargeCorrection,
   resolveRatePrice,
+  revisionTotal,
+  settle,
+  validateApplication,
   resolveDocumentLines,
   resolveRevisionKind,
   validateConversion,
@@ -48,6 +53,11 @@ import {
   type AgingRule,
   type Statement,
   type TrialBalance,
+  type Payment,
+  type NewPayment,
+  type CreditApplication,
+  type NewApplication,
+  type InvoiceSettlement,
 } from '@accounts/core';
 import { MIGRATIONS, SCHEMA_VERSION } from './schema.js';
 
@@ -767,7 +777,7 @@ export class CompanyFile implements ItemCatalog {
         closures: this.lineClosures(record.id),
       })),
     );
-    return computeStatement(pairs, query, asOf, rules);
+    return computeStatement(pairs, this.listPayments(), this.listApplications(), query, asOf, rules);
   }
 
   private listDocumentRecords(type: DocumentType): DocumentRecord[] {
@@ -1039,6 +1049,272 @@ export class CompanyFile implements ItemCatalog {
         line.sourceLineId,
       );
     });
+  }
+
+  // ── Payments & credit application (Tier 1, ADR 0008) ────────────────────
+
+  /** Record money received; optionally apply it to invoices immediately. */
+  recordPayment(input: NewPayment): Payment {
+    if (input.amount <= 0n) {
+      throw new LedgerError('INVALID_ALLOCATION', 'Payment amounts must be positive');
+    }
+    if (!input.customerName.trim()) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Every transaction must carry a customer name (ADR 0006)');
+    }
+    const payment: Payment = {
+      id: randomUUID(),
+      number: input.number,
+      date: input.date,
+      customerName: input.customerName.trim(),
+      accountNumber: input.accountNumber ?? null,
+      poNumber: input.poNumber ?? null,
+      memo: input.memo ?? null,
+      method: input.method ?? null,
+      amountMinor: input.amount,
+      status: 'received',
+    };
+    this.db.transaction(() => {
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO payments (id, number, date, customer_name, account_number, po_number, memo, method, amount, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
+          )
+          .run(
+            payment.id,
+            payment.number,
+            payment.date,
+            payment.customerName,
+            payment.accountNumber,
+            payment.poNumber,
+            payment.memo,
+            payment.method,
+            payment.amountMinor,
+          );
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('UNIQUE constraint failed: payments.number')) {
+          throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Payment number already in use: ${input.number}`);
+        }
+        throw error;
+      }
+      this.audit('payment.recorded', 'payment', payment.id, {
+        number: payment.number,
+        amount: payment.amountMinor.toString(),
+        customerName: payment.customerName,
+      });
+      for (const application of input.applications ?? []) {
+        this.applyCreditInternal(
+          { sourceKind: 'payment', sourceId: payment.id, ...application },
+          input.date,
+        );
+      }
+    })();
+    return payment;
+  }
+
+  getPayment(id: string): Payment | undefined {
+    interface PaymentRow {
+      id: string;
+      number: string;
+      date: string;
+      customer_name: string;
+      account_number: string | null;
+      po_number: string | null;
+      memo: string | null;
+      method: string | null;
+      amount: bigint;
+      status: Payment['status'];
+    }
+    const row = this.db.prepare(`SELECT * FROM payments WHERE id = ?`).get(id) as PaymentRow | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      number: row.number,
+      date: row.date,
+      customerName: row.customer_name,
+      accountNumber: row.account_number,
+      poNumber: row.po_number,
+      memo: row.memo,
+      method: row.method,
+      amountMinor: row.amount,
+      status: row.status,
+    };
+  }
+
+  listPayments(): Payment[] {
+    const rows = this.db.prepare(`SELECT id FROM payments ORDER BY date, number`).all() as { id: string }[];
+    return rows.map((row) => this.getPayment(row.id)!);
+  }
+
+  voidPayment(id: string): Payment {
+    const payment = this.getPayment(id);
+    if (!payment) {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such payment: ${id}`);
+    }
+    if (payment.status === 'void') {
+      throw new LedgerError('INVALID_STATUS', 'Payment is already void');
+    }
+    this.db.transaction(() => {
+      this.db.prepare(`UPDATE payments SET status = 'void' WHERE id = ?`).run(id);
+      this.audit('payment.voided', 'payment', id, {});
+    })();
+    return { ...payment, status: 'void' };
+  }
+
+  listApplications(): CreditApplication[] {
+    interface ApplicationRow {
+      application_seq: bigint;
+      source_kind: CreditApplication['sourceKind'];
+      source_id: string;
+      invoice_id: string;
+      amount: bigint;
+      date: string;
+      at: string;
+      reverses_application_seq: bigint | null;
+    }
+    const rows = this.db
+      .prepare(`SELECT * FROM credit_applications ORDER BY application_seq`)
+      .all() as ApplicationRow[];
+    return rows.map((row) => ({
+      applicationSeq: Number(row.application_seq),
+      sourceKind: row.source_kind,
+      sourceId: row.source_id,
+      invoiceId: row.invoice_id,
+      amountMinor: row.amount,
+      date: row.date,
+      at: row.at,
+      reversesApplicationSeq:
+        row.reverses_application_seq === null ? null : Number(row.reverses_application_seq),
+    }));
+  }
+
+  /** Apply credit from a payment or account credit memo against an invoice. */
+  applyCredit(
+    input: { sourceKind: CreditApplication['sourceKind']; sourceId: string } & NewApplication,
+    date?: string,
+  ): CreditApplication {
+    let application!: CreditApplication;
+    this.db.transaction(() => {
+      application = this.applyCreditInternal(input, date);
+    })();
+    return application;
+  }
+
+  private applyCreditInternal(
+    input: { sourceKind: CreditApplication['sourceKind']; sourceId: string } & NewApplication,
+    date?: string,
+  ): CreditApplication {
+    const source = this.sourceState(input.sourceKind, input.sourceId);
+    const invoice = this.requireDocumentRecord(input.invoiceId);
+    const applications = this.listApplications();
+    const remaining =
+      source.total - appliedFromSource(applications, input.sourceKind, input.sourceId);
+    const settlement = this.invoiceSettlement(input.invoiceId);
+    validateApplication(input.amount, remaining, invoice, settlement.open, source);
+    const effectiveDate = date ?? invoice.revisions[invoice.revisions.length - 1]!.date;
+    const at = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `INSERT INTO credit_applications (source_kind, source_id, invoice_id, amount, date, at, reverses_application_seq)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .run(input.sourceKind, input.sourceId, input.invoiceId, input.amount, effectiveDate, at);
+    const seq = Number(result.lastInsertRowid);
+    this.audit('credit.applied', 'credit_application', String(seq), {
+      sourceKind: input.sourceKind,
+      sourceId: input.sourceId,
+      invoiceId: input.invoiceId,
+      amount: input.amount.toString(),
+    });
+    return {
+      applicationSeq: seq,
+      sourceKind: input.sourceKind,
+      sourceId: input.sourceId,
+      invoiceId: input.invoiceId,
+      amountMinor: input.amount,
+      date: effectiveDate,
+      at,
+      reversesApplicationSeq: null,
+    };
+  }
+
+  /** Undo an application (appends a reversal record; nothing is edited). */
+  reverseApplication(applicationSeq: number): CreditApplication {
+    const applications = this.listApplications();
+    const target = applications.find((application) => application.applicationSeq === applicationSeq);
+    if (!target || target.reversesApplicationSeq !== null) {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such application: ${applicationSeq}`);
+    }
+    if (applications.some((application) => application.reversesApplicationSeq === applicationSeq)) {
+      throw new LedgerError('ALREADY_REVERSED', `Application already reversed: ${applicationSeq}`);
+    }
+    const at = new Date().toISOString();
+    let seq = 0;
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO credit_applications (source_kind, source_id, invoice_id, amount, date, at, reverses_application_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(target.sourceKind, target.sourceId, target.invoiceId, target.amountMinor, target.date, at, applicationSeq);
+      seq = Number(result.lastInsertRowid);
+      this.audit('credit.application_reversed', 'credit_application', String(seq), {
+        reverses: applicationSeq,
+      });
+    })();
+    return { ...target, applicationSeq: seq, at, reversesApplicationSeq: applicationSeq };
+  }
+
+  private isSourceActive(kind: CreditApplication['sourceKind'], id: string): boolean {
+    if (kind === 'payment') {
+      return this.getPayment(id)?.status === 'received';
+    }
+    const record = this.getDocumentRecord(id);
+    return record?.type === 'credit_memo' && record.status === 'sent' && record.settlement === 'account';
+  }
+
+  private sourceState(kind: CreditApplication['sourceKind'], id: string): {
+    customerName: string;
+    accountNumber: string | null;
+    total: bigint;
+  } {
+    if (kind === 'payment') {
+      const payment = this.getPayment(id);
+      if (!payment) throw new LedgerError('UNKNOWN_DOCUMENT', `No such payment: ${id}`);
+      if (payment.status !== 'received') {
+        throw new LedgerError('INVALID_STATUS', 'Void payments cannot be applied');
+      }
+      return { customerName: payment.customerName, accountNumber: payment.accountNumber, total: payment.amountMinor };
+    }
+    const record = this.getDocumentRecord(id);
+    if (!record || record.type !== 'credit_memo') {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such credit memo: ${id}`);
+    }
+    if (record.status !== 'sent') {
+      throw new LedgerError('INVALID_STATUS', 'Only sent credit memos can be applied');
+    }
+    if (record.settlement !== 'account') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Refund credit memos were paid out and cannot be applied');
+    }
+    const current = record.revisions[record.revisions.length - 1]!;
+    return {
+      customerName: current.customerName,
+      accountNumber: current.accountNumber,
+      total: revisionTotal(current),
+    };
+  }
+
+  /** Derived paid/open state of an invoice — never stored (Tier 1). */
+  invoiceSettlement(invoiceId: string, asOf?: string): InvoiceSettlement {
+    const invoice = this.requireDocumentRecord(invoiceId);
+    const current = invoice.revisions[invoice.revisions.length - 1]!;
+    const paid = appliedToInvoice(
+      this.listApplications(),
+      invoiceId,
+      (kind, id) => this.isSourceActive(kind, id),
+      asOf,
+    );
+    return settle(revisionTotal(current), paid);
   }
 
   // ── Audit ───────────────────────────────────────────────────────────────
