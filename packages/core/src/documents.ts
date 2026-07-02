@@ -3,7 +3,7 @@ import { allocateProportional } from './allocation.js';
 import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
 import { divRoundHalf, QUANTITY_SCALE } from './quantity.js';
-import { computeStatement, type AgingRule, type Statement } from './statement.js';
+import { computeStatement, daysBetween, type AgingRule, type Statement } from './statement.js';
 import {
   computeRateSuggestions,
   defaultAllowBelowCost,
@@ -69,6 +69,8 @@ export interface DocumentLine {
   readonly sourceDocumentId: string | null;
   /** Line-level provenance to the source document's line (ADR 0005). */
   readonly sourceLineId: string | null;
+  /** Condition of a returned item on credit-memo lines (ADR 0009). */
+  readonly returnCondition: ReturnCondition | null;
 }
 
 export interface NewDocumentLine {
@@ -84,6 +86,7 @@ export interface NewDocumentLine {
   substituted?: boolean;
   sourceDocumentId?: string;
   sourceLineId?: string;
+  returnCondition?: ReturnCondition;
 }
 
 export interface DocumentRevision {
@@ -162,6 +165,8 @@ export interface NewLineClosure {
   /** Defaults to the line's full open quantity. */
   quantityMilli?: bigint;
   reason?: string;
+  /** Required when the approval policy gates close_line (ADR 0009). */
+  approvedBy?: string;
 }
 
 export interface LineFulfillment {
@@ -203,6 +208,33 @@ export interface ConversionSpec {
 }
 
 export type PriceKind = 'sale' | 'cost';
+
+/** Condition of a returned item (ADR 0009); unopened usually fees lowest. */
+export const RETURN_CONDITIONS = ['unopened', 'opened', 'damaged'] as const;
+export type ReturnCondition = (typeof RETURN_CONDITIONS)[number];
+
+/** Percent of the line's credit and/or a flat amount, both optional. */
+export interface RestockingFee {
+  percentMilli?: bigint;
+  amountMinor?: bigint;
+}
+
+export interface ReturnPolicy {
+  /** Returns older than this many days need an approved override. */
+  windowDays?: number;
+  /** Default restocking fee per condition; per-item overrides win. */
+  fees?: Partial<Record<ReturnCondition, RestockingFee>>;
+}
+
+/** Privileged actions the approval policy may gate (ADR 0009 part 3). */
+export const APPROVAL_ACTIONS = [
+  'charge_correction',
+  'below_cost_sale',
+  'void_document',
+  'close_line',
+  'return_window_override',
+] as const;
+export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];
 
 export interface Item {
   readonly id: string;
@@ -478,8 +510,38 @@ export function resolveDocumentLines(
       substituted: line.substituted ?? previous?.substituted ?? false,
       sourceDocumentId: line.sourceDocumentId ?? previous?.sourceDocumentId ?? null,
       sourceLineId: line.sourceLineId ?? previous?.sourceLineId ?? null,
+      returnCondition: line.returnCondition ?? previous?.returnCondition ?? null,
     };
   });
+}
+
+/**
+ * ADR 0009 return guard: cumulative returns against a purchase line may never
+ * exceed the quantity purchased. Shared by every storage engine.
+ */
+export function validateReturnQuantities(
+  lines: readonly DocumentLine[],
+  getSourceLine: (documentId: string, lineId: string) => DocumentLine | undefined,
+  priorReturnedMilli: (documentId: string, lineId: string) => bigint,
+): void {
+  const consumed = new Map<string, bigint>();
+  for (const line of lines) {
+    if (line.sourceDocumentId === null || line.sourceLineId === null) continue;
+    const key = `${line.sourceDocumentId}#${line.sourceLineId}`;
+    consumed.set(key, (consumed.get(key) ?? 0n) + line.quantityMilli);
+  }
+  for (const [key, quantity] of consumed) {
+    const [documentId, lineId] = key.split('#') as [string, string];
+    const sourceLine = getSourceLine(documentId, lineId);
+    if (!sourceLine) continue; // provenance to a non-purchase source
+    const total = priorReturnedMilli(documentId, lineId) + quantity;
+    if (total > sourceLine.quantityMilli) {
+      throw new LedgerError(
+        'RETURN_EXCEEDS_PURCHASE',
+        `Returning ${total} (milli) of "${sourceLine.description}" exceeds the ${sourceLine.quantityMilli} purchased`,
+      );
+    }
+  }
 }
 
 /**
@@ -740,6 +802,10 @@ export interface ReturnItem {
   quantityMilli: bigint;
   /** Override the looked-up price (out-of-band cases). */
   unitPrice?: bigint;
+  /** Condition of the returned goods; defaults to 'unopened' (ADR 0009). */
+  condition?: ReturnCondition;
+  /** Override the policy's restocking fee for this item. */
+  restockingFee?: RestockingFee;
 }
 
 export interface NewReturn {
@@ -752,6 +818,10 @@ export interface NewReturn {
   settlement?: SettlementMode;
   memo?: string;
   items: ReturnItem[];
+  /** Accept a return outside the policy window (approvable action). */
+  overrideWindow?: boolean;
+  /** Who authorized gated aspects of this return (ADR 0009 part 3). */
+  approvedBy?: string;
 }
 
 /**
@@ -765,6 +835,8 @@ export function buildReturnLine(
   asOf: string,
   records: readonly DocumentRecord[],
   catalog: ItemCatalog,
+  policy?: ReturnPolicy,
+  overrideWindow = false,
 ): NewDocumentLine {
   const catalogItem = catalog.getItem(item.itemId);
   if (!catalogItem) {
@@ -780,12 +852,39 @@ export function buildReturnLine(
       `No purchase of ${catalogItem.name} found for this customer on or before ${asOf}; pass an explicit unitPrice to credit anyway`,
     );
   }
+  if (purchase && policy?.windowDays !== undefined && !overrideWindow) {
+    const purchaseDate = purchase.record.revisions[purchase.record.revisions.length - 1]!.date;
+    const age = daysBetween(purchaseDate, asOf);
+    if (age > policy.windowDays) {
+      throw new LedgerError(
+        'RETURN_WINDOW',
+        `Purchase of ${catalogItem.name} is ${age} days old; the return window is ${policy.windowDays} days (pass overrideWindow to accept anyway)`,
+      );
+    }
+  }
+  const condition: ReturnCondition = item.condition ?? 'unopened';
+  const unitPrice = item.unitPrice ?? perUnitCustomerPrice(purchase!.line);
+  // Restocking fee (ADR 0009): percent of the credit and/or flat, per
+  // condition — applied through the standard adjustment machinery.
+  const fee = item.restockingFee ?? policy?.fees?.[condition];
+  let adjustment = 0n;
+  if (fee) {
+    const face = divRoundHalf(item.quantityMilli * unitPrice, QUANTITY_SCALE);
+    let amount =
+      (fee.percentMilli !== undefined ? divRoundHalf(face * fee.percentMilli, 100_000n) : 0n) +
+      (fee.amountMinor ?? 0n);
+    if (amount < 0n) amount = 0n;
+    if (amount > face) amount = face;
+    adjustment = -amount;
+  }
   return {
     itemId: item.itemId,
-    description: `${catalogItem.name} (return)`,
+    description: `${catalogItem.name} (return, ${condition})`,
     quantityMilli: item.quantityMilli,
-    unitPrice: item.unitPrice ?? perUnitCustomerPrice(purchase!.line),
+    unitPrice,
     currency: catalogItem.currency,
+    ...(adjustment !== 0n ? { adjustment } : {}),
+    returnCondition: condition,
     ...(purchase
       ? { sourceDocumentId: purchase.record.id, sourceLineId: purchase.line.lineId }
       : {}),
@@ -859,6 +958,8 @@ export interface NewDocument {
   partyId?: string;
   memo?: string;
   sourceDocumentId?: string;
+  /** Who authorized gated aspects (e.g. below-cost pricing) (ADR 0009). */
+  approvedBy?: string;
   /** Credit memos only: defaults to 'account'. */
   settlement?: SettlementMode;
 }
@@ -873,6 +974,8 @@ export interface DocumentChanges {
   poNumber?: string;
   termsDays?: number;
   memo?: string;
+  /** Who authorized gated aspects (e.g. below-cost pricing) (ADR 0009). */
+  approvedBy?: string;
 }
 
 export interface NewItem {
@@ -899,6 +1002,68 @@ export class DocumentBook implements ItemCatalog {
   private readonly applications: CreditApplication[] = [];
   private readonly parties = new Map<string, Party>();
   private readonly partyNames = new Map<string, PartyName[]>();
+  private returnPolicyValue: ReturnPolicy = {};
+  private approvalPolicy = new Set<ApprovalAction>();
+
+  // ── Policies (ADR 0009) ───────────────────────────────────────────────
+
+  setReturnPolicy(policy: ReturnPolicy): void {
+    this.returnPolicyValue = policy;
+  }
+
+  returnPolicy(): ReturnPolicy {
+    return this.returnPolicyValue;
+  }
+
+  setApprovalPolicy(actions: readonly ApprovalAction[]): void {
+    this.approvalPolicy = new Set(actions);
+  }
+
+  private requireApproval(action: ApprovalAction, approvedBy: string | undefined): void {
+    if (this.approvalPolicy.has(action) && approvedBy === undefined) {
+      throw new LedgerError('APPROVAL_REQUIRED', `Action "${action}" requires an approver (approvedBy)`);
+    }
+  }
+
+  /** Non-free sales lines priced under the item's cost are gated (ADR 0009). */
+  private requireBelowCostApproval(
+    type: DocumentType,
+    date: string,
+    lines: readonly DocumentLine[],
+    approvedBy: string | undefined,
+  ): void {
+    if (type === 'credit_memo') return;
+    for (const line of lines) {
+      if (line.free || line.itemId === null) continue;
+      const cost = this.costAt(line.itemId, date);
+      if (cost !== undefined && line.unitPrice < cost) {
+        this.requireApproval('below_cost_sale', approvedBy);
+        return;
+      }
+    }
+  }
+
+  /** Cumulative quantity already returned against a purchase line. */
+  private priorReturnedMilli(documentId: string, lineId: string): bigint {
+    let total = 0n;
+    for (const record of this.documents.values()) {
+      if (record.type !== 'credit_memo' || record.status === 'void') continue;
+      const current = record.revisions[record.revisions.length - 1]!;
+      for (const line of current.lines) {
+        if (line.sourceDocumentId === documentId && line.sourceLineId === lineId) {
+          total += line.quantityMilli;
+        }
+      }
+    }
+    return total;
+  }
+
+  private sourceLineFor(documentId: string, lineId: string): DocumentLine | undefined {
+    const record = this.documents.get(documentId);
+    if (!record) return undefined;
+    const current = record.revisions[record.revisions.length - 1]!;
+    return current.lines.find((line) => line.lineId === lineId);
+  }
 
   // ── Parties (ADR 0008 part 4) ─────────────────────────────────────────
 
@@ -1182,6 +1347,14 @@ export class DocumentBook implements ItemCatalog {
       inheritedTags = deriveTags(source, this.closures.get(source.id) ?? []);
     }
     validateRevisionContent({ date: input.date, lines, customerName: customer.customerName });
+    this.requireBelowCostApproval(input.type, input.date, lines, input.approvedBy);
+    if (input.type === 'credit_memo') {
+      validateReturnQuantities(
+        lines,
+        (documentId, lineId) => this.sourceLineFor(documentId, lineId),
+        (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
+      );
+    }
     const document: DocumentRecord = {
       id,
       type: input.type,
@@ -1235,6 +1408,18 @@ export class DocumentBook implements ItemCatalog {
     validateRevisionContent({ date, lines, customerName });
     // ADR 0006: never orphan downstream links or over-consume a shrunk line.
     validateLineConsumption(lines, this.fulfillment(id));
+    this.requireBelowCostApproval(document.type, date, lines, changes.approvedBy);
+    if (document.type === 'credit_memo' && changes.lines !== undefined) {
+      validateReturnQuantities(
+        lines,
+        (documentId, lineId) => this.sourceLineFor(documentId, lineId),
+        (documentId, lineId) =>
+          this.priorReturnedMilli(documentId, lineId) -
+          previous.lines
+            .filter((line) => line.sourceDocumentId === documentId && line.sourceLineId === lineId)
+            .reduce((sum, line) => sum + line.quantityMilli, 0n),
+      );
+    }
     this.appendRevision(document, {
       revisionNo: previous.revisionNo + 1,
       kind,
@@ -1255,7 +1440,8 @@ export class DocumentBook implements ItemCatalog {
    * "We accidentally charged the wrong amount": reduce the customer total of
    * a sent invoice to `actualTotal`, pro rata with cost floors (ADR 0005).
    */
-  chargeCorrection(id: string, actualTotal: bigint, reason?: string, at?: string): DocumentView {
+  chargeCorrection(id: string, actualTotal: bigint, reason?: string, at?: string, approvedBy?: string): DocumentView {
+    this.requireApproval('charge_correction', approvedBy);
     const document = this.requireDocument(id);
     const kind = resolveRevisionKind(document.type, document.status, 'correction');
     const lines = planChargeCorrection(document, actualTotal, this);
@@ -1317,9 +1503,12 @@ export class DocumentBook implements ItemCatalog {
       ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
       ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
     };
+    if (input.overrideWindow === true) {
+      this.requireApproval('return_window_override', input.approvedBy);
+    }
     const invoices = [...this.documents.values()];
     const lines = input.items.map((item) =>
-      buildReturnLine(item, query, input.date, invoices, this),
+      buildReturnLine(item, query, input.date, invoices, this, this.returnPolicyValue, input.overrideWindow ?? false),
     );
     return this.createDocument(
       {
@@ -1524,6 +1713,7 @@ export class DocumentBook implements ItemCatalog {
 
   /** Explicitly close (part of) a line without fulfilling it (ADR 0005). */
   closeLine(documentId: string, input: NewLineClosure, at?: string): LineClosure {
+    this.requireApproval('close_line', input.approvedBy);
     const document = this.requireDocument(documentId);
     if (document.status !== 'sent') {
       throw new LedgerError('INVALID_STATUS', 'Only lines of sent documents can be closed');
@@ -1581,7 +1771,8 @@ export class DocumentBook implements ItemCatalog {
     return this.view(id);
   }
 
-  voidDocument(id: string): DocumentView {
+  voidDocument(id: string, approvedBy?: string): DocumentView {
+    this.requireApproval('void_document', approvedBy);
     const document = this.requireDocument(id);
     if (document.status === 'void') {
       throw new LedgerError('INVALID_STATUS', 'Document is already void');

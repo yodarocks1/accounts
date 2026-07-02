@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import {
   LedgerError,
@@ -24,12 +25,14 @@ import {
   validateConversion,
   validateLineConsumption,
   validateNewEntry,
+  validateReturnQuantities,
   validateTermsDays,
   validateRevisionContent,
   viewDocument,
   type Account,
   type ConversionSpec,
   type DocumentChanges,
+  type DocumentLine,
   type DocumentRecord,
   type DocumentRevision,
   type DocumentTag,
@@ -55,6 +58,9 @@ import {
   type Party,
   type NewParty,
   type PartyName,
+  type ReturnPolicy,
+  type ReturnCondition,
+  type ApprovalAction,
   type NewCustomerRate,
   type SpecialRateSuggestion,
   type AgingRule,
@@ -152,6 +158,11 @@ export class CompanyFile implements ItemCatalog {
       throw new LedgerError('EMPTY_ENTRY', `Company file is schema v${row.value}; this build supports v${SCHEMA_VERSION}`);
     }
     if (fileVersion < SCHEMA_VERSION) {
+      // ADR 0009 part 4: snapshot the file before touching it. VACUUM INTO
+      // produces a consistent copy even under WAL.
+      let backupPath = `${path}.v${fileVersion}.backup`;
+      if (existsSync(backupPath)) backupPath = `${path}.v${fileVersion}.${Date.now()}.backup`;
+      db.prepare(`VACUUM INTO ?`).run(backupPath);
       // Migrations run with foreign keys off (table rebuilds require it);
       // integrity is verified afterwards, before FKs come back on.
       db.transaction(() => {
@@ -734,6 +745,92 @@ export class CompanyFile implements ItemCatalog {
     return computeRateSuggestions(this.requireDocumentRecord(documentId), this);
   }
 
+  // ── Policies (Tier 2, ADR 0009) ─────────────────────────────────────────
+
+  setReturnPolicy(policy: ReturnPolicy): void {
+    const serialized = JSON.stringify(policy, (_key, value) =>
+      typeof value === 'bigint' ? `${value.toString()}n` : value,
+    );
+    this.db.transaction(() => {
+      this.db
+        .prepare(`INSERT INTO meta (key, value) VALUES ('return_policy', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+        .run(serialized);
+      this.audit('policy.return_set', 'policy', 'return', { policy: serialized });
+    })();
+  }
+
+  returnPolicy(): ReturnPolicy {
+    const row = this.db.prepare(`SELECT value FROM meta WHERE key = 'return_policy'`).get() as
+      | { value: string }
+      | undefined;
+    if (!row) return {};
+    return JSON.parse(row.value, (_key, value) =>
+      typeof value === 'string' && /^-?\d+n$/.test(value) ? BigInt(value.slice(0, -1)) : value,
+    ) as ReturnPolicy;
+  }
+
+  setApprovalPolicy(actions: readonly ApprovalAction[]): void {
+    this.db.transaction(() => {
+      this.db
+        .prepare(`INSERT INTO meta (key, value) VALUES ('approval_policy', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+        .run(JSON.stringify(actions));
+      this.audit('policy.approval_set', 'policy', 'approval', { actions });
+    })();
+  }
+
+  approvalPolicy(): Set<ApprovalAction> {
+    const row = this.db.prepare(`SELECT value FROM meta WHERE key = 'approval_policy'`).get() as
+      | { value: string }
+      | undefined;
+    return new Set(row ? (JSON.parse(row.value) as ApprovalAction[]) : []);
+  }
+
+  private requireApproval(action: ApprovalAction, approvedBy: string | undefined): void {
+    if (this.approvalPolicy().has(action) && approvedBy === undefined) {
+      throw new LedgerError('APPROVAL_REQUIRED', `Action "${action}" requires an approver (approvedBy)`);
+    }
+  }
+
+  /** Non-free sales lines priced under the item's cost are gated (ADR 0009). */
+  private requireBelowCostApproval(
+    type: DocumentType,
+    date: string,
+    lines: readonly DocumentLine[],
+    approvedBy: string | undefined,
+  ): void {
+    if (type === 'credit_memo') return;
+    for (const line of lines) {
+      if (line.free || line.itemId === null) continue;
+      const cost = this.costAt(line.itemId, date);
+      if (cost !== undefined && line.unitPrice < cost) {
+        this.requireApproval('below_cost_sale', approvedBy);
+        return;
+      }
+    }
+  }
+
+  /** Cumulative quantity already returned against a purchase line (SQL). */
+  private priorReturnedMilli(documentId: string, lineId: string): bigint {
+    const row = this.db
+      .prepare(
+        `SELECT coalesce(sum(l.quantity_milli), 0) AS total
+         FROM documents d
+         JOIN document_revision_lines l ON l.document_id = d.id
+           AND l.revision_no = (SELECT max(revision_no) FROM document_revisions WHERE document_id = d.id)
+         WHERE d.type = 'credit_memo' AND d.status != 'void'
+           AND l.source_document_id = ? AND l.source_line_id = ?`,
+      )
+      .get(documentId, lineId) as { total: bigint };
+    return row.total;
+  }
+
+  private sourceLineFor(documentId: string, lineId: string): DocumentLine | undefined {
+    const record = this.getDocumentRecord(documentId);
+    if (!record) return undefined;
+    const current = record.revisions[record.revisions.length - 1]!;
+    return current.lines.find((line) => line.lineId === lineId);
+  }
+
   // ── Documents (ADR 0004) ────────────────────────────────────────────────
 
   createDocument(input: NewDocument): DocumentView {
@@ -759,6 +856,14 @@ export class CompanyFile implements ItemCatalog {
       inherited = deriveTags(source, this.lineClosures(source.id));
     }
     validateRevisionContent({ date: input.date, lines, customerName: customer.customerName });
+    this.requireBelowCostApproval(input.type, input.date, lines, input.approvedBy);
+    if (input.type === 'credit_memo') {
+      validateReturnQuantities(
+        lines,
+        (documentId, lineId) => this.sourceLineFor(documentId, lineId),
+        (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
+      );
+    }
     const id = randomUUID();
     this.db.transaction(() => {
       try {
@@ -820,6 +925,18 @@ export class CompanyFile implements ItemCatalog {
     validateRevisionContent({ date, lines, customerName });
     // ADR 0006: never orphan downstream links or over-consume a shrunk line.
     validateLineConsumption(lines, this.fulfillment(id));
+    this.requireBelowCostApproval(document.type, date, lines, changes.approvedBy);
+    if (document.type === 'credit_memo' && changes.lines !== undefined) {
+      validateReturnQuantities(
+        lines,
+        (documentId, lineId) => this.sourceLineFor(documentId, lineId),
+        (documentId, lineId) =>
+          this.priorReturnedMilli(documentId, lineId) -
+          previous.lines
+            .filter((line) => line.sourceDocumentId === documentId && line.sourceLineId === lineId)
+            .reduce((sum, line) => sum + line.quantityMilli, 0n),
+      );
+    }
     this.db.transaction(() => {
       this.insertRevision(id, {
         revisionNo: previous.revisionNo + 1,
@@ -844,7 +961,8 @@ export class CompanyFile implements ItemCatalog {
    * "We accidentally charged the wrong amount": reduce a sent invoice's
    * customer total to `actualTotal`, pro rata with cost floors (ADR 0005).
    */
-  chargeCorrection(id: string, actualTotal: bigint, reason?: string): DocumentView {
+  chargeCorrection(id: string, actualTotal: bigint, reason?: string, approvedBy?: string): DocumentView {
+    this.requireApproval('charge_correction', approvedBy);
     const document = this.requireDocumentRecord(id);
     const kind = resolveRevisionKind(document.type, document.status, 'correction');
     const lines = planChargeCorrection(document, actualTotal, this);
@@ -909,8 +1027,14 @@ export class CompanyFile implements ItemCatalog {
       ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
       ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
     };
+    if (input.overrideWindow === true) {
+      this.requireApproval('return_window_override', input.approvedBy);
+    }
     const invoices = this.listDocumentRecords('invoice');
-    const lines = input.items.map((item) => buildReturnLine(item, query, input.date, invoices, this));
+    const policy = this.returnPolicy();
+    const lines = input.items.map((item) =>
+      buildReturnLine(item, query, input.date, invoices, this, policy, input.overrideWindow ?? false),
+    );
     return this.createDocument({
       type: 'credit_memo',
       number: input.number,
@@ -943,6 +1067,7 @@ export class CompanyFile implements ItemCatalog {
 
   /** Explicitly close (part of) a line without fulfilling it (ADR 0005). */
   closeLine(documentId: string, input: NewLineClosure): LineClosure {
+    this.requireApproval('close_line', input.approvedBy);
     const document = this.requireDocumentRecord(documentId);
     if (document.status !== 'sent') {
       throw new LedgerError('INVALID_STATUS', 'Only lines of sent documents can be closed');
@@ -1036,7 +1161,8 @@ export class CompanyFile implements ItemCatalog {
     return this.viewDocument(id);
   }
 
-  voidDocument(id: string): DocumentView {
+  voidDocument(id: string, approvedBy?: string): DocumentView {
+    this.requireApproval('void_document', approvedBy);
     const document = this.requireDocumentRecord(id);
     if (document.status === 'void') {
       throw new LedgerError('INVALID_STATUS', 'Document is already void');
@@ -1095,6 +1221,7 @@ export class CompanyFile implements ItemCatalog {
       substituted: bigint;
       source_document_id: string | null;
       source_line_id: string | null;
+      return_condition: ReturnCondition | null;
     }
     const lineRows = this.db
       .prepare(`SELECT * FROM document_revision_lines WHERE document_id = ? ORDER BY revision_no, line_no`)
@@ -1141,6 +1268,7 @@ export class CompanyFile implements ItemCatalog {
           substituted: line.substituted === 1n,
           sourceDocumentId: line.source_document_id ?? (line.source_line_id !== null ? row.source_document_id : null),
           sourceLineId: line.source_line_id,
+          returnCondition: line.return_condition,
         })),
       })),
     };
@@ -1192,8 +1320,8 @@ export class CompanyFile implements ItemCatalog {
       );
     const insertLine = this.db.prepare(
       `INSERT INTO document_revision_lines
-         (document_id, revision_no, line_no, line_id, item_id, description, quantity_milli, unit_price, currency, adjustment, free, substituted, source_document_id, source_line_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (document_id, revision_no, line_no, line_id, item_id, description, quantity_milli, unit_price, currency, adjustment, free, substituted, source_document_id, source_line_id, return_condition)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     revision.lines.forEach((line, index) => {
       insertLine.run(
@@ -1211,6 +1339,7 @@ export class CompanyFile implements ItemCatalog {
         line.substituted ? 1 : 0,
         line.sourceDocumentId,
         line.sourceLineId,
+        line.returnCondition,
       );
     });
   }

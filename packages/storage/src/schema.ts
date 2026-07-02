@@ -421,7 +421,13 @@ WHEN NEW.id IS NOT OLD.id
 BEGIN SELECT RAISE(ABORT, 'only payment status may change'); END;
 `;
 
+const V10_SQL = `
+-- Tier 2: return conditions live on credit-memo lines (ADR 0009 part 1).
+ALTER TABLE document_revision_lines ADD COLUMN return_condition TEXT
+  CHECK (return_condition IS NULL OR return_condition IN ('unopened','opened','damaged'));
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

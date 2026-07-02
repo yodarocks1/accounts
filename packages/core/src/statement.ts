@@ -107,7 +107,7 @@ export interface Statement {
   readonly balance: bigint;
 }
 
-function daysBetween(from: string, to: string): number {
+export function daysBetween(from: string, to: string): number {
   const parse = (value: string): number => {
     const [year, month, day] = value.split('-').map(Number);
     return Date.UTC(year!, month! - 1, day!);

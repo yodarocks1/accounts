@@ -57,6 +57,13 @@ export {
   type CustomerQuery,
   type ReturnItem,
   type NewReturn,
+  RETURN_CONDITIONS,
+  type ReturnCondition,
+  type RestockingFee,
+  type ReturnPolicy,
+  APPROVAL_ACTIONS,
+  type ApprovalAction,
+  validateReturnQuantities,
   matchesCustomerOrParty,
   resolveDocumentLines,
   resolveRevisionKind,
@@ -103,6 +110,7 @@ export {
   DEFAULT_AGING_RULES,
   ageLabelFor,
   computeStatement,
+  daysBetween,
 } from './statement.js';
 export { type Party, type NewParty, type PartyName } from './parties.js';
 export {

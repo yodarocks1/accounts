@@ -164,7 +164,7 @@ describe('returns and credits (ADR 0006 part 2)', () => {
     expect(credit.total).toBe(3000n); // last purchase price, not current catalog
     expect(credit.current.lines[0]!.sourceDocumentId).toBe(lastSale.id);
     expect(credit.current.lines[0]!.sourceLineId).toBe(lastSale.current.lines[0]!.lineId);
-    expect(credit.current.lines[0]!.description).toBe('Widget (return)');
+    expect(credit.current.lines[0]!.description).toBe('Widget (return, unopened)');
     expect(book.getDocument(credit.id)!.settlement).toBe('account');
   });
 

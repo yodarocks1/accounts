@@ -25,7 +25,10 @@ export type LedgerErrorCode =
   | 'UNKNOWN_LINE'
   | 'LINE_OVERDRAWN'
   | 'LINE_LINKED'
-  | 'NO_PURCHASE_HISTORY';
+  | 'NO_PURCHASE_HISTORY'
+  | 'RETURN_EXCEEDS_PURCHASE'
+  | 'RETURN_WINDOW'
+  | 'APPROVAL_REQUIRED';
 
 export class LedgerError extends Error {
   constructor(
