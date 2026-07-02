@@ -347,6 +347,10 @@ A first-class, obsessively-tested onramp — this determines adoption.
       quantity guard), rate expiry/revocation/review, quantity price
       breaks incl. exact multiples, approval gates, pre-migration
       backups (ADR 0009)
+- [x] Sales tax (snapshotted rates, exemptions, tax-payable posting),
+      auto-numbering, deposits/prepayments on sales orders with item
+      policies and line-level prepayment, JSON HTTP API + CLI document
+      commands (ADR 0010)
 - [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging

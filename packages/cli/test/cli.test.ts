@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CompanyFile } from '@accounts/storage';
 import { run } from '../src/cli.js';
 
 let dir: string;
@@ -97,5 +98,33 @@ describe('accounts CLI', () => {
 
   it('prints usage with no arguments', () => {
     expect(run([])).toContain('Usage:');
+  });
+});
+
+describe('document commands (Tier 3)', () => {
+  it('item add, doc list/show/send, statement', () => {
+    run(['init', books, '--name', 'Demo Co']);
+    const itemOut = run(['item', 'add', books, '--name', 'Widget', '--price', '25.00', '--cost', '10.00']);
+    const itemId = /\(([-0-9a-f]+)\)$/.exec(itemOut)![1]!;
+
+    // Create a document through the library (creation stays API/REST-side).
+    const file = CompanyFile.open(books);
+    const invoice = file.createDocument({
+      type: 'invoice', number: 'INV-1', date: '2026-07-01', customerName: 'Acme LLC', termsDays: 30,
+      lines: [{ itemId, description: 'Widget', quantityMilli: 4000n }],
+    });
+    file.close();
+
+    expect(run(['doc', 'list', books])).toContain('INV-1');
+    const shown = run(['doc', 'show', books, invoice.id]);
+    expect(shown).toContain('INVOICE INV-1');
+    expect(shown).toContain('Net 30');
+    expect(shown).toContain('Total: 100.00');
+
+    expect(run(['doc', 'send', books, invoice.id])).toContain('Sent INV-1');
+    const statement = run(['statement', books, '--customer', 'Acme LLC', '--as-of', '2026-09-15']);
+    expect(statement).toContain('INV-1');
+    expect(statement).toContain('past due');
+    expect(statement).toContain('Balance due: 100.00');
   });
 });

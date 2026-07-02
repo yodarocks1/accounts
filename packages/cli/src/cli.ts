@@ -1,13 +1,16 @@
 import { parseArgs } from 'node:util';
 import {
   formatMoney,
+  formatQuantity,
   money,
   normalBalance,
   parseMoney,
   type Account,
+  type DocumentType,
   type NewJournalLine,
 } from '@accounts/core';
 import { CompanyFile } from '@accounts/storage';
+import { createApiServer } from '@accounts/server';
 
 export const USAGE = `accounts — open-source, moddable double-entry books
 
@@ -19,6 +22,14 @@ Usage:
   accounts reverse <file> <entry-id> --date YYYY-MM-DD [--memo <text>]
   accounts entries <file>
   accounts trial-balance <file> [--as-of YYYY-MM-DD]
+
+Document layer:
+  accounts item add <file> --name <name> --price <amount> [--cost <amount>] [--tax-code <code>] [--deposit-policy <never|always|when_out_of_stock>]
+  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo>]
+  accounts doc show <file> <document-id>
+  accounts doc send <file> <document-id> [--override-deposit] [--approved-by <who>]
+  accounts statement <file> (--party <id> | --customer <name> | --acct <number>) [--as-of YYYY-MM-DD]
+  accounts serve <file> [--port 3000]
 
 Accounts in --debit/--credit are referenced by code or id; amounts are decimal
 strings in the account's currency ("1500.00").`;
@@ -89,6 +100,14 @@ export function run(argv: string[]): string {
       return cmdEntries(rest);
     case 'trial-balance':
       return cmdTrialBalance(rest);
+    case 'item':
+      return cmdItem(rest);
+    case 'doc':
+      return cmdDoc(rest);
+    case 'statement':
+      return cmdStatement(rest);
+    case 'serve':
+      return cmdServe(rest);
     default:
       fail(`Unknown command ${JSON.stringify(command)}\n\n${USAGE}`);
   }
@@ -283,4 +302,214 @@ function cmdTrialBalance(args: string[]): string {
   } finally {
     file.close();
   }
+}
+
+function cmdItem(args: string[]): string {
+  const [sub, ...rest] = args;
+  if (sub !== 'add') fail(`Unknown subcommand: item ${sub ?? ''}\n\n${USAGE}`);
+  const { values, positionals } = parseArgs({
+    args: rest,
+    allowPositionals: true,
+    options: {
+      name: { type: 'string' },
+      price: { type: 'string' },
+      cost: { type: 'string' },
+      currency: { type: 'string' },
+      'tax-code': { type: 'string' },
+      'deposit-policy': { type: 'string' },
+    },
+  });
+  const file = CompanyFile.open(requirePath(positionals));
+  try {
+    if (!values.name || !values.price) fail('item add requires --name and --price');
+    const currency = values.currency ?? file.info().baseCurrency;
+    const item = file.createItem({
+      name: values.name,
+      currency,
+      unitPrice: parseMoney(values.price, currency).amount,
+      ...(values.cost !== undefined ? { cost: parseMoney(values.cost, currency).amount } : {}),
+      ...(values['tax-code'] !== undefined ? { taxCode: values['tax-code'] } : {}),
+      ...(values['deposit-policy'] !== undefined
+        ? { depositPolicy: values['deposit-policy'] as 'never' | 'always' | 'when_out_of_stock' }
+        : {}),
+    });
+    return `Created item ${item.name} (${item.id})`;
+  } finally {
+    file.close();
+  }
+}
+
+function cmdDoc(args: string[]): string {
+  const [sub, ...rest] = args;
+  if (sub === 'list') return cmdDocList(rest);
+  if (sub === 'show') return cmdDocShow(rest);
+  if (sub === 'send') return cmdDocSend(rest);
+  fail(`Unknown subcommand: doc ${sub ?? ''}\n\n${USAGE}`);
+}
+
+function cmdDocList(args: string[]): string {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: { type: { type: 'string' } },
+  });
+  const file = CompanyFile.open(requirePath(positionals));
+  try {
+    const documents = file.listDocuments(values.type as DocumentType | undefined);
+    if (documents.length === 0) return 'No documents yet.';
+    const rows = [
+      ['TYPE', 'NUMBER', 'STATUS', 'DATE', 'CUSTOMER', 'TOTAL', 'ID'],
+      ...documents.map((view) => [
+        view.type,
+        view.label,
+        view.status,
+        view.current.date,
+        view.current.customerName,
+        formatMoney(money(view.total, view.currency)),
+        view.id,
+      ]),
+    ];
+    return table(rows, ['left', 'left', 'left', 'left', 'left', 'right', 'left']);
+  } finally {
+    file.close();
+  }
+}
+
+function cmdDocShow(args: string[]): string {
+  const { positionals } = parseArgs({ args, allowPositionals: true, options: {} });
+  const file = CompanyFile.open(requirePath(positionals));
+  try {
+    const id = positionals[1];
+    if (!id) fail('doc show requires a document id');
+    const view = file.viewDocument(id);
+    const current = view.current;
+    const usd = (value: bigint) => formatMoney(money(value, view.currency));
+    const header = [
+      `${view.type.toUpperCase()} ${view.label}  [${view.status}]`,
+      `Customer: ${current.customerName}${current.accountNumber ? `  (${current.accountNumber})` : ''}${current.poNumber ? `  PO ${current.poNumber}` : ''}`,
+      `Date: ${current.date}${current.termsDays !== null ? `  Net ${current.termsDays}` : ''}`,
+      ...(current.depositRequiredMinor !== null ? [`Deposit requested: ${usd(current.depositRequiredMinor)}`] : []),
+    ];
+    const lineRows = [
+      ['QTY', 'DESCRIPTION', 'UNIT', 'TAX', 'AMOUNT'],
+      ...current.lines.map((line) => [
+        formatQuantity(line.quantityMilli),
+        line.description + (line.free ? ' (FREE)' : ''),
+        usd(line.unitPrice),
+        line.taxCode ?? '',
+        line.free ? usd(0n) : usd((line.quantityMilli * line.unitPrice) / 1000n + line.adjustment),
+      ]),
+    ];
+    const totals = [
+      `Subtotal: ${usd(view.subtotal)}`,
+      ...(view.taxTotal > 0n ? [`Tax: ${usd(view.taxTotal)}`] : []),
+      `Total: ${usd(view.total)}`,
+    ];
+    if (view.type === 'invoice' && view.status === 'sent') {
+      const settlement = file.invoiceSettlement(view.id);
+      totals.push(`Paid: ${usd(settlement.paid)}  Open: ${usd(settlement.open)}  [${settlement.status}]`);
+    }
+    if (view.type === 'sales_order' && view.status === 'sent') {
+      totals.push(`Deposit held: ${usd(file.depositHeld(view.id))}`);
+    }
+    return [...header, '', table(lineRows, ['right', 'left', 'right', 'left', 'right']), '', ...totals].join('\n');
+  } finally {
+    file.close();
+  }
+}
+
+function cmdDocSend(args: string[]): string {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: {
+      'override-deposit': { type: 'boolean' },
+      'approved-by': { type: 'string' },
+    },
+  });
+  const file = CompanyFile.open(requirePath(positionals));
+  try {
+    const id = positionals[1];
+    if (!id) fail('doc send requires a document id');
+    const view = file.sendDocument(id, {
+      ...(values['override-deposit'] !== undefined ? { overrideDeposit: values['override-deposit'] } : {}),
+      ...(values['approved-by'] !== undefined ? { approvedBy: values['approved-by'] } : {}),
+    });
+    const suggestions = file.suggestSpecialRates(id);
+    const ask = suggestions.map(
+      (suggestion) =>
+        `ASK: keep ${suggestion.itemName} at ${formatMoney(money(suggestion.givenPrice, view.currency))} for ${suggestion.customerName}? (list ${formatMoney(money(suggestion.catalogPrice, view.currency))})`,
+    );
+    return [`Sent ${view.label}`, ...ask].join('\n');
+  } finally {
+    file.close();
+  }
+}
+
+function cmdStatement(args: string[]): string {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: {
+      party: { type: 'string' },
+      customer: { type: 'string' },
+      acct: { type: 'string' },
+      'as-of': { type: 'string' },
+    },
+  });
+  const file = CompanyFile.open(requirePath(positionals));
+  try {
+    const asOf = values['as-of'] ?? new Date().toISOString().slice(0, 10);
+    const statement = values.party
+      ? file.statementForParty(values.party, asOf)
+      : file.statement(
+          {
+            ...(values.customer !== undefined ? { customerName: values.customer } : {}),
+            ...(values.acct !== undefined ? { accountNumber: values.acct } : {}),
+          },
+          asOf,
+        );
+    const usd = (value: bigint) => formatMoney(money(value, file.info().baseCurrency));
+    const out: string[] = [`STATEMENT as of ${statement.asOf}`];
+    for (const invoice of statement.invoices) {
+      out.push(
+        `  ${invoice.date}  ${invoice.label.padEnd(24)} ${usd(invoice.originalTotal).padStart(10)}  [${invoice.ageLabel}]${invoice.dueDate ? `  due ${invoice.dueDate}` : ''}`,
+      );
+      for (const correction of invoice.corrections) {
+        out.push(`              └─ correction: ${usd(correction.total)}${correction.reason ? `  (${correction.reason})` : ''}`);
+      }
+      if (invoice.paidAmount > 0n) out.push(`              paid ${usd(invoice.paidAmount)}, open ${usd(invoice.openAmount)}`);
+    }
+    for (const credit of statement.credits) {
+      out.push(`  ${credit.date}  ${credit.label.padEnd(24)} −${usd(credit.total)}  (${credit.kind}, ${credit.settlement})`);
+    }
+    for (const payment of statement.payments) {
+      out.push(`  ${payment.date}  ${payment.number.padEnd(24)} −${usd(payment.amount)}  (payment${payment.method ? `, ${payment.method}` : ''})`);
+    }
+    out.push(`  Balance due: ${usd(statement.balance)}`);
+    return out.join('\n');
+  } finally {
+    file.close();
+  }
+}
+
+function cmdServe(args: string[]): string {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: { port: { type: 'string' } },
+  });
+  const path = requirePath(positionals);
+  const file = CompanyFile.open(path);
+  const port = Number(values.port ?? 3000);
+  const server = createApiServer(file);
+  server.listen(port);
+  // The server owns the process from here; close on SIGINT.
+  process.on('SIGINT', () => {
+    server.close(() => {
+      file.close();
+      process.exit(0);
+    });
+  });
+  return `Serving ${path} on http://127.0.0.1:${port} (Ctrl-C to stop)`;
 }

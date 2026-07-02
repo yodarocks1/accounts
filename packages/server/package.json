@@ -1,17 +1,18 @@
 {
-  "name": "@accounts/cli",
+  "name": "@accounts/server",
   "version": "0.0.1",
-  "description": "Command-line interface for accounts company files",
+  "description": "Dependency-free JSON HTTP API over an accounts company file",
   "license": "AGPL-3.0-only",
   "type": "module",
-  "bin": {
-    "accounts": "./dist/main.js"
-  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": [
-    "dist"
-  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -19,8 +20,7 @@
   },
   "dependencies": {
     "@accounts/core": "workspace:*",
-    "@accounts/storage": "workspace:*",
-    "@accounts/server": "workspace:*"
+    "@accounts/storage": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.1.0",
