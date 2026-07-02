@@ -57,6 +57,7 @@ export {
   type CustomerQuery,
   type ReturnItem,
   type NewReturn,
+  matchesCustomerOrParty,
   resolveDocumentLines,
   resolveRevisionKind,
   deriveTags,
@@ -103,6 +104,7 @@ export {
   ageLabelFor,
   computeStatement,
 } from './statement.js';
+export { type Party, type NewParty, type PartyName } from './parties.js';
 export {
   POSTING_ROLES,
   type PostingRole,

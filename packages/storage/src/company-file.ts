@@ -52,6 +52,9 @@ import {
   type PostingRole,
   type CustomerQuery,
   type CustomerRate,
+  type Party,
+  type NewParty,
+  type PartyName,
   type NewCustomerRate,
   type SpecialRateSuggestion,
   type AgingRule,
@@ -359,6 +362,132 @@ export class CompanyFile implements ItemCatalog {
     return this.listEntries().filter((entry) => entry.date <= asOf);
   }
 
+  // ── Parties (Tier 1, ADR 0008 part 4) ───────────────────────────────────
+
+  createParty(input: NewParty): Party {
+    if (!input.name.trim()) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Party name must not be empty');
+    }
+    const party: Party = {
+      id: randomUUID(),
+      name: input.name.trim(),
+      accountNumber: input.accountNumber ?? null,
+      termsDays: validateTermsDays(input.termsDays) ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    this.db.transaction(() => {
+      try {
+        this.db
+          .prepare(`INSERT INTO parties (id, account_number, terms_days, created_at) VALUES (?, ?, ?, ?)`)
+          .run(party.id, party.accountNumber, party.termsDays, party.createdAt);
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('UNIQUE constraint failed: parties.account_number')) {
+          throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Account number already in use: ${party.accountNumber}`);
+        }
+        throw error;
+      }
+      this.db
+        .prepare(`INSERT INTO party_names (party_id, name_seq, name, at) VALUES (?, 1, ?, ?)`)
+        .run(party.id, party.name, party.createdAt);
+      this.audit('party.created', 'party', party.id, { name: party.name, accountNumber: party.accountNumber });
+    })();
+    return party;
+  }
+
+  /** Renames are events: history is kept, documents keep their snapshots. */
+  renameParty(id: string, name: string): Party {
+    const party = this.requireParty(id);
+    if (!name.trim()) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Party name must not be empty');
+    }
+    this.db.transaction(() => {
+      const next = this.db
+        .prepare(`SELECT coalesce(max(name_seq), 0) + 1 AS seq FROM party_names WHERE party_id = ?`)
+        .get(id) as { seq: bigint };
+      this.db
+        .prepare(`INSERT INTO party_names (party_id, name_seq, name, at) VALUES (?, ?, ?, ?)`)
+        .run(id, next.seq, name.trim(), new Date().toISOString());
+      this.audit('party.renamed', 'party', id, { from: party.name, to: name.trim() });
+    })();
+    return { ...party, name: name.trim() };
+  }
+
+  getParty(id: string): Party | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT p.id, p.account_number AS accountNumber, p.terms_days AS termsDays, p.created_at AS createdAt,
+                (SELECT name FROM party_names WHERE party_id = p.id ORDER BY name_seq DESC LIMIT 1) AS name
+         FROM parties p WHERE p.id = ?`,
+      )
+      .get(id) as { id: string; accountNumber: string | null; termsDays: bigint | null; createdAt: string; name: string } | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      name: row.name,
+      accountNumber: row.accountNumber,
+      termsDays: row.termsDays === null ? null : Number(row.termsDays),
+      createdAt: row.createdAt,
+    };
+  }
+
+  partyNameHistory(id: string): PartyName[] {
+    const rows = this.db
+      .prepare(`SELECT name_seq AS nameSeq, name, at FROM party_names WHERE party_id = ? ORDER BY name_seq`)
+      .all(id) as { nameSeq: bigint; name: string; at: string }[];
+    return rows.map((row) => ({ ...row, nameSeq: Number(row.nameSeq) }));
+  }
+
+  findPartyByAccountNumber(accountNumber: string): Party | undefined {
+    const row = this.db.prepare(`SELECT id FROM parties WHERE account_number = ?`).get(accountNumber) as
+      | { id: string }
+      | undefined;
+    return row ? this.getParty(row.id) : undefined;
+  }
+
+  private requireParty(id: string): Party {
+    const party = this.getParty(id);
+    if (!party) {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such party: ${id}`);
+    }
+    return party;
+  }
+
+  /** Effective customer fields: explicit values win, party supplies defaults. */
+  private resolveCustomer(input: {
+    partyId?: string;
+    customerName?: string;
+    accountNumber?: string;
+    termsDays?: number;
+  }): { partyId: string | null; customerName: string; accountNumber?: string; termsDays?: number } {
+    const party = input.partyId !== undefined ? this.requireParty(input.partyId) : undefined;
+    const customerName = input.customerName ?? party?.name;
+    if (customerName === undefined || !customerName.trim()) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Every transaction must carry a customer name (ADR 0006)');
+    }
+    const accountNumber = input.accountNumber ?? party?.accountNumber ?? undefined;
+    const termsDays = validateTermsDays(input.termsDays) ?? party?.termsDays ?? undefined;
+    return {
+      partyId: party?.id ?? null,
+      customerName: customerName.trim(),
+      ...(accountNumber !== undefined ? { accountNumber } : {}),
+      ...(termsDays !== undefined ? { termsDays } : {}),
+    };
+  }
+
+  /** Statement resolved through the party's identity, with free-text fallback. */
+  statementForParty(partyId: string, asOf: string, rules?: readonly AgingRule[]): Statement {
+    const party = this.requireParty(partyId);
+    return this.statement(
+      {
+        partyId,
+        customerName: party.name,
+        ...(party.accountNumber !== null ? { accountNumber: party.accountNumber } : {}),
+      },
+      asOf,
+      rules,
+    );
+  }
+
   // ── Items & price history (ADR 0004) ────────────────────────────────────
 
   createItem(input: NewItem): Item {
@@ -482,9 +611,10 @@ export class CompanyFile implements ItemCatalog {
     if (!this.getItem(input.itemId)) {
       throw new LedgerError('UNKNOWN_ITEM', `No such item: ${input.itemId}`);
     }
-    if (input.customerName === undefined && input.accountNumber === undefined) {
-      throw new LedgerError('INVALID_DOCUMENT', 'A rate needs a customer name or account number');
+    if (input.customerName === undefined && input.accountNumber === undefined && input.partyId === undefined) {
+      throw new LedgerError('INVALID_DOCUMENT', 'A rate needs a party, customer name, or account number');
     }
+    if (input.partyId !== undefined) this.requireParty(input.partyId);
     const effectiveFrom = input.effectiveFrom ?? '0000-01-01';
     const evalDate = input.effectiveFrom ?? '9999-12-31';
     const salePrice = this.priceAt(input.itemId, evalDate);
@@ -498,6 +628,7 @@ export class CompanyFile implements ItemCatalog {
     const rate: CustomerRate = {
       rateSeq: 0, // assigned below
       itemId: input.itemId,
+      partyId: input.partyId ?? null,
       customerName: input.customerName ?? null,
       accountNumber: input.accountNumber ?? null,
       kind: input.rate.kind,
@@ -514,11 +645,12 @@ export class CompanyFile implements ItemCatalog {
       const result = this.db
         .prepare(
           `INSERT INTO customer_rates
-             (item_id, customer_name, account_number, kind, unit_price, base, percent_milli, amount_minor, allow_below_cost, effective_from, at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (item_id, party_id, customer_name, account_number, kind, unit_price, base, percent_milli, amount_minor, allow_below_cost, effective_from, at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           rate.itemId,
+          rate.partyId,
           rate.customerName,
           rate.accountNumber,
           rate.kind,
@@ -548,6 +680,7 @@ export class CompanyFile implements ItemCatalog {
     interface RateRow {
       rate_seq: bigint;
       item_id: string;
+      party_id: string | null;
       customer_name: string | null;
       account_number: string | null;
       kind: CustomerRate['kind'];
@@ -563,17 +696,19 @@ export class CompanyFile implements ItemCatalog {
       .prepare(
         `SELECT * FROM customer_rates
          WHERE item_id = ? AND effective_from <= ?
-           AND ((account_number IS NOT NULL AND account_number = ?)
-             OR (account_number IS NULL AND customer_name = ?))
+           AND ((party_id IS NOT NULL AND party_id = ?)
+             OR (party_id IS NULL AND account_number IS NOT NULL AND account_number = ?)
+             OR (party_id IS NULL AND account_number IS NULL AND customer_name = ?))
          ORDER BY effective_from DESC, rate_seq DESC LIMIT 1`,
       )
-      .get(itemId, date, customer.accountNumber ?? null, customer.customerName ?? null) as
+      .get(itemId, date, customer.partyId ?? null, customer.accountNumber ?? null, customer.customerName ?? null) as
       | RateRow
       | undefined;
     if (!row) return undefined;
     return {
       rateSeq: Number(row.rate_seq),
       itemId: row.item_id,
+      partyId: row.party_id,
       customerName: row.customer_name,
       accountNumber: row.account_number,
       kind: row.kind,
@@ -607,9 +742,11 @@ export class CompanyFile implements ItemCatalog {
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
+    const customer = this.resolveCustomer(input);
     const lines = resolveDocumentLines(input.lines, input.date, this, undefined, {
-      customerName: input.customerName,
-      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+      customerName: customer.customerName,
+      ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
+      ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
     });
     let inherited: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
@@ -620,14 +757,14 @@ export class CompanyFile implements ItemCatalog {
       validateConversion(source, input.type, lines, this.fulfillment(source.id));
       inherited = deriveTags(source, this.lineClosures(source.id));
     }
-    validateRevisionContent({ date: input.date, lines, customerName: input.customerName });
+    validateRevisionContent({ date: input.date, lines, customerName: customer.customerName });
     const id = randomUUID();
     this.db.transaction(() => {
       try {
         this.db
           .prepare(
-            `INSERT INTO documents (id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement)
-             VALUES (?, ?, ?, 'draft', ?, ?, ?, ?)`,
+            `INSERT INTO documents (id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement, party_id)
+             VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?)`,
           )
           .run(
             id,
@@ -637,6 +774,7 @@ export class CompanyFile implements ItemCatalog {
             inherited.includes('with corrections') ? 1 : 0,
             inherited.includes('with substitutions') ? 1 : 0,
             input.type === 'credit_memo' ? (input.settlement ?? 'account') : null,
+            customer.partyId,
           );
       } catch (error) {
         if (error instanceof Error && error.message.includes('UNIQUE constraint failed: documents.type, documents.number')) {
@@ -650,10 +788,10 @@ export class CompanyFile implements ItemCatalog {
         at: new Date().toISOString(),
         reason: null,
         date: input.date,
-        customerName: input.customerName.trim(),
-        accountNumber: input.accountNumber ?? null,
+        customerName: customer.customerName,
+        accountNumber: customer.accountNumber ?? null,
         poNumber: input.poNumber ?? null,
-        termsDays: validateTermsDays(input.termsDays) ?? null,
+        termsDays: customer.termsDays ?? null,
         memo: input.memo ?? null,
         lines,
       });
@@ -675,6 +813,7 @@ export class CompanyFile implements ItemCatalog {
         ? resolveDocumentLines(changes.lines, date, this, previous.lines, {
             customerName,
             ...(accountNumber !== null ? { accountNumber } : {}),
+            ...(document.partyId !== null ? { partyId: document.partyId } : {}),
           })
         : [...previous.lines];
     validateRevisionContent({ date, lines, customerName });
@@ -743,6 +882,7 @@ export class CompanyFile implements ItemCatalog {
       date: spec.date,
       lines,
       sourceDocumentId: sourceId,
+      ...(source.partyId !== null ? { partyId: source.partyId } : {}),
       customerName: spec.customerName ?? previous.customerName,
       ...((spec.accountNumber ?? previous.accountNumber) !== null
         ? { accountNumber: (spec.accountNumber ?? previous.accountNumber)! }
@@ -762,9 +902,11 @@ export class CompanyFile implements ItemCatalog {
    * with line-level links back to that purchase (ADR 0006).
    */
   createReturn(input: NewReturn): DocumentView {
+    const customer = this.resolveCustomer(input);
     const query: CustomerQuery = {
-      customerName: input.customerName,
-      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+      customerName: customer.customerName,
+      ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
+      ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
     };
     const invoices = this.listDocumentRecords('invoice');
     const lines = input.items.map((item) => buildReturnLine(item, query, input.date, invoices, this));
@@ -773,8 +915,9 @@ export class CompanyFile implements ItemCatalog {
       number: input.number,
       date: input.date,
       lines,
-      customerName: input.customerName,
-      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+      customerName: customer.customerName,
+      ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
+      ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
       ...(input.poNumber !== undefined ? { poNumber: input.poNumber } : {}),
       ...(input.settlement !== undefined ? { settlement: input.settlement } : {}),
       ...(input.memo !== undefined ? { memo: input.memo } : {}),
@@ -916,6 +1059,7 @@ export class CompanyFile implements ItemCatalog {
       inherited_corrections: bigint;
       inherited_substitutions: bigint;
       settlement: DocumentRecord['settlement'];
+      party_id: string | null;
     }
     const row = this.db.prepare(`SELECT * FROM documents WHERE id = ?`).get(id) as
       | DocumentRow
@@ -970,6 +1114,7 @@ export class CompanyFile implements ItemCatalog {
       number: row.number,
       status: row.status,
       sourceDocumentId: row.source_document_id,
+      partyId: row.party_id,
       settlement: row.settlement,
       inheritedTags,
       revisions: revisionRows.map((revision) => ({
@@ -1076,15 +1221,14 @@ export class CompanyFile implements ItemCatalog {
     if (input.amount <= 0n) {
       throw new LedgerError('INVALID_ALLOCATION', 'Payment amounts must be positive');
     }
-    if (!input.customerName.trim()) {
-      throw new LedgerError('INVALID_DOCUMENT', 'Every transaction must carry a customer name (ADR 0006)');
-    }
+    const customer = this.resolveCustomer(input);
     const payment: Payment = {
       id: randomUUID(),
       number: input.number,
       date: input.date,
-      customerName: input.customerName.trim(),
-      accountNumber: input.accountNumber ?? null,
+      partyId: customer.partyId,
+      customerName: customer.customerName,
+      accountNumber: customer.accountNumber ?? null,
       poNumber: input.poNumber ?? null,
       memo: input.memo ?? null,
       method: input.method ?? null,
@@ -1095,13 +1239,14 @@ export class CompanyFile implements ItemCatalog {
       try {
         this.db
           .prepare(
-            `INSERT INTO payments (id, number, date, customer_name, account_number, po_number, memo, method, amount, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
+            `INSERT INTO payments (id, number, date, party_id, customer_name, account_number, po_number, memo, method, amount, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
           )
           .run(
             payment.id,
             payment.number,
             payment.date,
+            payment.partyId,
             payment.customerName,
             payment.accountNumber,
             payment.poNumber,
@@ -1147,6 +1292,7 @@ export class CompanyFile implements ItemCatalog {
       id: string;
       number: string;
       date: string;
+      party_id: string | null;
       customer_name: string;
       account_number: string | null;
       po_number: string | null;
@@ -1161,6 +1307,7 @@ export class CompanyFile implements ItemCatalog {
       id: row.id,
       number: row.number,
       date: row.date,
+      partyId: row.party_id,
       customerName: row.customer_name,
       accountNumber: row.account_number,
       poNumber: row.po_number,

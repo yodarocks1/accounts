@@ -13,6 +13,7 @@ import {
   type NewCustomerRate,
   type SpecialRateSuggestion,
 } from './customer-rates.js';
+import type { NewParty, Party, PartyName } from './parties.js';
 import {
   appliedFromSource,
   appliedToInvoice,
@@ -112,6 +113,8 @@ export interface DocumentRecord {
   readonly number: string;
   readonly status: DocumentStatus;
   readonly sourceDocumentId: string | null;
+  /** Durable customer identity when known (ADR 0008 part 4). */
+  readonly partyId: string | null;
   /** Only for credit memos: how the credit settles (ADR 0006). */
   readonly settlement: SettlementMode | null;
   /** Source document's tags snapshotted at creation (ADR 0004). */
@@ -126,6 +129,7 @@ export interface DocumentView {
   readonly number: string;
   readonly status: DocumentStatus;
   readonly sourceDocumentId: string | null;
+  readonly partyId: string | null;
   readonly current: DocumentRevision;
   readonly tags: readonly DocumentTag[];
   /** e.g. "INV-0001 (with corrections)" */
@@ -522,6 +526,7 @@ export function viewDocument(
     number: document.number,
     status: document.status,
     sourceDocumentId: document.sourceDocumentId,
+    partyId: document.partyId,
     current,
     tags,
     label: documentLabel(document.number, tags),
@@ -664,6 +669,8 @@ export function buildConversionLines(
 export interface CustomerQuery {
   customerName?: string;
   accountNumber?: string;
+  /** Durable identity; matches record-level partyId (ADR 0008 part 4). */
+  partyId?: string;
 }
 
 /** Match a revision's customer: account number when given, else exact name. */
@@ -677,7 +684,20 @@ export function matchesCustomer(
   if (query.customerName !== undefined) {
     return revision.customerName === query.customerName;
   }
-  throw new LedgerError('INVALID_DOCUMENT', 'Customer query needs a name or an account number');
+  return false;
+}
+
+/**
+ * Party identity wins; free-text matching remains as the fallback for
+ * documents recorded before the party existed (ADR 0008 part 4).
+ */
+export function matchesCustomerOrParty(
+  record: Pick<DocumentRecord, 'partyId'>,
+  revision: Pick<DocumentRevision, 'customerName' | 'accountNumber'>,
+  query: CustomerQuery,
+): boolean {
+  if (query.partyId !== undefined && record.partyId === query.partyId) return true;
+  return matchesCustomer(revision, query);
 }
 
 /** The customer-facing per-unit price actually paid on a line (free ⇒ 0). */
@@ -700,7 +720,7 @@ export function findLastPurchase(
   for (const record of invoices) {
     if (record.type !== 'invoice' || record.status !== 'sent') continue;
     const current = record.revisions[record.revisions.length - 1]!;
-    if (current.date > asOf || !matchesCustomer(current, customer)) continue;
+    if (current.date > asOf || !matchesCustomerOrParty(record, current, customer)) continue;
     const line = current.lines.find((candidate) => candidate.itemId === itemId);
     if (!line) continue;
     if (!best) {
@@ -725,8 +745,9 @@ export interface ReturnItem {
 export interface NewReturn {
   number: string;
   date: string;
-  customerName: string;
+  customerName?: string;
   accountNumber?: string;
+  partyId?: string;
   poNumber?: string;
   settlement?: SettlementMode;
   memo?: string;
@@ -828,11 +849,14 @@ export interface NewDocument {
   number: string;
   date: string;
   lines: NewDocumentLine[];
-  customerName: string;
+  /** Required unless partyId supplies it. */
+  customerName?: string;
   accountNumber?: string;
   poNumber?: string;
-  /** Payment terms in days (Net N). */
+  /** Payment terms in days (Net N); defaults from the party when linked. */
   termsDays?: number;
+  /** Link to the durable customer record; supplies name/account/terms defaults. */
+  partyId?: string;
   memo?: string;
   sourceDocumentId?: string;
   /** Credit memos only: defaults to 'account'. */
@@ -873,6 +897,87 @@ export class DocumentBook implements ItemCatalog {
   private readonly rates: CustomerRate[] = [];
   private readonly payments = new Map<string, Payment>();
   private readonly applications: CreditApplication[] = [];
+  private readonly parties = new Map<string, Party>();
+  private readonly partyNames = new Map<string, PartyName[]>();
+
+  // ── Parties (ADR 0008 part 4) ─────────────────────────────────────────
+
+  createParty(input: NewParty, id: string = randomUUID(), at?: string): Party {
+    if (!input.name.trim()) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Party name must not be empty');
+    }
+    if (
+      input.accountNumber !== undefined &&
+      [...this.parties.values()].some((party) => party.accountNumber === input.accountNumber)
+    ) {
+      throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Account number already in use: ${input.accountNumber}`);
+    }
+    const party: Party = {
+      id,
+      name: input.name.trim(),
+      accountNumber: input.accountNumber ?? null,
+      termsDays: validateTermsDays(input.termsDays) ?? null,
+      createdAt: at ?? new Date().toISOString(),
+    };
+    this.parties.set(id, party);
+    this.partyNames.set(id, [{ nameSeq: 1, name: party.name, at: party.createdAt }]);
+    return party;
+  }
+
+  /** Renames are events: history is kept, documents keep their snapshots. */
+  renameParty(id: string, name: string, at?: string): Party {
+    const party = this.requireParty(id);
+    if (!name.trim()) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Party name must not be empty');
+    }
+    const history = this.partyNames.get(id)!;
+    history.push({ nameSeq: history.length + 1, name: name.trim(), at: at ?? new Date().toISOString() });
+    const renamed: Party = { ...party, name: name.trim() };
+    this.parties.set(id, renamed);
+    return renamed;
+  }
+
+  getParty(id: string): Party | undefined {
+    return this.parties.get(id);
+  }
+
+  partyNameHistory(id: string): readonly PartyName[] {
+    return this.partyNames.get(id) ?? [];
+  }
+
+  findPartyByAccountNumber(accountNumber: string): Party | undefined {
+    return [...this.parties.values()].find((party) => party.accountNumber === accountNumber);
+  }
+
+  private requireParty(id: string): Party {
+    const party = this.parties.get(id);
+    if (!party) {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such party: ${id}`);
+    }
+    return party;
+  }
+
+  /** Effective customer fields: explicit values win, party supplies defaults. */
+  private resolveCustomer(input: {
+    partyId?: string;
+    customerName?: string;
+    accountNumber?: string;
+    termsDays?: number;
+  }): { partyId: string | null; customerName: string; accountNumber?: string; termsDays?: number } {
+    const party = input.partyId !== undefined ? this.requireParty(input.partyId) : undefined;
+    const customerName = input.customerName ?? party?.name;
+    if (customerName === undefined || !customerName.trim()) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Every transaction must carry a customer name (ADR 0006)');
+    }
+    const accountNumber = input.accountNumber ?? party?.accountNumber ?? undefined;
+    const termsDays = validateTermsDays(input.termsDays) ?? party?.termsDays ?? undefined;
+    return {
+      partyId: party?.id ?? null,
+      customerName: customerName.trim(),
+      ...(accountNumber !== undefined ? { accountNumber } : {}),
+      ...(termsDays !== undefined ? { termsDays } : {}),
+    };
+  }
 
   // ── Items & price history ─────────────────────────────────────────────
 
@@ -972,9 +1077,10 @@ export class DocumentBook implements ItemCatalog {
     if (!this.items.has(input.itemId)) {
       throw new LedgerError('UNKNOWN_ITEM', `No such item: ${input.itemId}`);
     }
-    if (input.customerName === undefined && input.accountNumber === undefined) {
-      throw new LedgerError('INVALID_DOCUMENT', 'A rate needs a customer name or account number');
+    if (input.customerName === undefined && input.accountNumber === undefined && input.partyId === undefined) {
+      throw new LedgerError('INVALID_DOCUMENT', 'A rate needs a party, customer name, or account number');
     }
+    if (input.partyId !== undefined) this.requireParty(input.partyId);
     const effectiveFrom = input.effectiveFrom ?? '0000-01-01';
     // The below-cost default judges the item as of the rate's effective date;
     // for an open-ended rate, judge it by the latest known price and cost.
@@ -990,6 +1096,7 @@ export class DocumentBook implements ItemCatalog {
     const rate: CustomerRate = {
       rateSeq: this.rates.length + 1,
       itemId: input.itemId,
+      partyId: input.partyId ?? null,
       customerName: input.customerName ?? null,
       accountNumber: input.accountNumber ?? null,
       kind: input.rate.kind,
@@ -1058,9 +1165,11 @@ export class DocumentBook implements ItemCatalog {
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
+    const customer = this.resolveCustomer(input);
     const lines = this.resolveLines(input.lines, input.date, undefined, {
-      customerName: input.customerName,
-      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+      customerName: customer.customerName,
+      ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
+      ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
     });
     let inheritedTags: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
@@ -1071,13 +1180,14 @@ export class DocumentBook implements ItemCatalog {
       validateConversion(source, input.type, lines, this.fulfillment(source.id));
       inheritedTags = deriveTags(source, this.closures.get(source.id) ?? []);
     }
-    validateRevisionContent({ date: input.date, lines, customerName: input.customerName });
+    validateRevisionContent({ date: input.date, lines, customerName: customer.customerName });
     const document: DocumentRecord = {
       id,
       type: input.type,
       number: input.number.trim(),
       status: 'draft',
       sourceDocumentId: input.sourceDocumentId ?? null,
+      partyId: customer.partyId,
       settlement: input.type === 'credit_memo' ? (input.settlement ?? 'account') : null,
       inheritedTags,
       revisions: [
@@ -1087,10 +1197,10 @@ export class DocumentBook implements ItemCatalog {
           at: at ?? new Date().toISOString(),
           reason: null,
           date: input.date,
-          customerName: input.customerName.trim(),
-          accountNumber: input.accountNumber ?? null,
+          customerName: customer.customerName,
+          accountNumber: customer.accountNumber ?? null,
           poNumber: input.poNumber ?? null,
-          termsDays: validateTermsDays(input.termsDays) ?? null,
+          termsDays: customer.termsDays ?? null,
           memo: input.memo ?? null,
           lines,
         },
@@ -1118,6 +1228,7 @@ export class DocumentBook implements ItemCatalog {
         ? this.resolveLines(changes.lines, date, previous.lines, {
             customerName,
             ...(accountNumber !== null ? { accountNumber } : {}),
+            ...(document.partyId !== null ? { partyId: document.partyId } : {}),
           })
         : [...previous.lines];
     validateRevisionContent({ date, lines, customerName });
@@ -1176,6 +1287,7 @@ export class DocumentBook implements ItemCatalog {
         date: spec.date,
         lines,
         sourceDocumentId: sourceId,
+        ...(source.partyId !== null ? { partyId: source.partyId } : {}),
         customerName: spec.customerName ?? previous.customerName,
         ...((spec.accountNumber ?? previous.accountNumber) !== null
           ? { accountNumber: (spec.accountNumber ?? previous.accountNumber)! }
@@ -1198,9 +1310,11 @@ export class DocumentBook implements ItemCatalog {
    * paid for it, with line-level links back to that purchase (ADR 0006).
    */
   createReturn(input: NewReturn, id?: string, at?: string): DocumentView {
+    const customer = this.resolveCustomer(input);
     const query: CustomerQuery = {
-      customerName: input.customerName,
-      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+      customerName: customer.customerName,
+      ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
+      ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
     };
     const invoices = [...this.documents.values()];
     const lines = input.items.map((item) =>
@@ -1212,14 +1326,29 @@ export class DocumentBook implements ItemCatalog {
         number: input.number,
         date: input.date,
         lines,
-        customerName: input.customerName,
-        ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+        customerName: customer.customerName,
+        ...(customer.accountNumber !== undefined ? { accountNumber: customer.accountNumber } : {}),
+        ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
         ...(input.poNumber !== undefined ? { poNumber: input.poNumber } : {}),
         ...(input.settlement !== undefined ? { settlement: input.settlement } : {}),
         ...(input.memo !== undefined ? { memo: input.memo } : {}),
       },
       id,
       at,
+    );
+  }
+
+  /** Statement resolved through the party's identity, with free-text fallback. */
+  statementForParty(partyId: string, asOf: string, rules?: readonly AgingRule[]): Statement {
+    const party = this.requireParty(partyId);
+    return this.statement(
+      {
+        partyId,
+        customerName: party.name,
+        ...(party.accountNumber !== null ? { accountNumber: party.accountNumber } : {}),
+      },
+      asOf,
+      rules,
     );
   }
 
@@ -1246,9 +1375,7 @@ export class DocumentBook implements ItemCatalog {
     if (input.amount <= 0n) {
       throw new LedgerError('INVALID_ALLOCATION', 'Payment amounts must be positive');
     }
-    if (!input.customerName.trim()) {
-      throw new LedgerError('INVALID_DOCUMENT', 'Every transaction must carry a customer name (ADR 0006)');
-    }
+    const customer = this.resolveCustomer(input);
     if ([...this.payments.values()].some((payment) => payment.number === input.number)) {
       throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Payment number already in use: ${input.number}`);
     }
@@ -1256,8 +1383,9 @@ export class DocumentBook implements ItemCatalog {
       id,
       number: input.number,
       date: input.date,
-      customerName: input.customerName.trim(),
-      accountNumber: input.accountNumber ?? null,
+      partyId: customer.partyId,
+      customerName: customer.customerName,
+      accountNumber: customer.accountNumber ?? null,
       poNumber: input.poNumber ?? null,
       memo: input.memo ?? null,
       method: input.method ?? null,

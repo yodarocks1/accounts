@@ -20,6 +20,7 @@ export type RateBase = 'sale' | 'cost';
 export interface CustomerRate {
   readonly rateSeq: number;
   readonly itemId: string;
+  readonly partyId: string | null;
   readonly customerName: string | null;
   readonly accountNumber: string | null;
   readonly kind: 'constant' | 'formula';
@@ -43,6 +44,7 @@ export type RateSpec =
 
 export interface NewCustomerRate {
   itemId: string;
+  partyId?: string;
   customerName?: string;
   accountNumber?: string;
   rate: RateSpec;
@@ -62,9 +64,12 @@ export function defaultAllowBelowCost(salePrice: bigint, cost: bigint | undefine
 
 /** Does this rate apply to the document customer? Account number wins when the rate has one. */
 export function rateMatchesCustomer(
-  rate: Pick<CustomerRate, 'customerName' | 'accountNumber'>,
+  rate: Pick<CustomerRate, 'partyId' | 'customerName' | 'accountNumber'>,
   customer: CustomerQuery,
 ): boolean {
+  if (rate.partyId !== null) {
+    return rate.partyId === customer.partyId;
+  }
   if (rate.accountNumber !== null) {
     return rate.accountNumber === customer.accountNumber;
   }
@@ -135,6 +140,7 @@ export function computeRateSuggestions(
   const customer: CustomerQuery = {
     customerName: current.customerName,
     ...(current.accountNumber !== null ? { accountNumber: current.accountNumber } : {}),
+    ...(record.partyId !== null ? { partyId: record.partyId } : {}),
   };
   const suggestions: SpecialRateSuggestion[] = [];
   const seen = new Set<string>();
@@ -163,6 +169,7 @@ export function computeRateSuggestions(
         itemId: line.itemId,
         customerName: current.customerName,
         ...(current.accountNumber !== null ? { accountNumber: current.accountNumber } : {}),
+        ...(record.partyId !== null ? { partyId: record.partyId } : {}),
         rate: { kind: 'constant', unitPrice: givenPrice },
         allowBelowCost: defaultAllowBelowCost(catalogPrice, cost),
         effectiveFrom: current.date,

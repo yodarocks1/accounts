@@ -11,6 +11,7 @@ export interface Payment {
   readonly id: string;
   readonly number: string;
   readonly date: string;
+  readonly partyId: string | null;
   readonly customerName: string;
   readonly accountNumber: string | null;
   readonly poNumber: string | null;
@@ -24,8 +25,10 @@ export interface Payment {
 export interface NewPayment {
   number: string;
   date: string;
-  customerName: string;
+  /** Required unless partyId supplies it. */
+  customerName?: string;
   accountNumber?: string;
+  partyId?: string;
   poNumber?: string;
   memo?: string;
   method?: string;

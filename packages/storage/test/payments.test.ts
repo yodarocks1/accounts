@@ -31,6 +31,40 @@ function sendInvoice(itemId: string, number: string, date: string, quantityMilli
   return invoice;
 }
 
+describe('parties persist (Tier 1)', () => {
+  it('party defaults, renames, rates, and statements survive reopening', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    const party = file.createParty({ name: 'Acme LLC', accountNumber: 'P-100', termsDays: 30 });
+    file.setCustomerRate({ itemId: widget.id, partyId: party.id, rate: { kind: 'constant', unitPrice: 2000n } });
+
+    const invoice = file.createDocument({
+      type: 'invoice', number: 'INV-P1', date: '2026-06-01', partyId: party.id,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
+    });
+    expect(invoice.current.customerName).toBe('Acme LLC');
+    expect(invoice.current.termsDays).toBe(30);
+    expect(invoice.current.lines[0]!.unitPrice).toBe(2000n); // party rate applied
+    file.sendDocument(invoice.id);
+
+    file.renameParty(party.id, 'Acme Industries Inc');
+    file.close();
+    file = CompanyFile.open(books);
+
+    expect(file.getParty(party.id)!.name).toBe('Acme Industries Inc');
+    expect(file.partyNameHistory(party.id)).toHaveLength(2);
+    // The sent invoice keeps its snapshot; the statement still finds it via the party.
+    expect(file.viewDocument(invoice.id).current.customerName).toBe('Acme LLC');
+    const statement = file.statementForParty(party.id, '2026-07-01');
+    expect(statement.invoices.map((entry) => entry.number)).toEqual(['INV-P1']);
+
+    // Payments via party too.
+    file.recordPayment({ number: 'PMT-P1', date: '2026-06-15', partyId: party.id, amount: 500n });
+    expect(file.statementForParty(party.id, '2026-07-01').payments).toHaveLength(1);
+
+    expect(() => file.createParty({ name: 'Other', accountNumber: 'P-100' })).toThrowError(/already in use/);
+  });
+});
+
 describe('terms persist (Tier 1)', () => {
   it('stores termsDays and ages from the due date after reopening', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });

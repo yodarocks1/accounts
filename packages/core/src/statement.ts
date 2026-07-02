@@ -4,6 +4,7 @@ import {
   documentLabel,
   dueDateOf,
   matchesCustomer,
+  matchesCustomerOrParty,
   revisionTotal,
   type CustomerQuery,
   type DocumentRecord,
@@ -137,8 +138,8 @@ export function computeStatement(
   asOf: string,
   rules: readonly AgingRule[] = DEFAULT_AGING_RULES,
 ): Statement {
-  if (query.customerName === undefined && query.accountNumber === undefined) {
-    throw new LedgerError('INVALID_DOCUMENT', 'Statement query needs a customer name or an account number');
+  if (query.customerName === undefined && query.accountNumber === undefined && query.partyId === undefined) {
+    throw new LedgerError('INVALID_DOCUMENT', 'Statement query needs a party, customer name, or account number');
   }
   const recordsById = new Map(documents.map((pair) => [pair.record.id, pair.record]));
   const paymentsById = new Map(payments.map((payment) => [payment.id, payment]));
@@ -154,7 +155,7 @@ export function computeStatement(
   for (const { record, closures } of documents) {
     if (record.status !== 'sent') continue;
     const current = record.revisions[record.revisions.length - 1]!;
-    if (current.date > asOf || !matchesCustomer(current, query)) continue;
+    if (current.date > asOf || !matchesCustomerOrParty(record, current, query)) continue;
     const tags = deriveTags(record, closures);
 
     if (record.type === 'invoice') {
@@ -214,7 +215,8 @@ export function computeStatement(
       (payment) =>
         payment.status === 'received' &&
         payment.date <= asOf &&
-        matchesCustomer({ customerName: payment.customerName, accountNumber: payment.accountNumber }, query),
+        ((query.partyId !== undefined && payment.partyId === query.partyId) ||
+          matchesCustomer({ customerName: payment.customerName, accountNumber: payment.accountNumber }, query)),
     )
     .map((payment) => {
       const applied = appliedFromSource(applications, 'payment', payment.id, asOf);

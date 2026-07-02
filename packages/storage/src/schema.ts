@@ -362,7 +362,66 @@ CREATE TRIGGER postings_no_delete BEFORE DELETE ON postings
 BEGIN SELECT RAISE(ABORT, 'postings are immutable'); END;
 `;
 
+const V9_SQL = `
+-- Tier 1: parties — the durable customer record (ADR 0008 part 4).
+-- Names live in append-only history; documents snapshot names at the time.
+CREATE TABLE parties (
+  id             TEXT PRIMARY KEY,
+  account_number TEXT UNIQUE,
+  terms_days     INTEGER CHECK (terms_days IS NULL OR terms_days >= 0),
+  created_at     TEXT NOT NULL
+) STRICT;
+
+CREATE TRIGGER parties_no_delete BEFORE DELETE ON parties
+BEGIN SELECT RAISE(ABORT, 'parties are never deleted'); END;
+
+CREATE TABLE party_names (
+  party_id TEXT NOT NULL REFERENCES parties(id),
+  name_seq INTEGER NOT NULL,
+  name     TEXT NOT NULL CHECK (length(trim(name)) > 0),
+  at       TEXT NOT NULL,
+  PRIMARY KEY (party_id, name_seq)
+) STRICT;
+
+CREATE TRIGGER party_names_no_update BEFORE UPDATE ON party_names
+BEGIN SELECT RAISE(ABORT, 'party name history is immutable'); END;
+
+CREATE TRIGGER party_names_no_delete BEFORE DELETE ON party_names
+BEGIN SELECT RAISE(ABORT, 'party name history is immutable'); END;
+
+ALTER TABLE documents ADD COLUMN party_id TEXT REFERENCES parties(id);
+ALTER TABLE payments ADD COLUMN party_id TEXT REFERENCES parties(id);
+ALTER TABLE customer_rates ADD COLUMN party_id TEXT REFERENCES parties(id);
+
+-- Freeze the new identity columns alongside the existing ones.
+DROP TRIGGER documents_status_only_update;
+CREATE TRIGGER documents_status_only_update BEFORE UPDATE ON documents
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.type IS NOT OLD.type
+  OR NEW.number IS NOT OLD.number
+  OR NEW.source_document_id IS NOT OLD.source_document_id
+  OR NEW.inherited_corrections IS NOT OLD.inherited_corrections
+  OR NEW.inherited_substitutions IS NOT OLD.inherited_substitutions
+  OR NEW.settlement IS NOT OLD.settlement
+  OR NEW.party_id IS NOT OLD.party_id
+BEGIN SELECT RAISE(ABORT, 'only document status may change'); END;
+
+DROP TRIGGER payments_status_only_update;
+CREATE TRIGGER payments_status_only_update BEFORE UPDATE ON payments
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.number IS NOT OLD.number
+  OR NEW.date IS NOT OLD.date
+  OR NEW.customer_name IS NOT OLD.customer_name
+  OR NEW.account_number IS NOT OLD.account_number
+  OR NEW.po_number IS NOT OLD.po_number
+  OR NEW.memo IS NOT OLD.memo
+  OR NEW.method IS NOT OLD.method
+  OR NEW.amount IS NOT OLD.amount
+  OR NEW.party_id IS NOT OLD.party_id
+BEGIN SELECT RAISE(ABORT, 'only payment status may change'); END;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
