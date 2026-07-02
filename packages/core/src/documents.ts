@@ -100,6 +100,8 @@ export interface DocumentRevision {
   readonly accountNumber: string | null;
   /** Optional purchase-order number (ADR 0006). */
   readonly poNumber: string | null;
+  /** Payment terms in days (Net N); due date = date + termsDays (ADR 0008). */
+  readonly termsDays: number | null;
   readonly memo: string | null;
   readonly lines: readonly DocumentLine[];
 }
@@ -190,6 +192,7 @@ export interface ConversionSpec {
   customerName?: string;
   accountNumber?: string;
   poNumber?: string;
+  termsDays?: number;
   memo?: string;
   /** Omit to convert every open line in full. */
   lines?: ConversionLine[];
@@ -290,6 +293,24 @@ export function deriveTags(
 
 export function documentLabel(number: string, tags: readonly DocumentTag[]): string {
   return tags.length === 0 ? number : `${number} (${tags.join(', ')})`;
+}
+
+/** Terms must be a whole, non-negative day count when given. */
+export function validateTermsDays(termsDays: number | undefined): number | undefined {
+  if (termsDays === undefined) return undefined;
+  if (!Number.isInteger(termsDays) || termsDays < 0) {
+    throw new LedgerError('INVALID_DOCUMENT', `termsDays must be a non-negative integer; got ${termsDays}`);
+  }
+  return termsDays;
+}
+
+/** date + termsDays, or null when the revision has no terms (ADR 0008). */
+export function dueDateOf(revision: Pick<DocumentRevision, 'date' | 'termsDays'>): string | null {
+  if (revision.termsDays === null) return null;
+  const [year, month, day] = revision.date.split('-').map(Number);
+  const due = new Date(Date.UTC(year!, month! - 1, day! + revision.termsDays));
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${due.getUTCFullYear()}-${pad(due.getUTCMonth() + 1)}-${pad(due.getUTCDate())}`;
 }
 
 /** Face amount: quantity × unit price, before adjustments and free handling. */
@@ -810,6 +831,8 @@ export interface NewDocument {
   customerName: string;
   accountNumber?: string;
   poNumber?: string;
+  /** Payment terms in days (Net N). */
+  termsDays?: number;
   memo?: string;
   sourceDocumentId?: string;
   /** Credit memos only: defaults to 'account'. */
@@ -824,6 +847,7 @@ export interface DocumentChanges {
   customerName?: string;
   accountNumber?: string;
   poNumber?: string;
+  termsDays?: number;
   memo?: string;
 }
 
@@ -1066,6 +1090,7 @@ export class DocumentBook implements ItemCatalog {
           customerName: input.customerName.trim(),
           accountNumber: input.accountNumber ?? null,
           poNumber: input.poNumber ?? null,
+          termsDays: validateTermsDays(input.termsDays) ?? null,
           memo: input.memo ?? null,
           lines,
         },
@@ -1107,6 +1132,7 @@ export class DocumentBook implements ItemCatalog {
       customerName,
       accountNumber: changes.accountNumber ?? previous.accountNumber,
       poNumber: changes.poNumber ?? previous.poNumber,
+      termsDays: validateTermsDays(changes.termsDays) ?? previous.termsDays,
       memo: changes.memo ?? previous.memo,
       lines,
     });
@@ -1131,6 +1157,7 @@ export class DocumentBook implements ItemCatalog {
       customerName: previous.customerName,
       accountNumber: previous.accountNumber,
       poNumber: previous.poNumber,
+      termsDays: previous.termsDays,
       memo: previous.memo,
       lines,
     });
@@ -1155,6 +1182,9 @@ export class DocumentBook implements ItemCatalog {
           : {}),
         ...((spec.poNumber ?? previous.poNumber) !== null
           ? { poNumber: (spec.poNumber ?? previous.poNumber)! }
+          : {}),
+        ...((spec.termsDays ?? previous.termsDays) !== null
+          ? { termsDays: (spec.termsDays ?? previous.termsDays)! }
           : {}),
         ...(spec.memo !== undefined ? { memo: spec.memo } : {}),
       },

@@ -331,7 +331,12 @@ CREATE TRIGGER credit_applications_no_delete BEFORE DELETE ON credit_application
 BEGIN SELECT RAISE(ABORT, 'applications are immutable; reverse them'); END;
 `;
 
+const V7_SQL = `
+-- Tier 1: payment terms (Net N); due date is derived, never stored.
+ALTER TABLE document_revisions ADD COLUMN terms_days INTEGER CHECK (terms_days IS NULL OR terms_days >= 0);
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

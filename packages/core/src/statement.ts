@@ -2,6 +2,7 @@ import { LedgerError } from './errors.js';
 import {
   deriveTags,
   documentLabel,
+  dueDateOf,
   matchesCustomer,
   revisionTotal,
   type CustomerQuery,
@@ -47,6 +48,8 @@ export interface StatementInvoice {
   readonly number: string;
   readonly label: string;
   readonly date: string;
+  /** date + terms; aging measures from this when present (ADR 0008). */
+  readonly dueDate: string | null;
   readonly poNumber: string | null;
   /** The original amount due — shown first (ADR 0006). */
   readonly originalTotal: bigint;
@@ -159,12 +162,15 @@ export function computeStatement(
         revisionTotal(current),
         appliedToInvoice(applications, record.id, isSourceActive, asOf),
       );
-      const ageDays = daysBetween(current.date, asOf);
+      const dueDate = dueDateOf(current);
+      // With terms, "past due" means past the DUE date; ages can be negative.
+      const ageDays = daysBetween(dueDate ?? current.date, asOf);
       invoices.push({
         documentId: record.id,
         number: record.number,
         label: documentLabel(record.number, tags),
         date: current.date,
+        dueDate,
         poNumber: current.poNumber,
         originalTotal: revisionTotal(record.revisions[0]!),
         currentTotal: settlement.total,

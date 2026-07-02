@@ -61,6 +61,8 @@ export {
   resolveRevisionKind,
   deriveTags,
   documentLabel,
+  dueDateOf,
+  validateTermsDays,
   lineTotal,
   customerLineTotal,
   revisionTotal,

@@ -31,6 +31,23 @@ function sendInvoice(itemId: string, number: string, date: string, quantityMilli
   return invoice;
 }
 
+describe('terms persist (Tier 1)', () => {
+  it('stores termsDays and ages from the due date after reopening', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    const invoice = file.createDocument({
+      type: 'invoice', number: 'INV-T1', date: '2026-05-01', ...acme, termsDays: 30,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
+    });
+    file.sendDocument(invoice.id);
+    file.close();
+    file = CompanyFile.open(books);
+    const statement = file.statement({ accountNumber: 'A-100' }, '2026-07-02');
+    expect(statement.invoices[0]!.dueDate).toBe('2026-05-31');
+    expect(statement.invoices[0]!.ageDays).toBe(32);
+    expect(statement.invoices[0]!.ageLabel).toBe('past due');
+  });
+});
+
 describe('payments persist (Tier 1)', () => {
   it('records, applies, reverses, and survives reopening', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });

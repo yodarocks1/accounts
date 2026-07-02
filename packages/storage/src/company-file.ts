@@ -23,6 +23,7 @@ import {
   validateConversion,
   validateLineConsumption,
   validateNewEntry,
+  validateTermsDays,
   validateRevisionContent,
   viewDocument,
   type Account,
@@ -649,6 +650,7 @@ export class CompanyFile implements ItemCatalog {
         customerName: input.customerName.trim(),
         accountNumber: input.accountNumber ?? null,
         poNumber: input.poNumber ?? null,
+        termsDays: validateTermsDays(input.termsDays) ?? null,
         memo: input.memo ?? null,
         lines,
       });
@@ -685,6 +687,7 @@ export class CompanyFile implements ItemCatalog {
         customerName,
         accountNumber: changes.accountNumber ?? previous.accountNumber,
         poNumber: changes.poNumber ?? previous.poNumber,
+        termsDays: validateTermsDays(changes.termsDays) ?? previous.termsDays,
         memo: changes.memo ?? previous.memo,
         lines,
       });
@@ -712,6 +715,7 @@ export class CompanyFile implements ItemCatalog {
         customerName: previous.customerName,
         accountNumber: previous.accountNumber,
         poNumber: previous.poNumber,
+        termsDays: previous.termsDays,
         memo: previous.memo,
         lines,
       });
@@ -740,6 +744,9 @@ export class CompanyFile implements ItemCatalog {
         : {}),
       ...((spec.poNumber ?? previous.poNumber) !== null
         ? { poNumber: (spec.poNumber ?? previous.poNumber)! }
+        : {}),
+      ...((spec.termsDays ?? previous.termsDays) !== null
+        ? { termsDays: (spec.termsDays ?? previous.termsDays)! }
         : {}),
       ...(spec.memo !== undefined ? { memo: spec.memo } : {}),
     });
@@ -915,6 +922,7 @@ export class CompanyFile implements ItemCatalog {
       customer_name: string | null;
       account_number: string | null;
       po_number: string | null;
+      terms_days: bigint | null;
       memo: string | null;
     }
     const revisionRows = this.db
@@ -965,6 +973,7 @@ export class CompanyFile implements ItemCatalog {
         customerName: revision.customer_name ?? '',
         accountNumber: revision.account_number,
         poNumber: revision.po_number,
+        termsDays: revision.terms_days === null ? null : Number(revision.terms_days),
         memo: revision.memo,
         lines: (linesByRevision.get(Number(revision.revision_no)) ?? []).map((line) => ({
           lineId: line.line_id ?? `${row.id}#${line.line_no}`,
@@ -1011,8 +1020,8 @@ export class CompanyFile implements ItemCatalog {
   private insertRevision(documentId: string, revision: DocumentRevision): void {
     this.db
       .prepare(
-        `INSERT INTO document_revisions (document_id, revision_no, kind, at, reason, date, customer_name, account_number, po_number, memo)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO document_revisions (document_id, revision_no, kind, at, reason, date, customer_name, account_number, po_number, terms_days, memo)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         documentId,
@@ -1024,6 +1033,7 @@ export class CompanyFile implements ItemCatalog {
         revision.customerName,
         revision.accountNumber,
         revision.poNumber,
+        revision.termsDays,
         revision.memo,
       );
     const insertLine = this.db.prepare(
