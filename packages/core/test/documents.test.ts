@@ -38,7 +38,7 @@ describe('invoice correction semantics', () => {
     const { book, widget } = bookWithItem();
     const invoice = book.createDocument({
       type: 'invoice',
-      number: 'INV-0001',
+      number: 'INV-0001', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n }],
     });
@@ -54,7 +54,7 @@ describe('invoice correction semantics', () => {
     const { book, widget } = bookWithItem();
     const invoice = book.createDocument({
       type: 'invoice',
-      number: 'INV-0002',
+      number: 'INV-0002', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n }],
     });
@@ -87,7 +87,7 @@ describe('sales order corrections and substitutions', () => {
     const { book, widget } = bookWithItem();
     const order = book.createDocument({
       type: 'sales_order',
-      number: 'SO-0001',
+      number: 'SO-0001', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 5000n }],
     });
@@ -112,7 +112,7 @@ describe('sales order corrections and substitutions', () => {
     const { book, widget } = bookWithItem();
     const order = book.createDocument({
       type: 'sales_order',
-      number: 'SO-0002',
+      number: 'SO-0002', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
     });
@@ -121,7 +121,7 @@ describe('sales order corrections and substitutions', () => {
 
     const invoice = book.createDocument({
       type: 'invoice',
-      number: 'INV-0003',
+      number: 'INV-0003', customerName: 'Acme LLC',
       date: '2026-07-05',
       sourceDocumentId: order.id,
       lines: [{ itemId: widget.id, description: 'Widget (blue)', quantityMilli: 1000n }],
@@ -140,7 +140,7 @@ describe('estimate semantics', () => {
     const { book, hours } = bookWithItem();
     const estimate = book.createDocument({
       type: 'estimate',
-      number: 'EST-0001',
+      number: 'EST-0001', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: hours.id, description: 'Discovery', quantityMilli: 10000n }],
     });
@@ -164,7 +164,7 @@ describe('void and lifecycle guards', () => {
     const { book, widget } = bookWithItem();
     const invoice = book.createDocument({
       type: 'invoice',
-      number: 'INV-0004',
+      number: 'INV-0004', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
     });
@@ -176,12 +176,12 @@ describe('void and lifecycle guards', () => {
   it('document numbers are unique per type', () => {
     const { book, widget } = bookWithItem();
     const lines = [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }];
-    book.createDocument({ type: 'invoice', number: 'DOC-1', date: '2026-07-01', lines });
+    book.createDocument({ type: 'invoice', number: 'DOC-1', customerName: 'Acme LLC', date: '2026-07-01', lines });
     expect(() =>
-      book.createDocument({ type: 'invoice', number: 'DOC-1', date: '2026-07-01', lines }),
+      book.createDocument({ type: 'invoice', number: 'DOC-1', customerName: 'Acme LLC', date: '2026-07-01', lines }),
     ).toThrowError(/already in use/);
     // Same number on a different type is fine.
-    book.createDocument({ type: 'estimate', number: 'DOC-1', date: '2026-07-01', lines });
+    book.createDocument({ type: 'estimate', number: 'DOC-1', customerName: 'Acme LLC', date: '2026-07-01', lines });
   });
 
   it('resolveRevisionKind rejects reserved and mismatched kinds', () => {
@@ -198,7 +198,7 @@ describe('price changes never change past transactions', () => {
     const widget = book.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
     const invoice = book.createDocument({
       type: 'invoice',
-      number: 'INV-0005',
+      number: 'INV-0005', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 4000n }],
     });
@@ -217,7 +217,7 @@ describe('price changes never change past transactions', () => {
     // New documents pick up the price effective on THEIR date.
     const later = book.createDocument({
       type: 'invoice',
-      number: 'INV-0006',
+      number: 'INV-0006', customerName: 'Acme LLC',
       date: '2026-08-02',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
     });
@@ -240,7 +240,7 @@ describe('price changes never change past transactions', () => {
           const item = book.createItem({ name: 'Thing', currency: 'USD', unitPrice: 777n });
           const created = book.createDocument({
             type: 'invoice',
-            number: 'INV-P',
+            number: 'INV-P', customerName: 'Acme LLC',
             date: '2026-06-15',
             lines: [{ itemId: item.id, description: 'Thing', quantityMilli: 3210n }],
           });

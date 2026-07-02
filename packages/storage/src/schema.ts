@@ -199,7 +199,57 @@ BEGIN SELECT RAISE(ABORT, 'line closures are immutable'); END;
 CREATE INDEX idx_documents_source ON documents(source_document_id);
 `;
 
+const V4_SQL = `
+-- ADR 0006: credit memos join the type enum and carry a settlement mode.
+-- SQLite cannot alter CHECK constraints, so documents is rebuilt in place
+-- (run with foreign keys off; CompanyFile verifies with foreign_key_check).
+DROP TRIGGER documents_status_only_update;
+DROP TRIGGER documents_no_delete;
+DROP INDEX idx_documents_source;
+
+CREATE TABLE documents_v4 (
+  id                      TEXT PRIMARY KEY,
+  type                    TEXT NOT NULL CHECK (type IN ('estimate','sales_order','invoice','credit_memo')),
+  number                  TEXT NOT NULL CHECK (length(trim(number)) > 0),
+  status                  TEXT NOT NULL CHECK (status IN ('draft','sent','void')),
+  source_document_id      TEXT REFERENCES documents(id),
+  inherited_corrections   INTEGER NOT NULL DEFAULT 0 CHECK (inherited_corrections IN (0,1)),
+  inherited_substitutions INTEGER NOT NULL DEFAULT 0 CHECK (inherited_substitutions IN (0,1)),
+  settlement              TEXT CHECK (settlement IN ('account','refund')),
+  UNIQUE (type, number)
+) STRICT;
+
+INSERT INTO documents_v4 (id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement)
+  SELECT id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, NULL FROM documents;
+
+DROP TABLE documents;
+ALTER TABLE documents_v4 RENAME TO documents;
+
+CREATE TRIGGER documents_status_only_update BEFORE UPDATE ON documents
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.type IS NOT OLD.type
+  OR NEW.number IS NOT OLD.number
+  OR NEW.source_document_id IS NOT OLD.source_document_id
+  OR NEW.inherited_corrections IS NOT OLD.inherited_corrections
+  OR NEW.inherited_substitutions IS NOT OLD.inherited_substitutions
+  OR NEW.settlement IS NOT OLD.settlement
+BEGIN SELECT RAISE(ABORT, 'only document status may change'); END;
+
+CREATE TRIGGER documents_no_delete BEFORE DELETE ON documents
+BEGIN SELECT RAISE(ABORT, 'documents are never deleted; void them'); END;
+
+CREATE INDEX idx_documents_source ON documents(source_document_id);
+
+-- ADR 0006: every transaction names its customer; PO and account are optional.
+ALTER TABLE document_revisions RENAME COLUMN counterparty TO customer_name;
+ALTER TABLE document_revisions ADD COLUMN account_number TEXT;
+ALTER TABLE document_revisions ADD COLUMN po_number TEXT;
+
+-- ADR 0006: links carry their own document context.
+ALTER TABLE document_revision_lines ADD COLUMN source_document_id TEXT;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

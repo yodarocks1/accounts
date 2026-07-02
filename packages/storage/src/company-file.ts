@@ -3,7 +3,9 @@ import Database from 'better-sqlite3';
 import {
   LedgerError,
   buildConversionLines,
+  buildReturnLine,
   computeFulfillment,
+  computeStatement,
   computeTrialBalance,
   currencyExponent,
   deriveTags,
@@ -11,6 +13,7 @@ import {
   resolveDocumentLines,
   resolveRevisionKind,
   validateConversion,
+  validateLineConsumption,
   validateNewEntry,
   validateRevisionContent,
   viewDocument,
@@ -33,7 +36,11 @@ import {
   type NewItem,
   type NewJournalEntry,
   type NewLineClosure,
+  type NewReturn,
   type PriceKind,
+  type CustomerQuery,
+  type AgingRule,
+  type Statement,
   type TrialBalance,
 } from '@accounts/core';
 import { MIGRATIONS, SCHEMA_VERSION } from './schema.js';
@@ -101,6 +108,7 @@ export class CompanyFile implements ItemCatalog {
       setMeta.run('base_currency', info.baseCurrency);
       setMeta.run('created_at', new Date().toISOString());
     })();
+    CompanyFile.enableForeignKeys(db);
     const file = new CompanyFile(db, actor);
     file.audit('company.created', 'company', 'company', { name: info.name.trim() });
     return file;
@@ -121,20 +129,34 @@ export class CompanyFile implements ItemCatalog {
       throw new LedgerError('EMPTY_ENTRY', `Company file is schema v${row.value}; this build supports v${SCHEMA_VERSION}`);
     }
     if (fileVersion < SCHEMA_VERSION) {
+      // Migrations run with foreign keys off (table rebuilds require it);
+      // integrity is verified afterwards, before FKs come back on.
       db.transaction(() => {
         for (const migration of MIGRATIONS.slice(fileVersion)) db.exec(migration);
         db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION));
       })();
+      const violations = db.pragma('foreign_key_check') as unknown[];
+      if (violations.length > 0) {
+        db.close();
+        throw new LedgerError('EMPTY_ENTRY', `Migration left ${violations.length} foreign-key violations; file untouched copy recommended`);
+      }
     }
+    CompanyFile.enableForeignKeys(db);
     return new CompanyFile(db, actor);
   }
 
   private static openDatabase(path: string, mustExist = false): Database.Database {
     const db = new Database(path, { fileMustExist: mustExist });
     db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
+    // Off until after migrations: table rebuilds (v4) must move rows freely.
+    // enableForeignKeys() turns enforcement on before any business writes.
+    db.pragma('foreign_keys = OFF');
     db.defaultSafeIntegers(true); // INTEGER comes back as bigint, never float
     return db;
+  }
+
+  private static enableForeignKeys(db: Database.Database): void {
+    db.pragma('foreign_keys = ON');
   }
 
   close(): void {
@@ -439,6 +461,9 @@ export class CompanyFile implements ItemCatalog {
     if (!input.number.trim()) {
       throw new LedgerError('INVALID_DOCUMENT', 'Document number must not be empty');
     }
+    if (input.settlement !== undefined && input.type !== 'credit_memo') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
+    }
     const lines = resolveDocumentLines(input.lines, input.date, this);
     let inherited: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
@@ -449,14 +474,14 @@ export class CompanyFile implements ItemCatalog {
       validateConversion(source, input.type, lines, this.fulfillment(source.id));
       inherited = deriveTags(source, this.lineClosures(source.id));
     }
-    validateRevisionContent({ date: input.date, lines });
+    validateRevisionContent({ date: input.date, lines, customerName: input.customerName });
     const id = randomUUID();
     this.db.transaction(() => {
       try {
         this.db
           .prepare(
-            `INSERT INTO documents (id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions)
-             VALUES (?, ?, ?, 'draft', ?, ?, ?)`,
+            `INSERT INTO documents (id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement)
+             VALUES (?, ?, ?, 'draft', ?, ?, ?, ?)`,
           )
           .run(
             id,
@@ -465,6 +490,7 @@ export class CompanyFile implements ItemCatalog {
             input.sourceDocumentId ?? null,
             inherited.includes('with corrections') ? 1 : 0,
             inherited.includes('with substitutions') ? 1 : 0,
+            input.type === 'credit_memo' ? (input.settlement ?? 'account') : null,
           );
       } catch (error) {
         if (error instanceof Error && error.message.includes('UNIQUE constraint failed: documents.type, documents.number')) {
@@ -478,7 +504,9 @@ export class CompanyFile implements ItemCatalog {
         at: new Date().toISOString(),
         reason: null,
         date: input.date,
-        counterparty: input.counterparty ?? null,
+        customerName: input.customerName.trim(),
+        accountNumber: input.accountNumber ?? null,
+        poNumber: input.poNumber ?? null,
         memo: input.memo ?? null,
         lines,
       });
@@ -497,7 +525,10 @@ export class CompanyFile implements ItemCatalog {
       changes.lines !== undefined
         ? resolveDocumentLines(changes.lines, date, this, previous.lines)
         : [...previous.lines];
-    validateRevisionContent({ date, lines });
+    const customerName = changes.customerName ?? previous.customerName;
+    validateRevisionContent({ date, lines, customerName });
+    // ADR 0006: never orphan downstream links or over-consume a shrunk line.
+    validateLineConsumption(lines, this.fulfillment(id));
     this.db.transaction(() => {
       this.insertRevision(id, {
         revisionNo: previous.revisionNo + 1,
@@ -505,7 +536,9 @@ export class CompanyFile implements ItemCatalog {
         at: new Date().toISOString(),
         reason: changes.reason ?? null,
         date,
-        counterparty: changes.counterparty ?? previous.counterparty,
+        customerName,
+        accountNumber: changes.accountNumber ?? previous.accountNumber,
+        poNumber: changes.poNumber ?? previous.poNumber,
         memo: changes.memo ?? previous.memo,
         lines,
       });
@@ -530,7 +563,9 @@ export class CompanyFile implements ItemCatalog {
         at: new Date().toISOString(),
         reason: reason ?? `Charged amount corrected to ${actualTotal}`,
         date: previous.date,
-        counterparty: previous.counterparty,
+        customerName: previous.customerName,
+        accountNumber: previous.accountNumber,
+        poNumber: previous.poNumber,
         memo: previous.memo,
         lines,
       });
@@ -553,13 +588,55 @@ export class CompanyFile implements ItemCatalog {
       date: spec.date,
       lines,
       sourceDocumentId: sourceId,
-      ...(spec.counterparty !== undefined
-        ? { counterparty: spec.counterparty }
-        : previous.counterparty !== null
-          ? { counterparty: previous.counterparty }
-          : {}),
+      customerName: spec.customerName ?? previous.customerName,
+      ...((spec.accountNumber ?? previous.accountNumber) !== null
+        ? { accountNumber: (spec.accountNumber ?? previous.accountNumber)! }
+        : {}),
+      ...((spec.poNumber ?? previous.poNumber) !== null
+        ? { poNumber: (spec.poNumber ?? previous.poNumber)! }
+        : {}),
       ...(spec.memo !== undefined ? { memo: spec.memo } : {}),
     });
+  }
+
+  /**
+   * Record a return: each item credited at the price this customer last paid,
+   * with line-level links back to that purchase (ADR 0006).
+   */
+  createReturn(input: NewReturn): DocumentView {
+    const query: CustomerQuery = {
+      customerName: input.customerName,
+      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+    };
+    const invoices = this.listDocumentRecords('invoice');
+    const lines = input.items.map((item) => buildReturnLine(item, query, input.date, invoices, this));
+    return this.createDocument({
+      type: 'credit_memo',
+      number: input.number,
+      date: input.date,
+      lines,
+      customerName: input.customerName,
+      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+      ...(input.poNumber !== undefined ? { poNumber: input.poNumber } : {}),
+      ...(input.settlement !== undefined ? { settlement: input.settlement } : {}),
+      ...(input.memo !== undefined ? { memo: input.memo } : {}),
+    });
+  }
+
+  /** Compute a customer statement as of a date (ADR 0006). */
+  statement(query: CustomerQuery, asOf: string, rules?: readonly AgingRule[]): Statement {
+    const pairs = ['invoice', 'credit_memo'].flatMap((type) =>
+      this.listDocumentRecords(type as DocumentType).map((record) => ({
+        record,
+        closures: this.lineClosures(record.id),
+      })),
+    );
+    return computeStatement(pairs, query, asOf, rules);
+  }
+
+  private listDocumentRecords(type: DocumentType): DocumentRecord[] {
+    const rows = this.db.prepare(`SELECT id FROM documents WHERE type = ?`).all(type) as { id: string }[];
+    return rows.map((row) => this.getDocumentRecord(row.id)!);
   }
 
   /** Explicitly close (part of) a line without fulfilling it (ADR 0005). */
@@ -677,6 +754,7 @@ export class CompanyFile implements ItemCatalog {
       source_document_id: string | null;
       inherited_corrections: bigint;
       inherited_substitutions: bigint;
+      settlement: DocumentRecord['settlement'];
     }
     const row = this.db.prepare(`SELECT * FROM documents WHERE id = ?`).get(id) as
       | DocumentRow
@@ -688,7 +766,9 @@ export class CompanyFile implements ItemCatalog {
       at: string;
       reason: string | null;
       date: string;
-      counterparty: string | null;
+      customer_name: string | null;
+      account_number: string | null;
+      po_number: string | null;
       memo: string | null;
     }
     const revisionRows = this.db
@@ -706,6 +786,7 @@ export class CompanyFile implements ItemCatalog {
       adjustment: bigint;
       free: bigint;
       substituted: bigint;
+      source_document_id: string | null;
       source_line_id: string | null;
     }
     const lineRows = this.db
@@ -727,6 +808,7 @@ export class CompanyFile implements ItemCatalog {
       number: row.number,
       status: row.status,
       sourceDocumentId: row.source_document_id,
+      settlement: row.settlement,
       inheritedTags,
       revisions: revisionRows.map((revision) => ({
         revisionNo: Number(revision.revision_no),
@@ -734,7 +816,9 @@ export class CompanyFile implements ItemCatalog {
         at: revision.at,
         reason: revision.reason,
         date: revision.date,
-        counterparty: revision.counterparty,
+        customerName: revision.customer_name ?? '',
+        accountNumber: revision.account_number,
+        poNumber: revision.po_number,
         memo: revision.memo,
         lines: (linesByRevision.get(Number(revision.revision_no)) ?? []).map((line) => ({
           lineId: line.line_id ?? `${row.id}#${line.line_no}`,
@@ -746,6 +830,7 @@ export class CompanyFile implements ItemCatalog {
           adjustment: line.adjustment,
           free: line.free === 1n,
           substituted: line.substituted === 1n,
+          sourceDocumentId: line.source_document_id ?? (line.source_line_id !== null ? row.source_document_id : null),
           sourceLineId: line.source_line_id,
         })),
       })),
@@ -780,8 +865,8 @@ export class CompanyFile implements ItemCatalog {
   private insertRevision(documentId: string, revision: DocumentRevision): void {
     this.db
       .prepare(
-        `INSERT INTO document_revisions (document_id, revision_no, kind, at, reason, date, counterparty, memo)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO document_revisions (document_id, revision_no, kind, at, reason, date, customer_name, account_number, po_number, memo)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         documentId,
@@ -790,13 +875,15 @@ export class CompanyFile implements ItemCatalog {
         revision.at,
         revision.reason,
         revision.date,
-        revision.counterparty,
+        revision.customerName,
+        revision.accountNumber,
+        revision.poNumber,
         revision.memo,
       );
     const insertLine = this.db.prepare(
       `INSERT INTO document_revision_lines
-         (document_id, revision_no, line_no, line_id, item_id, description, quantity_milli, unit_price, currency, adjustment, free, substituted, source_line_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (document_id, revision_no, line_no, line_id, item_id, description, quantity_milli, unit_price, currency, adjustment, free, substituted, source_document_id, source_line_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     revision.lines.forEach((line, index) => {
       insertLine.run(
@@ -812,6 +899,7 @@ export class CompanyFile implements ItemCatalog {
         line.adjustment,
         line.free ? 1 : 0,
         line.substituted ? 1 : 0,
+        line.sourceDocumentId,
         line.sourceLineId,
       );
     });

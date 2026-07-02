@@ -335,6 +335,9 @@ A first-class, obsessively-tested onramp — this determines adoption.
       correction/substitution tagging and snapshot pricing (ADR 0004)
 - [x] Conversions with line-level links, partial fulfillment, closures,
       charge corrections with cost floors, free items (ADR 0005)
+- [x] Link-integrity guards, returns & credit memos with last-purchase
+      pricing, customer statements with aging, customer/PO identity on all
+      transactions (ADR 0006)
 - [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging

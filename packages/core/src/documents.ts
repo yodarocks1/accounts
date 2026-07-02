@@ -3,8 +3,9 @@ import { allocateProportional } from './allocation.js';
 import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
 import { divRoundHalf, QUANTITY_SCALE } from './quantity.js';
+import { computeStatement, type AgingRule, type Statement } from './statement.js';
 
-export const DOCUMENT_TYPES = ['estimate', 'sales_order', 'invoice'] as const;
+export const DOCUMENT_TYPES = ['estimate', 'sales_order', 'invoice', 'credit_memo'] as const;
 export type DocumentType = (typeof DOCUMENT_TYPES)[number];
 
 export type DocumentStatus = 'draft' | 'sent' | 'void';
@@ -13,11 +14,15 @@ export type RevisionKind = 'initial' | 'edit' | 'correction' | 'substitution';
 
 export type DocumentTag = 'with corrections' | 'with substitutions';
 
+/** How a credit memo settles (ADR 0006): account credit or money paid back. */
+export type SettlementMode = 'account' | 'refund';
+
 /** Allowed conversion targets per source type (ADR 0005). */
 export const CONVERSION_TARGETS: Record<DocumentType, readonly DocumentType[]> = {
   estimate: ['sales_order', 'invoice'],
   sales_order: ['invoice'],
   invoice: [],
+  credit_memo: [],
 };
 
 export interface DocumentLine {
@@ -39,6 +44,8 @@ export interface DocumentLine {
   readonly free: boolean;
   /** This line substitutes for what its source line promised. */
   readonly substituted: boolean;
+  /** Line-level provenance: which document the linked line lives in (ADR 0006). */
+  readonly sourceDocumentId: string | null;
   /** Line-level provenance to the source document's line (ADR 0005). */
   readonly sourceLineId: string | null;
 }
@@ -54,6 +61,7 @@ export interface NewDocumentLine {
   adjustment?: bigint;
   free?: boolean;
   substituted?: boolean;
+  sourceDocumentId?: string;
   sourceLineId?: string;
 }
 
@@ -66,7 +74,12 @@ export interface DocumentRevision {
   readonly reason: string | null;
   /** Document date (issue date), YYYY-MM-DD. */
   readonly date: string;
-  readonly counterparty: string | null;
+  /** Every transaction must carry a customer name (ADR 0006). */
+  readonly customerName: string;
+  /** Optional customer account number (ADR 0006). */
+  readonly accountNumber: string | null;
+  /** Optional purchase-order number (ADR 0006). */
+  readonly poNumber: string | null;
   readonly memo: string | null;
   readonly lines: readonly DocumentLine[];
 }
@@ -77,6 +90,8 @@ export interface DocumentRecord {
   readonly number: string;
   readonly status: DocumentStatus;
   readonly sourceDocumentId: string | null;
+  /** Only for credit memos: how the credit settles (ADR 0006). */
+  readonly settlement: SettlementMode | null;
   /** Source document's tags snapshotted at creation (ADR 0004). */
   readonly inheritedTags: readonly DocumentTag[];
   readonly revisions: readonly DocumentRevision[];
@@ -151,7 +166,10 @@ export interface ConversionSpec {
   type: DocumentType;
   number: string;
   date: string;
-  counterparty?: string;
+  /** Customer fields inherit from the source document unless overridden. */
+  customerName?: string;
+  accountNumber?: string;
+  poNumber?: string;
   memo?: string;
   /** Omit to convert every open line in full. */
   lines?: ConversionLine[];
@@ -208,10 +226,11 @@ export function resolveRevisionKind(
       }
       return 'edit';
     case 'invoice':
+    case 'credit_memo':
       if (requested !== undefined && requested !== 'correction') {
         throw new LedgerError(
           'INVALID_REVISION_KIND',
-          'A sent invoice can only be changed by a correction',
+          `A sent ${type === 'invoice' ? 'invoice' : 'credit memo'} can only be changed by a correction`,
         );
       }
       return 'correction';
@@ -289,7 +308,7 @@ export function recordedLineTotals(lines: readonly DocumentLine[]): bigint[] {
 export interface RevisionContent {
   date: string;
   lines: DocumentLine[];
-  counterparty?: string;
+  customerName: string;
   memo?: string;
 }
 
@@ -297,6 +316,9 @@ export interface RevisionContent {
 export function validateRevisionContent(content: RevisionContent): string {
   if (!ISO_DATE.test(content.date)) {
     throw new LedgerError('INVALID_DOCUMENT', `Document date must be YYYY-MM-DD; got ${JSON.stringify(content.date)}`);
+  }
+  if (!content.customerName.trim()) {
+    throw new LedgerError('INVALID_DOCUMENT', 'Every transaction must carry a customer name (ADR 0006)');
   }
   if (content.lines.length === 0) {
     throw new LedgerError('INVALID_DOCUMENT', 'A document needs at least one line');
@@ -398,9 +420,39 @@ export function resolveDocumentLines(
       adjustment: line.adjustment ?? 0n,
       free,
       substituted: line.substituted ?? previous?.substituted ?? false,
+      sourceDocumentId: line.sourceDocumentId ?? previous?.sourceDocumentId ?? null,
       sourceLineId: line.sourceLineId ?? previous?.sourceLineId ?? null,
     };
   });
+}
+
+/**
+ * ADR 0006 consumption guard: a revision may not remove a line whose quantity
+ * has been consumed downstream (converted or closed), nor shrink it below the
+ * consumed amount. Enforced by every storage engine on every change.
+ */
+export function validateLineConsumption(
+  newLines: readonly Pick<DocumentLine, 'lineId' | 'quantityMilli'>[],
+  fulfillment: readonly LineFulfillment[],
+): void {
+  const byId = new Map(newLines.map((line) => [line.lineId, line]));
+  for (const state of fulfillment) {
+    const consumed = state.convertedMilli + state.closedMilli;
+    if (consumed === 0n) continue;
+    const line = byId.get(state.lineId);
+    if (!line) {
+      throw new LedgerError(
+        'LINE_LINKED',
+        `Line ${state.lineId} (${state.description}) has ${consumed} (milli) converted/closed and cannot be removed; void or close the downstream documents first`,
+      );
+    }
+    if (line.quantityMilli < consumed) {
+      throw new LedgerError(
+        'LINE_LINKED',
+        `Line ${state.lineId} (${state.description}) cannot shrink below its consumed quantity ${consumed} (milli)`,
+      );
+    }
+  }
 }
 
 export function viewDocument(
@@ -548,10 +600,123 @@ export function buildConversionLines(
         };
     return {
       ...base,
+      sourceDocumentId: source.id,
       sourceLineId: spec.sourceLineId,
       ...(spec.free !== undefined ? { free: spec.free } : {}),
     };
   });
+}
+
+// ── Returns & last-purchase lookup (ADR 0006) ─────────────────────────────
+
+export interface CustomerQuery {
+  customerName?: string;
+  accountNumber?: string;
+}
+
+/** Match a revision's customer: account number when given, else exact name. */
+export function matchesCustomer(
+  revision: Pick<DocumentRevision, 'customerName' | 'accountNumber'>,
+  query: CustomerQuery,
+): boolean {
+  if (query.accountNumber !== undefined) {
+    return revision.accountNumber === query.accountNumber;
+  }
+  if (query.customerName !== undefined) {
+    return revision.customerName === query.customerName;
+  }
+  throw new LedgerError('INVALID_DOCUMENT', 'Customer query needs a name or an account number');
+}
+
+/** The customer-facing per-unit price actually paid on a line (free ⇒ 0). */
+export function perUnitCustomerPrice(line: DocumentLine): bigint {
+  return divRoundHalf(customerLineTotal(line) * QUANTITY_SCALE, line.quantityMilli);
+}
+
+/**
+ * Find the price at which this customer last purchased an item on or before
+ * `asOf`: the newest sent invoice for the customer whose current revision
+ * contains the item (ADR 0006).
+ */
+export function findLastPurchase(
+  invoices: readonly DocumentRecord[],
+  itemId: string,
+  customer: CustomerQuery,
+  asOf: string,
+): { record: DocumentRecord; line: DocumentLine } | undefined {
+  let best: { record: DocumentRecord; line: DocumentLine } | undefined;
+  for (const record of invoices) {
+    if (record.type !== 'invoice' || record.status !== 'sent') continue;
+    const current = record.revisions[record.revisions.length - 1]!;
+    if (current.date > asOf || !matchesCustomer(current, customer)) continue;
+    const line = current.lines.find((candidate) => candidate.itemId === itemId);
+    if (!line) continue;
+    if (!best) {
+      best = { record, line };
+      continue;
+    }
+    const bestCurrent = best.record.revisions[best.record.revisions.length - 1]!;
+    const bestKey = `${bestCurrent.date}|${best.record.revisions[0]!.at}`;
+    const key = `${current.date}|${record.revisions[0]!.at}`;
+    if (key > bestKey) best = { record, line };
+  }
+  return best;
+}
+
+export interface ReturnItem {
+  itemId: string;
+  quantityMilli: bigint;
+  /** Override the looked-up price (out-of-band cases). */
+  unitPrice?: bigint;
+}
+
+export interface NewReturn {
+  number: string;
+  date: string;
+  customerName: string;
+  accountNumber?: string;
+  poNumber?: string;
+  settlement?: SettlementMode;
+  memo?: string;
+  items: ReturnItem[];
+}
+
+/**
+ * Build one credit-memo line for a returned item: priced at the customer's
+ * last purchase (or explicit override), linked to that purchase line
+ * (ADR 0006). Shared by DocumentBook and storage engines.
+ */
+export function buildReturnLine(
+  item: ReturnItem,
+  customer: CustomerQuery,
+  asOf: string,
+  records: readonly DocumentRecord[],
+  catalog: ItemCatalog,
+): NewDocumentLine {
+  const catalogItem = catalog.getItem(item.itemId);
+  if (!catalogItem) {
+    throw new LedgerError('UNKNOWN_ITEM', `No such item: ${item.itemId}`);
+  }
+  if (item.quantityMilli <= 0n) {
+    throw new LedgerError('INVALID_QUANTITY', 'Return quantities must be positive');
+  }
+  const purchase = findLastPurchase(records, item.itemId, customer, asOf);
+  if (!purchase && item.unitPrice === undefined) {
+    throw new LedgerError(
+      'NO_PURCHASE_HISTORY',
+      `No purchase of ${catalogItem.name} found for this customer on or before ${asOf}; pass an explicit unitPrice to credit anyway`,
+    );
+  }
+  return {
+    itemId: item.itemId,
+    description: `${catalogItem.name} (return)`,
+    quantityMilli: item.quantityMilli,
+    unitPrice: item.unitPrice ?? perUnitCustomerPrice(purchase!.line),
+    currency: catalogItem.currency,
+    ...(purchase
+      ? { sourceDocumentId: purchase.record.id, sourceLineId: purchase.line.lineId }
+      : {}),
+  };
 }
 
 // ── Charge corrections (pure planner) ─────────────────────────────────────
@@ -611,9 +776,13 @@ export interface NewDocument {
   number: string;
   date: string;
   lines: NewDocumentLine[];
-  counterparty?: string;
+  customerName: string;
+  accountNumber?: string;
+  poNumber?: string;
   memo?: string;
   sourceDocumentId?: string;
+  /** Credit memos only: defaults to 'account'. */
+  settlement?: SettlementMode;
 }
 
 export interface DocumentChanges {
@@ -621,7 +790,9 @@ export interface DocumentChanges {
   reason?: string;
   date?: string;
   lines?: NewDocumentLine[];
-  counterparty?: string;
+  customerName?: string;
+  accountNumber?: string;
+  poNumber?: string;
   memo?: string;
 }
 
@@ -757,6 +928,9 @@ export class DocumentBook implements ItemCatalog {
     if (this.numbers.has(numberKey)) {
       throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Number already in use: ${input.number}`);
     }
+    if (input.settlement !== undefined && input.type !== 'credit_memo') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
+    }
     const lines = this.resolveLines(input.lines, input.date);
     let inheritedTags: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
@@ -767,13 +941,14 @@ export class DocumentBook implements ItemCatalog {
       validateConversion(source, input.type, lines, this.fulfillment(source.id));
       inheritedTags = deriveTags(source, this.closures.get(source.id) ?? []);
     }
-    validateRevisionContent({ date: input.date, lines });
+    validateRevisionContent({ date: input.date, lines, customerName: input.customerName });
     const document: DocumentRecord = {
       id,
       type: input.type,
       number: input.number.trim(),
       status: 'draft',
       sourceDocumentId: input.sourceDocumentId ?? null,
+      settlement: input.type === 'credit_memo' ? (input.settlement ?? 'account') : null,
       inheritedTags,
       revisions: [
         {
@@ -782,7 +957,9 @@ export class DocumentBook implements ItemCatalog {
           at: at ?? new Date().toISOString(),
           reason: null,
           date: input.date,
-          counterparty: input.counterparty ?? null,
+          customerName: input.customerName.trim(),
+          accountNumber: input.accountNumber ?? null,
+          poNumber: input.poNumber ?? null,
           memo: input.memo ?? null,
           lines,
         },
@@ -807,14 +984,19 @@ export class DocumentBook implements ItemCatalog {
       changes.lines !== undefined
         ? this.resolveLines(changes.lines, date, previous.lines)
         : [...previous.lines];
-    validateRevisionContent({ date, lines });
+    const customerName = changes.customerName ?? previous.customerName;
+    validateRevisionContent({ date, lines, customerName });
+    // ADR 0006: never orphan downstream links or over-consume a shrunk line.
+    validateLineConsumption(lines, this.fulfillment(id));
     this.appendRevision(document, {
       revisionNo: previous.revisionNo + 1,
       kind,
       at: at ?? new Date().toISOString(),
       reason: changes.reason ?? null,
       date,
-      counterparty: changes.counterparty ?? previous.counterparty,
+      customerName,
+      accountNumber: changes.accountNumber ?? previous.accountNumber,
+      poNumber: changes.poNumber ?? previous.poNumber,
       memo: changes.memo ?? previous.memo,
       lines,
     });
@@ -836,7 +1018,9 @@ export class DocumentBook implements ItemCatalog {
       at: at ?? new Date().toISOString(),
       reason: reason ?? `Charged amount corrected to ${actualTotal}`,
       date: previous.date,
-      counterparty: previous.counterparty,
+      customerName: previous.customerName,
+      accountNumber: previous.accountNumber,
+      poNumber: previous.poNumber,
       memo: previous.memo,
       lines,
     });
@@ -855,16 +1039,57 @@ export class DocumentBook implements ItemCatalog {
         date: spec.date,
         lines,
         sourceDocumentId: sourceId,
-        ...(spec.counterparty !== undefined
-          ? { counterparty: spec.counterparty }
-          : previous.counterparty !== null
-            ? { counterparty: previous.counterparty }
-            : {}),
+        customerName: spec.customerName ?? previous.customerName,
+        ...((spec.accountNumber ?? previous.accountNumber) !== null
+          ? { accountNumber: (spec.accountNumber ?? previous.accountNumber)! }
+          : {}),
+        ...((spec.poNumber ?? previous.poNumber) !== null
+          ? { poNumber: (spec.poNumber ?? previous.poNumber)! }
+          : {}),
         ...(spec.memo !== undefined ? { memo: spec.memo } : {}),
       },
       id,
       at,
     );
+  }
+
+  /**
+   * Record a return: each item is credited at the price this customer last
+   * paid for it, with line-level links back to that purchase (ADR 0006).
+   */
+  createReturn(input: NewReturn, id?: string, at?: string): DocumentView {
+    const query: CustomerQuery = {
+      customerName: input.customerName,
+      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+    };
+    const invoices = [...this.documents.values()];
+    const lines = input.items.map((item) =>
+      buildReturnLine(item, query, input.date, invoices, this),
+    );
+    return this.createDocument(
+      {
+        type: 'credit_memo',
+        number: input.number,
+        date: input.date,
+        lines,
+        customerName: input.customerName,
+        ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+        ...(input.poNumber !== undefined ? { poNumber: input.poNumber } : {}),
+        ...(input.settlement !== undefined ? { settlement: input.settlement } : {}),
+        ...(input.memo !== undefined ? { memo: input.memo } : {}),
+      },
+      id,
+      at,
+    );
+  }
+
+  /** Compute a customer statement as of a date (ADR 0006). */
+  statement(query: CustomerQuery, asOf: string, rules?: readonly AgingRule[]): Statement {
+    const pairs = [...this.documents.values()].map((record) => ({
+      record,
+      closures: this.closures.get(record.id) ?? [],
+    }));
+    return computeStatement(pairs, query, asOf, rules);
   }
 
   /** Explicitly close (part of) a line without fulfilling it (ADR 0005). */

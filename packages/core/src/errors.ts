@@ -23,7 +23,9 @@ export type LedgerErrorCode =
   | 'CHARGE_INCREASE'
   | 'INVALID_CONVERSION'
   | 'UNKNOWN_LINE'
-  | 'LINE_OVERDRAWN';
+  | 'LINE_OVERDRAWN'
+  | 'LINE_LINKED'
+  | 'NO_PURCHASE_HISTORY';
 
 export class LedgerError extends Error {
   constructor(

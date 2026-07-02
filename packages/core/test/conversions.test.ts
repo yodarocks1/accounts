@@ -73,19 +73,19 @@ describe('conversions with line-level links', () => {
     const { book, widget } = setUp();
     const estimate = book.createDocument({
       type: 'estimate',
-      number: 'EST-1',
+      number: 'EST-1', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 10000n, lineId: 'E1' }],
     });
     book.sendDocument(estimate.id);
 
-    const order = book.convertDocument(estimate.id, { type: 'sales_order', number: 'SO-1', date: '2026-07-02' });
+    const order = book.convertDocument(estimate.id, { type: 'sales_order', number: 'SO-1', customerName: 'Acme LLC', date: '2026-07-02' });
     expect(order.current.lines[0]!.sourceLineId).toBe('E1');
     expect(order.current.lines[0]!.quantityMilli).toBe(10000n);
     expect(order.current.lines[0]!.unitPrice).toBe(2500n); // snapshot carried from estimate
     book.sendDocument(order.id);
 
-    const invoice = book.convertDocument(order.id, { type: 'invoice', number: 'INV-1', date: '2026-07-03' });
+    const invoice = book.convertDocument(order.id, { type: 'invoice', number: 'INV-1', customerName: 'Acme LLC', date: '2026-07-03' });
     expect(invoice.current.lines[0]!.sourceLineId).toBe(order.current.lines[0]!.lineId);
     expect(invoice.sourceDocumentId).toBe(order.id);
 
@@ -97,14 +97,14 @@ describe('conversions with line-level links', () => {
     const { book, widget } = setUp();
     const order = book.createDocument({
       type: 'sales_order',
-      number: 'SO-2',
+      number: 'SO-2', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 10000n, lineId: 'L1' }],
     });
     book.sendDocument(order.id);
 
     book.convertDocument(order.id, {
-      type: 'invoice', number: 'INV-2a', date: '2026-07-02',
+      type: 'invoice', number: 'INV-2a', customerName: 'Acme LLC', date: '2026-07-02',
       lines: [{ sourceLineId: 'L1', quantityMilli: 4000n }],
     });
     let state = book.fulfillment(order.id)[0]!;
@@ -112,7 +112,7 @@ describe('conversions with line-level links', () => {
     expect(state.openMilli).toBe(6000n);
 
     book.convertDocument(order.id, {
-      type: 'invoice', number: 'INV-2b', date: '2026-07-03',
+      type: 'invoice', number: 'INV-2b', customerName: 'Acme LLC', date: '2026-07-03',
       lines: [{ sourceLineId: 'L1', quantityMilli: 6000n }],
     });
     state = book.fulfillment(order.id)[0]!;
@@ -121,7 +121,7 @@ describe('conversions with line-level links', () => {
 
     expect(() =>
       book.convertDocument(order.id, {
-        type: 'invoice', number: 'INV-2c', date: '2026-07-04',
+        type: 'invoice', number: 'INV-2c', customerName: 'Acme LLC', date: '2026-07-04',
         lines: [{ sourceLineId: 'L1', quantityMilli: 1n }],
       }),
     ).toThrowError(/open .* but conversion takes/);
@@ -130,11 +130,11 @@ describe('conversions with line-level links', () => {
   it('voiding a conversion returns its quantity to the source', () => {
     const { book, widget } = setUp();
     const order = book.createDocument({
-      type: 'sales_order', number: 'SO-3', date: '2026-07-01',
+      type: 'sales_order', number: 'SO-3', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 5000n, lineId: 'L1' }],
     });
     book.sendDocument(order.id);
-    const invoice = book.convertDocument(order.id, { type: 'invoice', number: 'INV-3', date: '2026-07-02' });
+    const invoice = book.convertDocument(order.id, { type: 'invoice', number: 'INV-3', customerName: 'Acme LLC', date: '2026-07-02' });
     expect(book.fulfillment(order.id)[0]!.openMilli).toBe(0n);
     book.voidDocument(invoice.id);
     expect(book.fulfillment(order.id)[0]!.openMilli).toBe(5000n);
@@ -143,25 +143,25 @@ describe('conversions with line-level links', () => {
   it('rejects disallowed direction, unsent sources, and unknown lines', () => {
     const { book, widget } = setUp();
     const invoice = book.createDocument({
-      type: 'invoice', number: 'INV-4', date: '2026-07-01',
+      type: 'invoice', number: 'INV-4', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
     });
     book.sendDocument(invoice.id);
     expect(() =>
-      book.convertDocument(invoice.id, { type: 'sales_order', number: 'SO-4', date: '2026-07-02' }),
+      book.convertDocument(invoice.id, { type: 'sales_order', number: 'SO-4', customerName: 'Acme LLC', date: '2026-07-02' }),
     ).toThrowError(/cannot be converted/);
 
     const draft = book.createDocument({
-      type: 'estimate', number: 'EST-4', date: '2026-07-01',
+      type: 'estimate', number: 'EST-4', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n, lineId: 'L1' }],
     });
     expect(() =>
-      book.convertDocument(draft.id, { type: 'invoice', number: 'INV-4b', date: '2026-07-02' }),
+      book.convertDocument(draft.id, { type: 'invoice', number: 'INV-4b', customerName: 'Acme LLC', date: '2026-07-02' }),
     ).toThrowError(/Only sent documents/);
     book.sendDocument(draft.id);
     expect(() =>
       book.convertDocument(draft.id, {
-        type: 'invoice', number: 'INV-4c', date: '2026-07-02',
+        type: 'invoice', number: 'INV-4c', customerName: 'Acme LLC', date: '2026-07-02',
         lines: [{ sourceLineId: 'NOPE' }],
       }),
     ).toThrowError(/no line NOPE/);
@@ -172,7 +172,7 @@ describe('closures and substitutions', () => {
   it('closing a line unfulfilled removes it from the open balance', () => {
     const { book, widget } = setUp();
     const order = book.createDocument({
-      type: 'sales_order', number: 'SO-5', date: '2026-07-01',
+      type: 'sales_order', number: 'SO-5', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 10000n, lineId: 'L1' }],
     });
     book.sendDocument(order.id);
@@ -191,14 +191,14 @@ describe('closures and substitutions', () => {
   it('substitution closures tag the source; substitute conversion lines tag the target', () => {
     const { book, widget, gadget } = setUp();
     const order = book.createDocument({
-      type: 'sales_order', number: 'SO-6', date: '2026-07-01',
+      type: 'sales_order', number: 'SO-6', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n, lineId: 'L1' }],
     });
     book.sendDocument(order.id);
 
     // Deliver gadgets instead of widgets, at a changed price.
     const invoice = book.convertDocument(order.id, {
-      type: 'invoice', number: 'INV-6', date: '2026-07-02',
+      type: 'invoice', number: 'INV-6', customerName: 'Acme LLC', date: '2026-07-02',
       lines: [{ sourceLineId: 'L1', substitution: { itemId: gadget.id, description: 'Gadget (substitute)', unitPrice: 3500n } }],
     });
     expect(invoice.current.lines[0]!.substituted).toBe(true);
@@ -207,19 +207,19 @@ describe('closures and substitutions', () => {
 
     // A substitution may also keep the source price.
     const order2 = book.createDocument({
-      type: 'sales_order', number: 'SO-6b', date: '2026-07-01',
+      type: 'sales_order', number: 'SO-6b', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n, lineId: 'L1' }],
     });
     book.sendDocument(order2.id);
     const invoice2 = book.convertDocument(order2.id, {
-      type: 'invoice', number: 'INV-6b', date: '2026-07-02',
+      type: 'invoice', number: 'INV-6b', customerName: 'Acme LLC', date: '2026-07-02',
       lines: [{ sourceLineId: 'L1', substitution: { description: 'Widget v2' } }],
     });
     expect(invoice2.current.lines[0]!.unitPrice).toBe(2500n);
 
     // Closing with a substitution marks the source document.
     const order3 = book.createDocument({
-      type: 'sales_order', number: 'SO-6c', date: '2026-07-01',
+      type: 'sales_order', number: 'SO-6c', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n, lineId: 'L1' }],
     });
     book.sendDocument(order3.id);
@@ -233,7 +233,7 @@ describe('charge corrections (amount paid)', () => {
   function invoiceWithTwoLines() {
     const { book, widget, gadget } = setUp();
     const invoice = book.createDocument({
-      type: 'invoice', number: 'INV-7', date: '2026-07-01',
+      type: 'invoice', number: 'INV-7', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [
         { itemId: widget.id, description: 'Widget', quantityMilli: 4000n, lineId: 'L1' }, // 4 × 25.00 = 100.00
         { itemId: gadget.id, description: 'Gadget', quantityMilli: 2500n, lineId: 'L2' }, // 2.5 × 40.00 = 100.00
@@ -280,7 +280,7 @@ describe('charge corrections (amount paid)', () => {
   it('applies only to sent invoices', () => {
     const { book, widget } = setUp();
     const order = book.createDocument({
-      type: 'sales_order', number: 'SO-8', date: '2026-07-01',
+      type: 'sales_order', number: 'SO-8', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
     });
     book.sendDocument(order.id);
@@ -293,7 +293,7 @@ describe('free items', () => {
     const { book, widget, gadget } = setUp();
     // Widget: sale 25.00 / cost 10.00 → free line records at 10.00 each.
     const invoice = book.createDocument({
-      type: 'invoice', number: 'INV-9', date: '2026-07-01',
+      type: 'invoice', number: 'INV-9', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [
         { itemId: gadget.id, description: 'Gadget', quantityMilli: 3000n, lineId: 'L1' }, // 3 × 40.00 = 120.00
         { itemId: widget.id, description: 'Widget (free to close the sale)', quantityMilli: 1000n, free: true, lineId: 'L2' },
@@ -316,7 +316,7 @@ describe('free items', () => {
     const lossLeader = book.createItem({ name: 'Loss leader', currency: 'USD', unitPrice: 500n, cost: 900n });
     const anchor = book.createItem({ name: 'Anchor', currency: 'USD', unitPrice: 10000n, cost: 1n });
     const invoice = book.createDocument({
-      type: 'invoice', number: 'INV-10', date: '2026-07-01',
+      type: 'invoice', number: 'INV-10', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [
         { itemId: anchor.id, description: 'Anchor', quantityMilli: 1000n },
         { itemId: lossLeader.id, description: 'Freebie', quantityMilli: 1000n, free: true },
@@ -365,7 +365,7 @@ describe('free items', () => {
   it('charge corrections leave free lines free and still hit the target', () => {
     const { book, widget, gadget } = setUp();
     const invoice = book.createDocument({
-      type: 'invoice', number: 'INV-11', date: '2026-07-01',
+      type: 'invoice', number: 'INV-11', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [
         { itemId: gadget.id, description: 'Gadget', quantityMilli: 3000n, lineId: 'L1' }, // 120.00, floor 90.00
         { itemId: widget.id, description: 'Freebie', quantityMilli: 1000n, free: true, lineId: 'L2' },

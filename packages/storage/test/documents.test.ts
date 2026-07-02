@@ -27,9 +27,8 @@ describe('invoice corrections persist', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
     const invoice = file.createDocument({
       type: 'invoice',
-      number: 'INV-0001',
+      number: 'INV-0001', customerName: 'Acme LLC',
       date: '2026-07-01',
-      counterparty: 'Acme LLC',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n }],
     });
     file.sendDocument(invoice.id);
@@ -55,7 +54,7 @@ describe('invoice corrections persist', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
     const order = file.createDocument({
       type: 'sales_order',
-      number: 'SO-0001',
+      number: 'SO-0001', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 5000n }],
     });
@@ -67,7 +66,7 @@ describe('invoice corrections persist', () => {
     });
     const invoice = file.createDocument({
       type: 'invoice',
-      number: 'INV-0002',
+      number: 'INV-0002', customerName: 'Acme LLC',
       date: '2026-07-03',
       sourceDocumentId: order.id,
       lines: [{ itemId: widget.id, description: 'Widget (blue)', quantityMilli: 5000n }],
@@ -82,7 +81,7 @@ describe('price snapshots persist', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
     const invoice = file.createDocument({
       type: 'invoice',
-      number: 'INV-0003',
+      number: 'INV-0003', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 4000n }],
     });
@@ -101,7 +100,7 @@ describe('database-level immutability', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
     const invoice = file.createDocument({
       type: 'invoice',
-      number: 'INV-0004',
+      number: 'INV-0004', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
     });
@@ -155,17 +154,17 @@ describe('conversions, closures, and adjustments persist (ADR 0005)', () => {
   it('partial conversion chain with line links and fulfillment survives reopening', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
     const estimate = file.createDocument({
-      type: 'estimate', number: 'EST-1', date: '2026-07-01',
+      type: 'estimate', number: 'EST-1', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 10000n, lineId: 'E1' }],
     });
     file.sendDocument(estimate.id);
-    const order = file.convertDocument(estimate.id, { type: 'sales_order', number: 'SO-1', date: '2026-07-02' });
+    const order = file.convertDocument(estimate.id, { type: 'sales_order', number: 'SO-1', customerName: 'Acme LLC', date: '2026-07-02' });
     expect(order.current.lines[0]!.sourceLineId).toBe('E1');
     file.sendDocument(order.id);
 
     const orderLineId = order.current.lines[0]!.lineId;
     file.convertDocument(order.id, {
-      type: 'invoice', number: 'INV-1', date: '2026-07-03',
+      type: 'invoice', number: 'INV-1', customerName: 'Acme LLC', date: '2026-07-03',
       lines: [{ sourceLineId: orderLineId, quantityMilli: 4000n }],
     });
     file.closeLine(order.id, { lineId: orderLineId, kind: 'unfulfilled', quantityMilli: 1000n, reason: 'reduced' });
@@ -186,12 +185,12 @@ describe('conversions, closures, and adjustments persist (ADR 0005)', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
     const gadget = file.createItem({ name: 'Gadget', currency: 'USD', unitPrice: 4000n });
     const order = file.createDocument({
-      type: 'sales_order', number: 'SO-2', date: '2026-07-01',
+      type: 'sales_order', number: 'SO-2', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 2000n, lineId: 'L1' }],
     });
     file.sendDocument(order.id);
     const invoice = file.convertDocument(order.id, {
-      type: 'invoice', number: 'INV-2', date: '2026-07-02',
+      type: 'invoice', number: 'INV-2', customerName: 'Acme LLC', date: '2026-07-02',
       lines: [{ sourceLineId: 'L1', substitution: { itemId: gadget.id, description: 'Gadget instead', unitPrice: 3000n } }],
     });
     expect(invoice.tags).toEqual(['with substitutions']);
@@ -204,7 +203,7 @@ describe('conversions, closures, and adjustments persist (ADR 0005)', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
     const gadget = file.createItem({ name: 'Gadget', currency: 'USD', unitPrice: 4000n, cost: 3000n });
     const invoice = file.createDocument({
-      type: 'invoice', number: 'INV-3', date: '2026-07-01',
+      type: 'invoice', number: 'INV-3', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [
         { itemId: widget.id, description: 'Widget', quantityMilli: 4000n, lineId: 'L1' }, // 100.00, floor 40.00
         { itemId: gadget.id, description: 'Gadget', quantityMilli: 2500n, lineId: 'L2' }, // 100.00, floor 75.00
@@ -228,7 +227,7 @@ describe('conversions, closures, and adjustments persist (ADR 0005)', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
     const gadget = file.createItem({ name: 'Gadget', currency: 'USD', unitPrice: 4000n });
     const invoice = file.createDocument({
-      type: 'invoice', number: 'INV-4', date: '2026-07-01',
+      type: 'invoice', number: 'INV-4', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [
         { itemId: gadget.id, description: 'Gadget', quantityMilli: 3000n, lineId: 'L1' },
         { itemId: widget.id, description: 'Widget (free)', quantityMilli: 1000n, free: true, lineId: 'L2' },
@@ -248,7 +247,7 @@ describe('conversions, closures, and adjustments persist (ADR 0005)', () => {
   it('closures are immutable at the database level', () => {
     const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
     const order = file.createDocument({
-      type: 'sales_order', number: 'SO-3', date: '2026-07-01',
+      type: 'sales_order', number: 'SO-3', customerName: 'Acme LLC', date: '2026-07-01',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n, lineId: 'L1' }],
     });
     file.sendDocument(order.id);
@@ -263,6 +262,97 @@ describe('conversions, closures, and adjustments persist (ADR 0005)', () => {
   });
 });
 
+describe('returns, statements, customer identity (ADR 0006)', () => {
+  const acme = { customerName: 'Acme LLC', accountNumber: 'A-100' };
+
+  function sell(itemId: string, number: string, date: string, quantityMilli: bigint) {
+    const invoice = file.createDocument({
+      type: 'invoice', number, date,
+      customerName: acme.customerName, accountNumber: acme.accountNumber, poNumber: `PO-${number}`,
+      lines: [{ itemId, description: 'Sale', quantityMilli }],
+    });
+    file.sendDocument(invoice.id);
+    return invoice;
+  }
+
+  it('persists a return credited at the last customer price with line links', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    sell(widget.id, 'INV-A', '2026-05-01', 2000n);
+    file.setPrice(widget.id, 3000n, '2026-06-01');
+    const last = sell(widget.id, 'INV-B', '2026-06-15', 1000n);
+    file.setPrice(widget.id, 9999n, '2026-07-01'); // must not affect the credit
+
+    const credit = file.createReturn({
+      number: 'CR-A', date: '2026-07-05', ...acme,
+      items: [{ itemId: widget.id, quantityMilli: 1000n }],
+    });
+    expect(credit.total).toBe(3000n);
+    expect(credit.current.lines[0]!.sourceDocumentId).toBe(last.id);
+    expect(credit.current.lines[0]!.sourceLineId).toBe(last.current.lines[0]!.lineId);
+
+    file.close();
+    file = CompanyFile.open(books);
+    const reloaded = file.viewDocument(credit.id);
+    expect(reloaded.total).toBe(3000n);
+    expect(file.getDocumentRecord(credit.id)!.settlement).toBe('account');
+  });
+
+  it('computes a statement with aging, corrections below originals, and credits', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n, cost: 1000n });
+    sell(widget.id, 'INV-C', '2026-05-15', 4000n); // 100.00, past due at 07-02
+    const corrected = sell(widget.id, 'INV-D', '2026-06-05', 2000n); // 50.00 → 45.00
+    file.chargeCorrection(corrected.id, 4500n, 'charged $45');
+    const credit = file.createReturn({
+      number: 'CR-B', date: '2026-06-28', ...acme,
+      items: [{ itemId: widget.id, quantityMilli: 1000n }],
+    });
+    file.sendDocument(credit.id);
+
+    const statement = file.statement({ accountNumber: 'A-100' }, '2026-07-02');
+    expect(statement.invoices.map((entry) => [entry.number, entry.ageLabel])).toEqual([
+      ['INV-C', 'past due'],
+      ['INV-D', 'due soon'],
+    ]);
+    const invD = statement.invoices[1]!;
+    expect(invD.originalTotal).toBe(5000n);
+    expect(invD.corrections[0]!.total).toBe(4500n);
+    expect(invD.poNumber).toBe('PO-INV-D');
+    expect(statement.credits[0]!.kind).toBe('return');
+    // The return credits the *corrected* price of the last purchase (INV-D): 45.00 / 2 = 22.50.
+    expect(statement.credits[0]!.total).toBe(2250n);
+    expect(statement.balance).toBe(10000n + 4500n - 2250n);
+  });
+
+  it('enforces the consumption guard on persisted documents', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    const order = file.createDocument({
+      type: 'sales_order', number: 'SO-X', date: '2026-07-01', customerName: 'Acme LLC',
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 10000n, lineId: 'L1' }],
+    });
+    file.sendDocument(order.id);
+    file.convertDocument(order.id, {
+      type: 'invoice', number: 'INV-X', date: '2026-07-02',
+      lines: [{ sourceLineId: 'L1', quantityMilli: 4000n }],
+    });
+    expect(() =>
+      file.changeDocument(order.id, {
+        kind: 'correction',
+        lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 3000n, lineId: 'L1' }],
+      }),
+    ).toThrowError(/cannot shrink below its consumed quantity/);
+  });
+
+  it('requires a customer name on every transaction', () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    expect(() =>
+      file.createDocument({
+        type: 'invoice', number: 'INV-Z', date: '2026-07-01', customerName: '',
+        lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n }],
+      }),
+    ).toThrowError(/customer name/);
+  });
+});
+
 describe('conformance against the in-memory DocumentBook', () => {
   it('replays the same operations and reaches the same views', () => {
     const reference = new DocumentBook();
@@ -271,14 +361,14 @@ describe('conformance against the in-memory DocumentBook', () => {
 
     const sqlInvoice = file.createDocument({
       type: 'invoice',
-      number: 'INV-C1',
+      number: 'INV-C1', customerName: 'Acme LLC',
       date: '2026-07-01',
       lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n, lineId: 'L1' }],
     });
     reference.createDocument(
       {
         type: 'invoice',
-        number: 'INV-C1',
+        number: 'INV-C1', customerName: 'Acme LLC',
         date: '2026-07-01',
         lines: [{ itemId: sqlWidget.id, description: 'Widget', quantityMilli: 2500n, lineId: 'L1' }],
       },
