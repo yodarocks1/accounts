@@ -104,6 +104,13 @@ export {
   computeStatement,
 } from './statement.js';
 export {
+  POSTING_ROLES,
+  type PostingRole,
+  type PostingKind,
+  rolesFor,
+  planPosting,
+} from './posting.js';
+export {
   type Payment,
   type NewPayment,
   type ApplicationSourceKind,

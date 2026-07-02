@@ -336,7 +336,33 @@ const V7_SQL = `
 ALTER TABLE document_revisions ADD COLUMN terms_days INTEGER CHECK (terms_days IS NULL OR terms_days >= 0);
 `;
 
+const V8_SQL = `
+-- Tier 1: ledger posting. Role → account mapping is mutable config
+-- (audited at the app level); posting links are append-only.
+CREATE TABLE posting_accounts (
+  role       TEXT PRIMARY KEY CHECK (role IN ('accounts_receivable','sales_income','cash')),
+  account_id TEXT NOT NULL REFERENCES accounts(id)
+) STRICT;
+
+CREATE TABLE postings (
+  posting_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('document','payment')),
+  source_id   TEXT NOT NULL,
+  entry_id    TEXT NOT NULL REFERENCES journal_entries(id),
+  kind        TEXT NOT NULL CHECK (kind IN ('post','reversal')),
+  at          TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX idx_postings_source ON postings(source_kind, source_id);
+
+CREATE TRIGGER postings_no_update BEFORE UPDATE ON postings
+BEGIN SELECT RAISE(ABORT, 'postings are immutable'); END;
+
+CREATE TRIGGER postings_no_delete BEFORE DELETE ON postings
+BEGIN SELECT RAISE(ABORT, 'postings are immutable'); END;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

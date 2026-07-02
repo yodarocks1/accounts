@@ -14,6 +14,7 @@ import {
   defaultAllowBelowCost,
   deriveTags,
   planChargeCorrection,
+  planPosting,
   resolveRatePrice,
   revisionTotal,
   settle,
@@ -47,6 +48,8 @@ import {
   type NewLineClosure,
   type NewReturn,
   type PriceKind,
+  type PostingKind,
+  type PostingRole,
   type CustomerQuery,
   type CustomerRate,
   type NewCustomerRate,
@@ -692,6 +695,7 @@ export class CompanyFile implements ItemCatalog {
         lines,
       });
       this.audit('document.revised', 'document', id, { kind, reason: changes.reason ?? null });
+      this.repostDocumentIfPosted(id);
     })();
     return this.viewDocument(id);
   }
@@ -723,6 +727,7 @@ export class CompanyFile implements ItemCatalog {
         actualTotal: actualTotal.toString(),
         reason: reason ?? null,
       });
+      this.repostDocumentIfPosted(id);
     })();
     return this.viewDocument(id);
   }
@@ -882,6 +887,7 @@ export class CompanyFile implements ItemCatalog {
     this.db.transaction(() => {
       this.db.prepare(`UPDATE documents SET status = 'sent' WHERE id = ?`).run(id);
       this.audit('document.sent', 'document', id, {});
+      this.postDocumentIfConfigured(this.requireDocumentRecord(id));
     })();
     return this.viewDocument(id);
   }
@@ -891,9 +897,11 @@ export class CompanyFile implements ItemCatalog {
     if (document.status === 'void') {
       throw new LedgerError('INVALID_STATUS', 'Document is already void');
     }
+    const voidCurrent = document.revisions[document.revisions.length - 1]!;
     this.db.transaction(() => {
       this.db.prepare(`UPDATE documents SET status = 'void' WHERE id = ?`).run(id);
       this.audit('document.voided', 'document', id, {});
+      this.reversePostingIfActive('document', id, voidCurrent.date, `Reversal: ${document.number} voided`);
     })();
     return this.viewDocument(id);
   }
@@ -1118,6 +1126,18 @@ export class CompanyFile implements ItemCatalog {
           input.date,
         );
       }
+      const plan = planPosting(
+        'payment',
+        payment.amountMinor,
+        this.info().baseCurrency,
+        payment.date,
+        this.postingAccounts(),
+        `Payment ${payment.number} (${payment.customerName})`,
+      );
+      if (plan) {
+        const entry = this.postEntry(plan);
+        this.recordPosting('payment', payment.id, entry.id, 'post');
+      }
     })();
     return payment;
   }
@@ -1167,6 +1187,7 @@ export class CompanyFile implements ItemCatalog {
     this.db.transaction(() => {
       this.db.prepare(`UPDATE payments SET status = 'void' WHERE id = ?`).run(id);
       this.audit('payment.voided', 'payment', id, {});
+      this.reversePostingIfActive('payment', id, payment.date, `Reversal: payment ${payment.number} voided`);
     })();
     return { ...payment, status: 'void' };
   }
@@ -1325,6 +1346,132 @@ export class CompanyFile implements ItemCatalog {
       asOf,
     );
     return settle(revisionTotal(current), paid);
+  }
+
+  // ── Ledger posting (Tier 1, ADR 0008 part 3) ────────────────────────────
+
+  /** Map a posting role to a ledger account; posting activates once mapped. */
+  setPostingAccount(role: PostingRole, accountId: string): void {
+    if (!this.getAccount(accountId)) {
+      throw new LedgerError('UNKNOWN_ACCOUNT', `No such account: ${accountId}`);
+    }
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO posting_accounts (role, account_id) VALUES (?, ?)
+           ON CONFLICT(role) DO UPDATE SET account_id = excluded.account_id`,
+        )
+        .run(role, accountId);
+      this.audit('posting.account_set', 'posting_account', role, { accountId });
+    })();
+  }
+
+  postingAccounts(): Partial<Record<PostingRole, string>> {
+    const rows = this.db
+      .prepare(`SELECT role, account_id AS accountId FROM posting_accounts`)
+      .all() as { role: PostingRole; accountId: string }[];
+    return Object.fromEntries(rows.map((row) => [row.role, row.accountId]));
+  }
+
+  listPostings(sourceKind?: 'document' | 'payment', sourceId?: string): {
+    postingSeq: number;
+    sourceKind: 'document' | 'payment';
+    sourceId: string;
+    entryId: string;
+    kind: 'post' | 'reversal';
+    at: string;
+  }[] {
+    interface PostingRow {
+      posting_seq: bigint;
+      source_kind: 'document' | 'payment';
+      source_id: string;
+      entry_id: string;
+      kind: 'post' | 'reversal';
+      at: string;
+    }
+    const rows = (
+      sourceKind !== undefined && sourceId !== undefined
+        ? this.db
+            .prepare(`SELECT * FROM postings WHERE source_kind = ? AND source_id = ? ORDER BY posting_seq`)
+            .all(sourceKind, sourceId)
+        : this.db.prepare(`SELECT * FROM postings ORDER BY posting_seq`).all()
+    ) as PostingRow[];
+    return rows.map((row) => ({
+      postingSeq: Number(row.posting_seq),
+      sourceKind: row.source_kind,
+      sourceId: row.source_id,
+      entryId: row.entry_id,
+      kind: row.kind,
+      at: row.at,
+    }));
+  }
+
+  private activePostingEntry(sourceKind: 'document' | 'payment', sourceId: string): string | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT entry_id AS entryId, kind FROM postings
+         WHERE source_kind = ? AND source_id = ? ORDER BY posting_seq DESC LIMIT 1`,
+      )
+      .get(sourceKind, sourceId) as { entryId: string; kind: 'post' | 'reversal' } | undefined;
+    return row?.kind === 'post' ? row.entryId : undefined;
+  }
+
+  private recordPosting(
+    sourceKind: 'document' | 'payment',
+    sourceId: string,
+    entryId: string,
+    kind: 'post' | 'reversal',
+  ): void {
+    this.db
+      .prepare(`INSERT INTO postings (source_kind, source_id, entry_id, kind, at) VALUES (?, ?, ?, ?, ?)`)
+      .run(sourceKind, sourceId, entryId, kind, new Date().toISOString());
+    this.audit('ledger.posted', 'posting', sourceId, { sourceKind, entryId, kind });
+  }
+
+  /** Post a sent invoice/credit memo if the needed roles are mapped. */
+  private postDocumentIfConfigured(record: DocumentRecord): void {
+    let kind: PostingKind;
+    if (record.type === 'invoice') kind = 'invoice';
+    else if (record.type === 'credit_memo') {
+      kind = record.settlement === 'refund' ? 'credit_refund' : 'credit_account';
+    } else return;
+    const current = record.revisions[record.revisions.length - 1]!;
+    const plan = planPosting(
+      kind,
+      revisionTotal(current),
+      current.lines[0]!.currency,
+      current.date,
+      this.postingAccounts(),
+      `${record.number} (${current.customerName})`,
+    );
+    if (!plan) return;
+    const entry = this.postEntry(plan);
+    this.recordPosting('document', record.id, entry.id, 'post');
+  }
+
+  private reversePostingIfActive(
+    sourceKind: 'document' | 'payment',
+    sourceId: string,
+    date: string,
+    memo: string,
+  ): void {
+    const entryId = this.activePostingEntry(sourceKind, sourceId);
+    if (entryId === undefined) return;
+    const reversal = this.reverseEntry(entryId, date, memo);
+    this.recordPosting(sourceKind, sourceId, reversal.id, 'reversal');
+  }
+
+  /**
+   * Corrections on sent, posted documents reverse the original entry and post
+   * the corrected one in the same transaction (ADR 0004 / ADR 0008).
+   */
+  private repostDocumentIfPosted(id: string): void {
+    const record = this.requireDocumentRecord(id);
+    if (record.status !== 'sent') return;
+    if (this.activePostingEntry('document', id) === undefined) return;
+    const current = record.revisions[record.revisions.length - 1]!;
+    this.reversePostingIfActive('document', id, current.date, `Reversal: ${record.number} corrected`);
+    this.postDocumentIfConfigured(record);
   }
 
   // ── Audit ───────────────────────────────────────────────────────────────
