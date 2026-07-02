@@ -170,10 +170,27 @@ of VS Code/Obsidian, under a license that keeps hosted forks honest.
 ### 6.2 Documents (business layer)
 
 Invoices, bills, payments, credit memos, etc. are **Documents**: structured
-records with lifecycle state (`draft → posted → paid/void`) that *generate*
-journal entries when posted. Documents are editable in draft; posting is the
-commit point. Plugins can define entirely new document types with their own
+records with lifecycle state (`draft → sent/posted → paid/void`) that *generate*
+journal entries when posted. Documents are editable in draft; sending/posting is
+the commit point. Plugins can define entirely new document types with their own
 posting rules.
+
+**Revision & correction semantics (ADR 0004):** a document is an append-only
+stack of immutable revisions; lookup shows the latest revision plus derived
+tags and full history.
+
+- **Invoices** cannot be edited after they are sent. Post-send changes are
+  recorded as *correction* revisions; lookup shows the up-to-date content
+  tagged **"with corrections"**.
+- **Sales orders** behave the same, except post-send revisions are explicitly
+  either *corrections* or *substitutions* ("with corrections" / "with
+  substitutions"). An invoice generated from such a sales order inherits its
+  tags at creation.
+- **Estimates** may be changed at any time, but every change lands in the
+  visible revision history.
+- **Price changes never change past transactions, no matter what.** Item prices
+  are effective-dated, append-only history; documents snapshot the unit price
+  into each line when the line is written.
 
 ### 6.3 Parties & items
 
@@ -300,7 +317,9 @@ A first-class, obsessively-tested onramp — this determines adoption.
 
 ### Phase 1 — Usable books (months 2–6) → **v0.1 alpha**
 - [ ] Web UI shell: chart of accounts, journal entry, register views
-- [ ] Documents: invoices, bills, payments (as bundled plugins)
+- [x] Document revision machinery: estimates, sales orders, invoices with
+      correction/substitution tagging and snapshot pricing (ADR 0004)
+- [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging
 - [ ] Plugin host v1 (in-process, bundled plugins only) — dogfooding the API

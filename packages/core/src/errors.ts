@@ -9,7 +9,15 @@ export type LedgerErrorCode =
   | 'UNKNOWN_ENTRY'
   | 'ALREADY_REVERSED'
   | 'INVALID_MONEY_STRING'
-  | 'UNKNOWN_CURRENCY';
+  | 'UNKNOWN_CURRENCY'
+  | 'INVALID_QUANTITY'
+  | 'UNKNOWN_ITEM'
+  | 'UNKNOWN_DOCUMENT'
+  | 'DUPLICATE_DOCUMENT_NUMBER'
+  | 'DOCUMENT_LOCKED'
+  | 'INVALID_REVISION_KIND'
+  | 'INVALID_DOCUMENT'
+  | 'INVALID_STATUS';
 
 export class LedgerError extends Error {
   constructor(

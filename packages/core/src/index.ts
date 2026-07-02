@@ -26,3 +26,32 @@ export {
 } from './journal.js';
 export { type TrialBalanceRow, type TrialBalance, computeTrialBalance } from './trial-balance.js';
 export { Ledger } from './ledger.js';
+export { QUANTITY_SCALE, parseQuantity, formatQuantity, divRoundHalf } from './quantity.js';
+export {
+  DOCUMENT_TYPES,
+  type DocumentType,
+  type DocumentStatus,
+  type RevisionKind,
+  type DocumentTag,
+  type DocumentLine,
+  type NewDocumentLine,
+  type DocumentRevision,
+  type DocumentRecord,
+  type DocumentView,
+  type NewDocument,
+  type DocumentChanges,
+  type Item,
+  type ItemPrice,
+  type NewItem,
+  type RevisionContent,
+  type ItemCatalog,
+  resolveDocumentLines,
+  resolveRevisionKind,
+  deriveTags,
+  documentLabel,
+  lineTotal,
+  revisionTotal,
+  validateRevisionContent,
+  viewDocument,
+  DocumentBook,
+} from './documents.js';
