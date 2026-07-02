@@ -45,7 +45,10 @@ export interface CreditApplication {
   readonly applicationSeq: number;
   readonly sourceKind: ApplicationSourceKind;
   readonly sourceId: string;
+  /** Target document: an invoice, or a sent sales order (deposit). */
   readonly invoiceId: string;
+  /** Sales orders only: the specific line this prepays (ADR 0010 part 3). */
+  readonly lineId: string | null;
   readonly amountMinor: bigint;
   readonly date: string;
   readonly at: string;
@@ -56,6 +59,8 @@ export interface CreditApplication {
 export interface NewApplication {
   invoiceId: string;
   amount: bigint;
+  /** Sales orders only: mark this specific line as prepaid (ADR 0010 part 3). */
+  lineId?: string;
 }
 
 /** Active (non-reversed) applications only. */
@@ -144,11 +149,11 @@ export function validateApplication(
   if (amount <= 0n) {
     throw new LedgerError('INVALID_ALLOCATION', 'Application amounts must be positive');
   }
-  if (invoice.type !== 'invoice') {
-    throw new LedgerError('INVALID_DOCUMENT', 'Credit can only be applied to invoices');
+  if (invoice.type !== 'invoice' && invoice.type !== 'sales_order') {
+    throw new LedgerError('INVALID_DOCUMENT', 'Credit can only be applied to invoices or sales orders (deposits)');
   }
   if (invoice.status !== 'sent') {
-    throw new LedgerError('INVALID_STATUS', 'Credit can only be applied to sent invoices');
+    throw new LedgerError('INVALID_STATUS', 'Credit can only be applied to sent documents');
   }
   const current = invoice.revisions[invoice.revisions.length - 1]!;
   if (!sameCustomer(source, current)) {
@@ -166,4 +171,23 @@ export function validateApplication(
       `Application of ${amount} exceeds the invoice's open balance ${invoiceOpen}; the remainder stays on account`,
     );
   }
+}
+
+/**
+ * Net amount applied to one sales-order line (line-level prepayments,
+ * ADR 0010 part 3).
+ */
+export function appliedToLine(
+  applications: readonly CreditApplication[],
+  targetId: string,
+  lineId: string,
+  isSourceActive: (kind: ApplicationSourceKind, id: string) => boolean,
+): bigint {
+  let total = 0n;
+  for (const application of activeApplications(applications)) {
+    if (application.invoiceId !== targetId || application.lineId !== lineId) continue;
+    if (!isSourceActive(application.sourceKind, application.sourceId)) continue;
+    total += application.amountMinor;
+  }
+  return total;
 }

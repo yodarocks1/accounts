@@ -20,6 +20,7 @@ import type { NewParty, Party, PartyName } from './parties.js';
 import {
   appliedFromSource,
   appliedToInvoice,
+  appliedToLine,
   settle,
   validateApplication,
   type CreditApplication,
@@ -117,6 +118,8 @@ export interface DocumentRevision {
   readonly poNumber: string | null;
   /** Payment terms in days (Net N); due date = date + termsDays (ADR 0008). */
   readonly termsDays: number | null;
+  /** Sales orders only: the deposit requested, resolved to minor units. */
+  readonly depositRequiredMinor: bigint | null;
   readonly memo: string | null;
   readonly lines: readonly DocumentLine[];
 }
@@ -247,6 +250,9 @@ export interface NewTaxRate {
 /** When an item requires a deposit on sales orders (ADR 0010 part 3). */
 export type DepositPolicy = 'never' | 'always' | 'when_out_of_stock';
 
+/** A deposit request on a sales order: flat or percent of the grand total. */
+export type DepositRequest = { amountMinor: bigint } | { percentMilli: bigint };
+
 /** What auto-numbering sequences exist for (ADR 0010 part 2). */
 export type SequenceKind = DocumentType | 'payment';
 
@@ -293,6 +299,7 @@ export const APPROVAL_ACTIONS = [
   'void_document',
   'close_line',
   'return_window_override',
+  'deposit_override',
 ] as const;
 export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];
 
@@ -467,6 +474,59 @@ export function revisionTax(revision: Pick<DocumentRevision, 'lines'>): bigint {
 /** What the customer owes: subtotal plus tax (ADR 0010). */
 export function revisionGrandTotal(revision: Pick<DocumentRevision, 'lines'>): bigint {
   return revisionTotal(revision) + revisionTax(revision);
+}
+
+/** One line's customer amount including its own tax (prepayment cap, ADR 0010). */
+export function lineGrossTotal(
+  line: Pick<DocumentLine, 'quantityMilli' | 'unitPrice' | 'adjustment' | 'free' | 'taxPercentMilli' | 'taxCode'>,
+): bigint {
+  const net = customerLineTotal(line);
+  if (line.taxCode === null || line.taxPercentMilli === 0n) return net;
+  return net + divRoundHalf(net * line.taxPercentMilli, PERCENT_SCALE);
+}
+
+/** Resolve a deposit request against the revision's grand total (ADR 0010). */
+export function computeDepositRequired(
+  request: DepositRequest,
+  grandTotal: bigint,
+): bigint {
+  const amount =
+    'amountMinor' in request
+      ? request.amountMinor
+      : divRoundHalf(grandTotal * request.percentMilli, PERCENT_SCALE);
+  if (amount <= 0n) {
+    throw new LedgerError('INVALID_DOCUMENT', 'Deposit requests must be positive');
+  }
+  if (amount > grandTotal) {
+    throw new LedgerError('INVALID_DOCUMENT', `Deposit ${amount} exceeds the order total ${grandTotal}`);
+  }
+  return amount;
+}
+
+/** Deposits belong to sales orders only (ADR 0010 part 3). */
+export function resolveDepositRequest(
+  type: DocumentType,
+  request: DepositRequest | undefined,
+  lines: readonly DocumentLine[],
+): bigint | null {
+  if (request === undefined) return null;
+  if (type !== 'sales_order') {
+    throw new LedgerError('INVALID_DOCUMENT', 'Deposits can only be requested on sales orders');
+  }
+  return computeDepositRequired(request, revisionGrandTotal({ lines }));
+}
+
+/** Which lines require a deposit before the order can be sent (ADR 0010). */
+export function depositRequiringLines(
+  lines: readonly DocumentLine[],
+  getItem: (id: string) => Item | undefined,
+): DocumentLine[] {
+  return lines.filter((line) => {
+    if (line.itemId === null) return false;
+    const item = getItem(line.itemId);
+    if (!item) return false;
+    return item.depositPolicy === 'always' || (item.depositPolicy === 'when_out_of_stock' && !item.inStock);
+  });
 }
 
 /**
@@ -1107,6 +1167,10 @@ export interface NewDocument {
   approvedBy?: string;
   /** Credit memos only: defaults to 'account'. */
   settlement?: SettlementMode;
+  /** Suppress tax codes on every line (defaults from the party) (ADR 0010). */
+  taxExempt?: boolean;
+  /** Sales orders only: request a deposit (ADR 0010 part 3). */
+  deposit?: DepositRequest;
 }
 
 export interface DocumentChanges {
@@ -1121,6 +1185,8 @@ export interface DocumentChanges {
   memo?: string;
   /** Who authorized gated aspects (e.g. below-cost pricing) (ADR 0009). */
   approvedBy?: string;
+  /** Sales orders only: change the requested deposit (ADR 0010 part 3). */
+  deposit?: DepositRequest;
 }
 
 export interface NewItem {
@@ -1673,6 +1739,7 @@ export class DocumentBook implements ItemCatalog {
           accountNumber: customer.accountNumber ?? null,
           poNumber: input.poNumber ?? null,
           termsDays: customer.termsDays ?? null,
+          depositRequiredMinor: resolveDepositRequest(input.type, input.deposit, lines),
           memo: input.memo ?? null,
           lines,
         },
@@ -1706,6 +1773,19 @@ export class DocumentBook implements ItemCatalog {
     validateRevisionContent({ date, lines, customerName });
     // ADR 0006: never orphan downstream links or over-consume a shrunk line.
     validateLineConsumption(lines, this.fulfillment(id));
+    // ADR 0010 part 3: prepaid lines cannot vanish or shrink below their prepayment.
+    if (document.type === 'sales_order') {
+      for (const entry of this.linePrepayments(id)) {
+        if (entry.prepaid === 0n) continue;
+        const stillThere = lines.find((line) => line.lineId === entry.lineId);
+        if (!stillThere) {
+          throw new LedgerError('LINE_LINKED', `Line ${entry.lineId} has ${entry.prepaid} prepaid and cannot be removed`);
+        }
+        if (lineGrossTotal(stillThere) < entry.prepaid) {
+          throw new LedgerError('LINE_LINKED', `Line ${entry.lineId} cannot shrink below its ${entry.prepaid} prepayment`);
+        }
+      }
+    }
     this.requireBelowCostApproval(document.type, date, lines, changes.approvedBy);
     if (document.type === 'credit_memo' && changes.lines !== undefined) {
       validateReturnQuantities(
@@ -1728,6 +1808,10 @@ export class DocumentBook implements ItemCatalog {
       accountNumber: changes.accountNumber ?? previous.accountNumber,
       poNumber: changes.poNumber ?? previous.poNumber,
       termsDays: validateTermsDays(changes.termsDays) ?? previous.termsDays,
+      depositRequiredMinor:
+        changes.deposit !== undefined
+          ? resolveDepositRequest(document.type, changes.deposit, lines)
+          : previous.depositRequiredMinor,
       memo: changes.memo ?? previous.memo,
       lines,
     });
@@ -1754,6 +1838,7 @@ export class DocumentBook implements ItemCatalog {
       accountNumber: previous.accountNumber,
       poNumber: previous.poNumber,
       termsDays: previous.termsDays,
+      depositRequiredMinor: previous.depositRequiredMinor,
       memo: previous.memo,
       lines,
     });
@@ -1956,11 +2041,32 @@ export class DocumentBook implements ItemCatalog {
       source.total - appliedFromSource(this.applications, input.sourceKind, input.sourceId);
     const settlement = this.invoiceSettlement(input.invoiceId);
     validateApplication(input.amount, remaining, invoice, settlement.open, source);
+    // Line-level prepayments are a sales-order-only concept (ADR 0010 part 3).
+    if (input.lineId !== undefined) {
+      if (invoice.type !== 'sales_order') {
+        throw new LedgerError('INVALID_DOCUMENT', 'Line-level prepayments apply only to sales orders');
+      }
+      const current = invoice.revisions[invoice.revisions.length - 1]!;
+      const line = current.lines.find((candidate) => candidate.lineId === input.lineId);
+      if (!line) {
+        throw new LedgerError('UNKNOWN_LINE', `No such line: ${input.lineId}`);
+      }
+      const lineOpen =
+        lineGrossTotal(line) -
+        appliedToLine(this.applications, invoice.id, input.lineId, (kind, id) => this.isSourceActive(kind, id));
+      if (input.amount > lineOpen) {
+        throw new LedgerError(
+          'INVALID_ALLOCATION',
+          `Prepaying ${input.amount} exceeds the line's remaining ${lineOpen}`,
+        );
+      }
+    }
     const application: CreditApplication = {
       applicationSeq: this.applications.length + 1,
       sourceKind: input.sourceKind,
       sourceId: input.sourceId,
       invoiceId: input.invoiceId,
+      lineId: input.lineId ?? null,
       amountMinor: input.amount,
       date: date ?? invoice.revisions[invoice.revisions.length - 1]!.date,
       at: at ?? new Date().toISOString(),
@@ -1984,6 +2090,7 @@ export class DocumentBook implements ItemCatalog {
       sourceKind: target.sourceKind,
       sourceId: target.sourceId,
       invoiceId: target.invoiceId,
+      lineId: target.lineId,
       amountMinor: target.amountMinor,
       date: target.date,
       at: at ?? new Date().toISOString(),
@@ -2061,13 +2168,104 @@ export class DocumentBook implements ItemCatalog {
     return this.closures.get(documentId) ?? [];
   }
 
-  sendDocument(id: string): DocumentView {
+  sendDocument(id: string, options?: { overrideDeposit?: boolean; approvedBy?: string }): DocumentView {
     const document = this.requireDocument(id);
     if (document.status !== 'draft') {
       throw new LedgerError('INVALID_STATUS', `Only draft documents can be sent (is ${document.status})`);
     }
+    const current = document.revisions[document.revisions.length - 1]!;
+    if (document.type === 'sales_order') {
+      const requiring = depositRequiringLines(current.lines, (itemId) => this.items.get(itemId));
+      if (requiring.length > 0 && (current.depositRequiredMinor ?? 0n) <= 0n) {
+        if (options?.overrideDeposit === true) {
+          this.requireApproval('deposit_override', options.approvedBy);
+        } else {
+          throw new LedgerError(
+            'DEPOSIT_REQUIRED',
+            `These items require a deposit before sending: ${requiring.map((line) => line.description).join(', ')} (pass overrideDeposit to send anyway)`,
+          );
+        }
+      }
+    }
     this.documents.set(id, { ...document, status: 'sent' });
+    if (document.type === 'invoice') {
+      this.transferDeposits(id);
+    }
     return this.view(id);
+  }
+
+  /** Total deposit money held against a sales order (ADR 0010 part 3). */
+  depositHeld(documentId: string): bigint {
+    this.requireDocument(documentId);
+    return appliedToInvoice(this.applications, documentId, (kind, id) => this.isSourceActive(kind, id));
+  }
+
+  /** Per-line prepayments on a sales order (ADR 0010 part 3). */
+  linePrepayments(documentId: string): { lineId: string; description: string; prepaid: bigint; lineGross: bigint }[] {
+    const document = this.requireDocument(documentId);
+    const current = document.revisions[document.revisions.length - 1]!;
+    return current.lines.map((line) => ({
+      lineId: line.lineId,
+      description: line.description,
+      prepaid: appliedToLine(this.applications, documentId, line.lineId, (kind, id) => this.isSourceActive(kind, id)),
+      lineGross: lineGrossTotal(line),
+    }));
+  }
+
+  /**
+   * Move deposits held on the source sales order onto a just-sent invoice:
+   * line-level prepayments whose line converted into this invoice first,
+   * then document-level deposits, oldest first (ADR 0010 part 3). Each move
+   * is a reversal plus a fresh application — fully auditable.
+   */
+  private transferDeposits(invoiceId: string): void {
+    const invoice = this.requireDocument(invoiceId);
+    if (invoice.sourceDocumentId === null) return;
+    const source = this.documents.get(invoice.sourceDocumentId);
+    if (!source || source.type !== 'sales_order') return;
+    const invoiceCurrent = invoice.revisions[invoice.revisions.length - 1]!;
+    const convertedLineIds = new Set(
+      invoiceCurrent.lines
+        .map((line) => line.sourceLineId)
+        .filter((lineId): lineId is string => lineId !== null),
+    );
+    const held = this.applications
+      .filter(
+        (application) =>
+          application.invoiceId === source.id &&
+          application.reversesApplicationSeq === null &&
+          !this.applications.some((other) => other.reversesApplicationSeq === application.applicationSeq) &&
+          this.isSourceActive(application.sourceKind, application.sourceId),
+      )
+      .sort((a, b) => {
+        const aLinked = a.lineId !== null && convertedLineIds.has(a.lineId) ? 0 : a.lineId === null ? 1 : 2;
+        const bLinked = b.lineId !== null && convertedLineIds.has(b.lineId) ? 0 : b.lineId === null ? 1 : 2;
+        return aLinked === bLinked ? a.applicationSeq - b.applicationSeq : aLinked - bLinked;
+      });
+    for (const application of held) {
+      // Prepayments for lines NOT on this invoice stay held on the order.
+      if (application.lineId !== null && !convertedLineIds.has(application.lineId)) continue;
+      const open = this.invoiceSettlement(invoiceId).open;
+      if (open === 0n) break;
+      const move = application.amountMinor < open ? application.amountMinor : open;
+      this.reverseApplication(application.applicationSeq);
+      this.applyCredit({
+        sourceKind: application.sourceKind,
+        sourceId: application.sourceId,
+        invoiceId,
+        amount: move,
+      });
+      if (move < application.amountMinor) {
+        // The unmoved remainder stays held on the order.
+        this.applyCredit({
+          sourceKind: application.sourceKind,
+          sourceId: application.sourceId,
+          invoiceId: source.id,
+          amount: application.amountMinor - move,
+          ...(application.lineId !== null ? { lineId: application.lineId } : {}),
+        });
+      }
+    }
   }
 
   voidDocument(id: string, approvedBy?: string): DocumentView {

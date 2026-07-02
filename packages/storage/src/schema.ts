@@ -545,7 +545,14 @@ CREATE TABLE number_sequences (
 ) STRICT;
 `;
 
+const V14_SQL = `
+-- Tier 3 (ADR 0010 part 3): deposits/prepayments on sales orders.
+ALTER TABLE document_revisions ADD COLUMN deposit_required_minor INTEGER
+  CHECK (deposit_required_minor IS NULL OR deposit_required_minor >= 0);
+ALTER TABLE credit_applications ADD COLUMN line_id TEXT;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

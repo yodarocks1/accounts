@@ -95,3 +95,46 @@ describe('sales tax persists (Tier 3)', () => {
     expect(invoice.total).toBe(10000n);
   });
 });
+
+describe('deposits persist (Tier 3)', () => {
+  it('line-level prepayments, gates, and invoice transfer survive reopening', () => {
+    const custom = file.createItem({ name: 'Custom job', currency: 'USD', unitPrice: 50_000n, depositPolicy: 'always' });
+    const order = file.createDocument({
+      type: 'sales_order', number: 'SO-D1', date: '2026-07-01', ...acme,
+      deposit: { percentMilli: 30_000n }, // 30% of 500.00 = 150.00
+      lines: [{ itemId: custom.id, description: 'Custom job', quantityMilli: 1000n, lineId: 'L1' }],
+    });
+    expect(order.current.depositRequiredMinor).toBe(15_000n);
+    file.sendDocument(order.id);
+
+    // Sending without a deposit request is gated by the item policy.
+    const bare = file.createDocument({
+      type: 'sales_order', number: 'SO-D2', date: '2026-07-01', ...acme,
+      lines: [{ itemId: custom.id, description: 'Custom job', quantityMilli: 1000n }],
+    });
+    expect(() => file.sendDocument(bare.id)).toThrowError(/require a deposit before sending/);
+    file.sendDocument(bare.id, { overrideDeposit: true });
+
+    const payment = file.recordPayment({ number: 'PMT-D1', date: '2026-07-02', ...acme, amount: 20_000n });
+    file.applyCredit({ sourceKind: 'payment', sourceId: payment.id, invoiceId: order.id, amount: 20_000n, lineId: 'L1' });
+
+    file.close();
+    file = CompanyFile.open(books);
+    expect(file.depositHeld(order.id)).toBe(20_000n);
+    expect(file.linePrepayments(order.id)[0]!.prepaid).toBe(20_000n);
+
+    // Prepaid line cannot shrink below the prepayment.
+    expect(() =>
+      file.changeDocument(order.id, {
+        kind: 'correction',
+        lines: [{ itemId: custom.id, description: 'Custom job', quantityMilli: 300n, lineId: 'L1' }],
+      }),
+    ).toThrowError(/cannot shrink below/);
+
+    // Convert and send: the prepayment transfers to the invoice.
+    const invoice = file.convertDocument(order.id, { type: 'invoice', number: 'INV-D1', date: '2026-07-05' });
+    file.sendDocument(invoice.id);
+    expect(file.invoiceSettlement(invoice.id).paid).toBe(20_000n);
+    expect(file.depositHeld(order.id)).toBe(0n);
+  });
+});

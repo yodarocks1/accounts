@@ -73,6 +73,10 @@ import {
   type NumberSequence,
   type NewNumberSequence,
   formatSequenceNumber,
+  appliedToLine,
+  depositRequiringLines,
+  lineGrossTotal,
+  resolveDepositRequest,
   type NewCustomerRate,
   type SpecialRateSuggestion,
   type AgingRule,
@@ -1176,6 +1180,7 @@ export class CompanyFile implements ItemCatalog {
         accountNumber: customer.accountNumber ?? null,
         poNumber: input.poNumber ?? null,
         termsDays: customer.termsDays ?? null,
+        depositRequiredMinor: resolveDepositRequest(input.type, input.deposit, lines),
         memo: input.memo ?? null,
         lines,
       });
@@ -1203,6 +1208,19 @@ export class CompanyFile implements ItemCatalog {
     validateRevisionContent({ date, lines, customerName });
     // ADR 0006: never orphan downstream links or over-consume a shrunk line.
     validateLineConsumption(lines, this.fulfillment(id));
+    // ADR 0010 part 3: prepaid lines cannot vanish or shrink below their prepayment.
+    if (document.type === 'sales_order') {
+      for (const entry of this.linePrepayments(id)) {
+        if (entry.prepaid === 0n) continue;
+        const stillThere = lines.find((line) => line.lineId === entry.lineId);
+        if (!stillThere) {
+          throw new LedgerError('LINE_LINKED', `Line ${entry.lineId} has ${entry.prepaid} prepaid and cannot be removed`);
+        }
+        if (lineGrossTotal(stillThere) < entry.prepaid) {
+          throw new LedgerError('LINE_LINKED', `Line ${entry.lineId} cannot shrink below its ${entry.prepaid} prepayment`);
+        }
+      }
+    }
     this.requireBelowCostApproval(document.type, date, lines, changes.approvedBy);
     if (document.type === 'credit_memo' && changes.lines !== undefined) {
       validateReturnQuantities(
@@ -1226,6 +1244,10 @@ export class CompanyFile implements ItemCatalog {
         accountNumber: changes.accountNumber ?? previous.accountNumber,
         poNumber: changes.poNumber ?? previous.poNumber,
         termsDays: validateTermsDays(changes.termsDays) ?? previous.termsDays,
+        depositRequiredMinor:
+          changes.deposit !== undefined
+            ? resolveDepositRequest(document.type, changes.deposit, lines)
+            : previous.depositRequiredMinor,
         memo: changes.memo ?? previous.memo,
         lines,
       });
@@ -1256,6 +1278,7 @@ export class CompanyFile implements ItemCatalog {
         accountNumber: previous.accountNumber,
         poNumber: previous.poNumber,
         termsDays: previous.termsDays,
+        depositRequiredMinor: previous.depositRequiredMinor,
         memo: previous.memo,
         lines,
       });
@@ -1426,17 +1449,107 @@ export class CompanyFile implements ItemCatalog {
     return rows.map((row) => ({ ...row, closureSeq: Number(row.closureSeq) }));
   }
 
-  sendDocument(id: string): DocumentView {
+  sendDocument(id: string, options?: { overrideDeposit?: boolean; approvedBy?: string }): DocumentView {
     const document = this.requireDocumentRecord(id);
     if (document.status !== 'draft') {
       throw new LedgerError('INVALID_STATUS', `Only draft documents can be sent (is ${document.status})`);
+    }
+    const current = document.revisions[document.revisions.length - 1]!;
+    if (document.type === 'sales_order') {
+      const requiring = depositRequiringLines(current.lines, (itemId) => this.getItem(itemId));
+      if (requiring.length > 0 && (current.depositRequiredMinor ?? 0n) <= 0n) {
+        if (options?.overrideDeposit === true) {
+          this.requireApproval('deposit_override', options.approvedBy);
+        } else {
+          throw new LedgerError(
+            'DEPOSIT_REQUIRED',
+            `These items require a deposit before sending: ${requiring.map((line) => line.description).join(', ')} (pass overrideDeposit to send anyway)`,
+          );
+        }
+      }
     }
     this.db.transaction(() => {
       this.db.prepare(`UPDATE documents SET status = 'sent' WHERE id = ?`).run(id);
       this.audit('document.sent', 'document', id, {});
       this.postDocumentIfConfigured(this.requireDocumentRecord(id));
+      if (document.type === 'invoice') {
+        this.transferDeposits(id);
+      }
     })();
     return this.viewDocument(id);
+  }
+
+  /** Total deposit money held against a sales order (ADR 0010 part 3). */
+  depositHeld(documentId: string): bigint {
+    this.requireDocumentRecord(documentId);
+    return appliedToInvoice(this.listApplications(), documentId, (kind, id) => this.isSourceActive(kind, id));
+  }
+
+  /** Per-line prepayments on a sales order (ADR 0010 part 3). */
+  linePrepayments(documentId: string): { lineId: string; description: string; prepaid: bigint; lineGross: bigint }[] {
+    const document = this.requireDocumentRecord(documentId);
+    const current = document.revisions[document.revisions.length - 1]!;
+    const applications = this.listApplications();
+    return current.lines.map((line) => ({
+      lineId: line.lineId,
+      description: line.description,
+      prepaid: appliedToLine(applications, documentId, line.lineId, (kind, id) => this.isSourceActive(kind, id)),
+      lineGross: lineGrossTotal(line),
+    }));
+  }
+
+  /**
+   * Move deposits held on the source sales order onto a just-sent invoice
+   * (ADR 0010 part 3): line prepayments whose line converted here first,
+   * then document-level deposits, oldest first; remainders stay held.
+   */
+  private transferDeposits(invoiceId: string): void {
+    const invoice = this.requireDocumentRecord(invoiceId);
+    if (invoice.sourceDocumentId === null) return;
+    const source = this.getDocumentRecord(invoice.sourceDocumentId);
+    if (!source || source.type !== 'sales_order') return;
+    const invoiceCurrent = invoice.revisions[invoice.revisions.length - 1]!;
+    const convertedLineIds = new Set(
+      invoiceCurrent.lines
+        .map((line) => line.sourceLineId)
+        .filter((lineId): lineId is string => lineId !== null),
+    );
+    const applications = this.listApplications();
+    const held = applications
+      .filter(
+        (application) =>
+          application.invoiceId === source.id &&
+          application.reversesApplicationSeq === null &&
+          !applications.some((other) => other.reversesApplicationSeq === application.applicationSeq) &&
+          this.isSourceActive(application.sourceKind, application.sourceId),
+      )
+      .sort((a, b) => {
+        const aLinked = a.lineId !== null && convertedLineIds.has(a.lineId) ? 0 : a.lineId === null ? 1 : 2;
+        const bLinked = b.lineId !== null && convertedLineIds.has(b.lineId) ? 0 : b.lineId === null ? 1 : 2;
+        return aLinked === bLinked ? a.applicationSeq - b.applicationSeq : aLinked - bLinked;
+      });
+    for (const application of held) {
+      if (application.lineId !== null && !convertedLineIds.has(application.lineId)) continue;
+      const open = this.invoiceSettlement(invoiceId).open;
+      if (open === 0n) break;
+      const move = application.amountMinor < open ? application.amountMinor : open;
+      this.reverseApplication(application.applicationSeq);
+      this.applyCreditInternal({
+        sourceKind: application.sourceKind,
+        sourceId: application.sourceId,
+        invoiceId,
+        amount: move,
+      });
+      if (move < application.amountMinor) {
+        this.applyCreditInternal({
+          sourceKind: application.sourceKind,
+          sourceId: application.sourceId,
+          invoiceId: source.id,
+          amount: application.amountMinor - move,
+          ...(application.lineId !== null ? { lineId: application.lineId } : {}),
+        });
+      }
+    }
   }
 
   voidDocument(id: string, approvedBy?: string): DocumentView {
@@ -1480,6 +1593,7 @@ export class CompanyFile implements ItemCatalog {
       account_number: string | null;
       po_number: string | null;
       terms_days: bigint | null;
+      deposit_required_minor: bigint | null;
       memo: string | null;
     }
     const revisionRows = this.db
@@ -1535,6 +1649,7 @@ export class CompanyFile implements ItemCatalog {
         accountNumber: revision.account_number,
         poNumber: revision.po_number,
         termsDays: revision.terms_days === null ? null : Number(revision.terms_days),
+        depositRequiredMinor: revision.deposit_required_minor,
         memo: revision.memo,
         lines: (linesByRevision.get(Number(revision.revision_no)) ?? []).map((line) => ({
           lineId: line.line_id ?? `${row.id}#${line.line_no}`,
@@ -1584,8 +1699,8 @@ export class CompanyFile implements ItemCatalog {
   private insertRevision(documentId: string, revision: DocumentRevision): void {
     this.db
       .prepare(
-        `INSERT INTO document_revisions (document_id, revision_no, kind, at, reason, date, customer_name, account_number, po_number, terms_days, memo)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO document_revisions (document_id, revision_no, kind, at, reason, date, customer_name, account_number, po_number, terms_days, deposit_required_minor, memo)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         documentId,
@@ -1598,6 +1713,7 @@ export class CompanyFile implements ItemCatalog {
         revision.accountNumber,
         revision.poNumber,
         revision.termsDays,
+        revision.depositRequiredMinor,
         revision.memo,
       );
     const insertLine = this.db.prepare(
@@ -1761,6 +1877,7 @@ export class CompanyFile implements ItemCatalog {
       source_kind: CreditApplication['sourceKind'];
       source_id: string;
       invoice_id: string;
+      line_id: string | null;
       amount: bigint;
       date: string;
       at: string;
@@ -1774,6 +1891,7 @@ export class CompanyFile implements ItemCatalog {
       sourceKind: row.source_kind,
       sourceId: row.source_id,
       invoiceId: row.invoice_id,
+      lineId: row.line_id,
       amountMinor: row.amount,
       date: row.date,
       at: row.at,
@@ -1805,14 +1923,34 @@ export class CompanyFile implements ItemCatalog {
       source.total - appliedFromSource(applications, input.sourceKind, input.sourceId);
     const settlement = this.invoiceSettlement(input.invoiceId);
     validateApplication(input.amount, remaining, invoice, settlement.open, source);
+    // Line-level prepayments are a sales-order-only concept (ADR 0010 part 3).
+    if (input.lineId !== undefined) {
+      if (invoice.type !== 'sales_order') {
+        throw new LedgerError('INVALID_DOCUMENT', 'Line-level prepayments apply only to sales orders');
+      }
+      const current = invoice.revisions[invoice.revisions.length - 1]!;
+      const line = current.lines.find((candidate) => candidate.lineId === input.lineId);
+      if (!line) {
+        throw new LedgerError('UNKNOWN_LINE', `No such line: ${input.lineId}`);
+      }
+      const lineOpen =
+        lineGrossTotal(line) -
+        appliedToLine(applications, invoice.id, input.lineId, (kind, id) => this.isSourceActive(kind, id));
+      if (input.amount > lineOpen) {
+        throw new LedgerError(
+          'INVALID_ALLOCATION',
+          `Prepaying ${input.amount} exceeds the line's remaining ${lineOpen}`,
+        );
+      }
+    }
     const effectiveDate = date ?? invoice.revisions[invoice.revisions.length - 1]!.date;
     const at = new Date().toISOString();
     const result = this.db
       .prepare(
-        `INSERT INTO credit_applications (source_kind, source_id, invoice_id, amount, date, at, reverses_application_seq)
-         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+        `INSERT INTO credit_applications (source_kind, source_id, invoice_id, line_id, amount, date, at, reverses_application_seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
       )
-      .run(input.sourceKind, input.sourceId, input.invoiceId, input.amount, effectiveDate, at);
+      .run(input.sourceKind, input.sourceId, input.invoiceId, input.lineId ?? null, input.amount, effectiveDate, at);
     const seq = Number(result.lastInsertRowid);
     this.audit('credit.applied', 'credit_application', String(seq), {
       sourceKind: input.sourceKind,
@@ -1825,6 +1963,7 @@ export class CompanyFile implements ItemCatalog {
       sourceKind: input.sourceKind,
       sourceId: input.sourceId,
       invoiceId: input.invoiceId,
+      lineId: input.lineId ?? null,
       amountMinor: input.amount,
       date: effectiveDate,
       at,
@@ -1847,10 +1986,10 @@ export class CompanyFile implements ItemCatalog {
     this.db.transaction(() => {
       const result = this.db
         .prepare(
-          `INSERT INTO credit_applications (source_kind, source_id, invoice_id, amount, date, at, reverses_application_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO credit_applications (source_kind, source_id, invoice_id, line_id, amount, date, at, reverses_application_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(target.sourceKind, target.sourceId, target.invoiceId, target.amountMinor, target.date, at, applicationSeq);
+        .run(target.sourceKind, target.sourceId, target.invoiceId, target.lineId, target.amountMinor, target.date, at, applicationSeq);
       seq = Number(result.lastInsertRowid);
       this.audit('credit.application_reversed', 'credit_application', String(seq), {
         reverses: applicationSeq,
