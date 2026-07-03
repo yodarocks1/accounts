@@ -6,6 +6,7 @@ import {
   normalBalance,
   parseMoney,
   type Account,
+  type DepositPolicy,
   type DocumentType,
   type NewJournalLine,
 } from '@accounts/core';
@@ -24,10 +25,10 @@ Usage:
   accounts trial-balance <file> [--as-of YYYY-MM-DD]
 
 Document layer:
-  accounts item add <file> --name <name> --price <amount> [--cost <amount>] [--tax-code <code>] [--deposit-policy <never|always|when_out_of_stock>]
-  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo>]
+  accounts item add <file> --name <name> --price <amount> [--cost <amount>] [--tax-code <code>] [--deposit-policy <never|always|when_out_of_stock|special_order>]
+  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order>]
   accounts doc show <file> <document-id>
-  accounts doc send <file> <document-id> [--override-deposit] [--approved-by <who>]
+  accounts doc send <file> <document-id> [--override-deposit] [--override-minimum] [--approved-by <who>]
   accounts statement <file> (--party <id> | --customer <name> | --acct <number>) [--as-of YYYY-MM-DD]
   accounts serve <file> [--port 3000]
 
@@ -330,7 +331,7 @@ function cmdItem(args: string[]): string {
       ...(values.cost !== undefined ? { cost: parseMoney(values.cost, currency).amount } : {}),
       ...(values['tax-code'] !== undefined ? { taxCode: values['tax-code'] } : {}),
       ...(values['deposit-policy'] !== undefined
-        ? { depositPolicy: values['deposit-policy'] as 'never' | 'always' | 'when_out_of_stock' }
+        ? { depositPolicy: values['deposit-policy'] as DepositPolicy }
         : {}),
     });
     return `Created item ${item.name} (${item.id})`;
@@ -412,6 +413,14 @@ function cmdDocShow(args: string[]): string {
     if (view.type === 'sales_order' && view.status === 'sent') {
       totals.push(`Deposit held: ${usd(file.depositHeld(view.id))}`);
     }
+    if (view.type === 'purchase_order' && view.status === 'draft') {
+      const readiness = file.purchaseOrderReadiness(view.id);
+      totals.push(
+        readiness.ready
+          ? 'Ready to send (supplier minimums met)'
+          : `NOT ready to send:\n${readiness.shortfalls.map((shortfall) => `  - ${shortfall.message}`).join('\n')}`,
+      );
+    }
     return [...header, '', table(lineRows, ['right', 'left', 'right', 'left', 'right']), '', ...totals].join('\n');
   } finally {
     file.close();
@@ -424,6 +433,7 @@ function cmdDocSend(args: string[]): string {
     allowPositionals: true,
     options: {
       'override-deposit': { type: 'boolean' },
+      'override-minimum': { type: 'boolean' },
       'approved-by': { type: 'string' },
     },
   });
@@ -433,6 +443,7 @@ function cmdDocSend(args: string[]): string {
     if (!id) fail('doc send requires a document id');
     const view = file.sendDocument(id, {
       ...(values['override-deposit'] !== undefined ? { overrideDeposit: values['override-deposit'] } : {}),
+      ...(values['override-minimum'] !== undefined ? { overrideMinimum: values['override-minimum'] } : {}),
       ...(values['approved-by'] !== undefined ? { approvedBy: values['approved-by'] } : {}),
     });
     const suggestions = file.suggestSpecialRates(id);

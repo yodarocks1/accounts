@@ -351,6 +351,10 @@ A first-class, obsessively-tested onramp — this determines adoption.
       auto-numbering, deposits/prepayments on sales orders with item
       policies and line-level prepayment, JSON HTTP API + CLI document
       commands (ADR 0010)
+- [x] Purchase side: purchase orders priced at cost with PO-line→SO-line
+      links and coverage, supplier info snapshots (costs, shipping
+      estimates, minimums — the plugin seam), minimum-order send gating,
+      special_order deposit policy (ADR 0011)
 - [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging

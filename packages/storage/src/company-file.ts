@@ -74,9 +74,19 @@ import {
   type NewNumberSequence,
   formatSequenceNumber,
   appliedToLine,
+  buildSupplierInfo,
+  computePurchaseCoverage,
+  computePurchaseReadiness,
   depositRequiringLines,
   lineGrossTotal,
   resolveDepositRequest,
+  specialOrderDepositFloor,
+  type NewSupplierInfo,
+  type PurchaseCoverageLine,
+  type PurchaseReadiness,
+  type ShippingEstimate,
+  type SupplierInfo,
+  type SupplierItemTerm,
   type NewCustomerRate,
   type SpecialRateSuggestion,
   type AgingRule,
@@ -1072,7 +1082,7 @@ export class CompanyFile implements ItemCatalog {
     lines: readonly DocumentLine[],
     approvedBy: string | undefined,
   ): void {
-    if (type === 'credit_memo') return;
+    if (type === 'credit_memo' || type === 'purchase_order') return;
     for (const line of lines) {
       if (line.free || line.itemId === null) continue;
       const cost = this.costAt(line.itemId, date);
@@ -1114,6 +1124,7 @@ export class CompanyFile implements ItemCatalog {
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
+    const purchase = input.type === 'purchase_order';
     const customer = this.resolveCustomer(input);
     const lines = resolveDocumentLines(
       input.lines,
@@ -1126,6 +1137,7 @@ export class CompanyFile implements ItemCatalog {
         ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
       },
       customer.taxExempt,
+      purchase,
     );
     let inherited: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
@@ -1144,6 +1156,9 @@ export class CompanyFile implements ItemCatalog {
         (documentId, lineId) => this.sourceLineFor(documentId, lineId),
         (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
       );
+    }
+    if (purchase) {
+      this.validatePurchaseLinks(lines);
     }
     const id = randomUUID();
     this.db.transaction(() => {
@@ -1199,11 +1214,19 @@ export class CompanyFile implements ItemCatalog {
     const accountNumber = changes.accountNumber ?? previous.accountNumber;
     const lines =
       changes.lines !== undefined
-        ? resolveDocumentLines(changes.lines, date, this, previous.lines, {
-            customerName,
-            ...(accountNumber !== null ? { accountNumber } : {}),
-            ...(document.partyId !== null ? { partyId: document.partyId } : {}),
-          })
+        ? resolveDocumentLines(
+            changes.lines,
+            date,
+            this,
+            previous.lines,
+            {
+              customerName,
+              ...(accountNumber !== null ? { accountNumber } : {}),
+              ...(document.partyId !== null ? { partyId: document.partyId } : {}),
+            },
+            false,
+            document.type === 'purchase_order',
+          )
         : [...previous.lines];
     validateRevisionContent({ date, lines, customerName });
     // ADR 0006: never orphan downstream links or over-consume a shrunk line.
@@ -1220,6 +1243,28 @@ export class CompanyFile implements ItemCatalog {
           throw new LedgerError('LINE_LINKED', `Line ${entry.lineId} cannot shrink below its ${entry.prepaid} prepayment`);
         }
       }
+      // ADR 0011 part 5: lines on order with a supplier cannot vanish or
+      // shrink below the linked quantity — a PO must not point at nothing.
+      for (const entry of this.purchaseCoverage(id)) {
+        const ordered = entry.draftOrderedMilli + entry.sentOrderedMilli;
+        if (ordered === 0n) continue;
+        const stillThere = lines.find((line) => line.lineId === entry.lineId);
+        if (!stillThere) {
+          throw new LedgerError(
+            'LINE_LINKED',
+            `Line ${entry.lineId} has ${ordered} (milli) on purchase orders and cannot be removed`,
+          );
+        }
+        if (stillThere.quantityMilli < ordered) {
+          throw new LedgerError(
+            'LINE_LINKED',
+            `Line ${entry.lineId} cannot shrink below the ${ordered} (milli) on purchase orders`,
+          );
+        }
+      }
+    }
+    if (document.type === 'purchase_order' && changes.lines !== undefined) {
+      this.validatePurchaseLinks(lines, id);
     }
     this.requireBelowCostApproval(document.type, date, lines, changes.approvedBy);
     if (document.type === 'credit_memo' && changes.lines !== undefined) {
@@ -1449,7 +1494,10 @@ export class CompanyFile implements ItemCatalog {
     return rows.map((row) => ({ ...row, closureSeq: Number(row.closureSeq) }));
   }
 
-  sendDocument(id: string, options?: { overrideDeposit?: boolean; approvedBy?: string }): DocumentView {
+  sendDocument(
+    id: string,
+    options?: { overrideDeposit?: boolean; overrideMinimum?: boolean; approvedBy?: string },
+  ): DocumentView {
     const document = this.requireDocumentRecord(id);
     if (document.status !== 'draft') {
       throw new LedgerError('INVALID_STATUS', `Only draft documents can be sent (is ${document.status})`);
@@ -1464,6 +1512,34 @@ export class CompanyFile implements ItemCatalog {
           throw new LedgerError(
             'DEPOSIT_REQUIRED',
             `These items require a deposit before sending: ${requiring.map((line) => line.description).join(', ')} (pass overrideDeposit to send anyway)`,
+          );
+        }
+      }
+      // ADR 0011 part 6: special-order items must be prepaid in full — the
+      // deposit request has to cover their gross amount before sending.
+      const floor = specialOrderDepositFloor(current.lines, (itemId) => this.getItem(itemId));
+      if (floor > 0n && (current.depositRequiredMinor ?? 0n) < floor) {
+        if (options?.overrideDeposit === true) {
+          this.requireApproval('deposit_override', options.approvedBy);
+        } else {
+          throw new LedgerError(
+            'DEPOSIT_REQUIRED',
+            `Special-order items must be prepaid: the deposit request must cover at least ${floor}, not ${current.depositRequiredMinor ?? 0n} (pass overrideDeposit to send anyway)`,
+          );
+        }
+      }
+    }
+    if (document.type === 'purchase_order') {
+      const readiness = this.purchaseOrderReadiness(id);
+      if (!readiness.ready) {
+        if (options?.overrideMinimum === true) {
+          this.requireApproval('minimum_order_override', options.approvedBy);
+        } else {
+          throw new LedgerError(
+            'MINIMUM_NOT_MET',
+            `Purchase order does not meet the supplier's terms: ${readiness.shortfalls
+              .map((shortfall) => shortfall.message)
+              .join('; ')} (pass overrideMinimum to send anyway)`,
           );
         }
       }
@@ -1742,6 +1818,265 @@ export class CompanyFile implements ItemCatalog {
         line.taxPercentMilli,
       );
     });
+  }
+
+  // ── Purchase side (ADR 0011) ─────────────────────────────────────────────
+
+  /** Record a supplier-info snapshot (append-only; `source` = 'manual' or a plugin id). */
+  recordSupplierInfo(input: NewSupplierInfo): SupplierInfo {
+    this.requireParty(input.partyId);
+    for (const term of input.items ?? []) {
+      if (!this.getItem(term.itemId)) {
+        throw new LedgerError('UNKNOWN_ITEM', `No such item: ${term.itemId}`);
+      }
+    }
+    const info = buildSupplierInfo(input, 0, new Date().toISOString());
+    let seq = 0;
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO supplier_info (party_id, source, as_of, at, currency, minimum_order_minor, minimum_order_quantity_milli, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          info.partyId,
+          info.source,
+          info.asOf,
+          info.at,
+          info.currency,
+          info.minimumOrderMinor,
+          info.minimumOrderQuantityMilli,
+          info.notes,
+        );
+      seq = Number(result.lastInsertRowid);
+      const insertShipping = this.db.prepare(
+        `INSERT INTO supplier_info_shipping (info_seq, shipping_no, method, cost_minor, free_above_minor, min_days, max_days)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      info.shipping.forEach((estimate, index) => {
+        insertShipping.run(seq, index + 1, estimate.method, estimate.costMinor, estimate.freeAboveMinor, estimate.minDays, estimate.maxDays);
+      });
+      const insertItem = this.db.prepare(
+        `INSERT INTO supplier_info_items (info_seq, item_id, unit_cost, supplier_sku, in_stock, min_quantity_milli, multiple_quantity_milli, lead_days)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const term of info.items) {
+        insertItem.run(
+          seq,
+          term.itemId,
+          term.unitCost,
+          term.supplierSku,
+          term.inStock === null ? null : term.inStock ? 1 : 0,
+          term.minQuantityMilli,
+          term.multipleQuantityMilli,
+          term.leadDays,
+        );
+      }
+      this.audit('supplier.info_recorded', 'supplier_info', String(seq), {
+        partyId: info.partyId,
+        source: info.source,
+        asOf: info.asOf,
+        items: info.items.length,
+      });
+    })();
+    return { ...info, infoSeq: seq };
+  }
+
+  /** Newest supplier snapshot observed on or before `date`. */
+  supplierInfoAt(partyId: string, date: string): SupplierInfo | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT info_seq AS seq FROM supplier_info
+         WHERE party_id = ? AND as_of <= ?
+         ORDER BY as_of DESC, info_seq DESC LIMIT 1`,
+      )
+      .get(partyId, date) as { seq: bigint } | undefined;
+    return row ? this.getSupplierInfo(Number(row.seq)) : undefined;
+  }
+
+  /** The latest supplier snapshot regardless of date. */
+  supplierInfo(partyId: string): SupplierInfo | undefined {
+    const row = this.db
+      .prepare(`SELECT info_seq AS seq FROM supplier_info WHERE party_id = ? ORDER BY info_seq DESC LIMIT 1`)
+      .get(partyId) as { seq: bigint } | undefined;
+    return row ? this.getSupplierInfo(Number(row.seq)) : undefined;
+  }
+
+  supplierInfoHistory(partyId: string): SupplierInfo[] {
+    const rows = this.db
+      .prepare(`SELECT info_seq AS seq FROM supplier_info WHERE party_id = ? ORDER BY info_seq`)
+      .all(partyId) as { seq: bigint }[];
+    return rows.map((row) => this.getSupplierInfo(Number(row.seq))!);
+  }
+
+  /** The supplier's quoted unit cost effective on `date` (ItemCatalog seam). */
+  supplierCostAt(partyId: string, itemId: string, date: string): bigint | undefined {
+    return this.supplierInfoAt(partyId, date)?.items.find((term) => term.itemId === itemId)?.unitCost;
+  }
+
+  private getSupplierInfo(infoSeq: number): SupplierInfo | undefined {
+    interface InfoRow {
+      info_seq: bigint;
+      party_id: string;
+      source: string;
+      as_of: string;
+      at: string;
+      currency: string;
+      minimum_order_minor: bigint | null;
+      minimum_order_quantity_milli: bigint | null;
+      notes: string | null;
+    }
+    const row = this.db.prepare(`SELECT * FROM supplier_info WHERE info_seq = ?`).get(infoSeq) as
+      | InfoRow
+      | undefined;
+    if (!row) return undefined;
+    interface ShippingRow {
+      method: string;
+      cost_minor: bigint | null;
+      free_above_minor: bigint | null;
+      min_days: bigint | null;
+      max_days: bigint | null;
+    }
+    const shipping: ShippingEstimate[] = (
+      this.db
+        .prepare(`SELECT * FROM supplier_info_shipping WHERE info_seq = ? ORDER BY shipping_no`)
+        .all(infoSeq) as ShippingRow[]
+    ).map((estimate) => ({
+      method: estimate.method,
+      costMinor: estimate.cost_minor,
+      freeAboveMinor: estimate.free_above_minor,
+      minDays: estimate.min_days === null ? null : Number(estimate.min_days),
+      maxDays: estimate.max_days === null ? null : Number(estimate.max_days),
+    }));
+    interface TermRow {
+      item_id: string;
+      unit_cost: bigint;
+      supplier_sku: string | null;
+      in_stock: bigint | null;
+      min_quantity_milli: bigint | null;
+      multiple_quantity_milli: bigint | null;
+      lead_days: bigint | null;
+    }
+    const items: SupplierItemTerm[] = (
+      this.db
+        .prepare(`SELECT * FROM supplier_info_items WHERE info_seq = ? ORDER BY rowid`)
+        .all(infoSeq) as TermRow[]
+    ).map((term) => ({
+      itemId: term.item_id,
+      unitCost: term.unit_cost,
+      supplierSku: term.supplier_sku,
+      inStock: term.in_stock === null ? null : term.in_stock === 1n,
+      minQuantityMilli: term.min_quantity_milli,
+      multipleQuantityMilli: term.multiple_quantity_milli,
+      leadDays: term.lead_days === null ? null : Number(term.lead_days),
+    }));
+    return {
+      infoSeq: Number(row.info_seq),
+      partyId: row.party_id,
+      source: row.source,
+      asOf: row.as_of,
+      at: row.at,
+      currency: row.currency,
+      minimumOrderMinor: row.minimum_order_minor,
+      minimumOrderQuantityMilli: row.minimum_order_quantity_milli,
+      shipping,
+      items,
+      notes: row.notes,
+    };
+  }
+
+  /** Cumulative quantity of a sales-order line already on other purchase orders. */
+  private priorLinkedMilli(salesOrderId: string, lineId: string, excludeDocumentId?: string): bigint {
+    const row = this.db
+      .prepare(
+        `SELECT coalesce(sum(l.quantity_milli), 0) AS total
+         FROM documents d
+         JOIN document_revision_lines l ON l.document_id = d.id
+           AND l.revision_no = (SELECT max(revision_no) FROM document_revisions WHERE document_id = d.id)
+         WHERE d.type = 'purchase_order' AND d.status != 'void' AND d.id IS NOT ?
+           AND l.source_document_id = ? AND l.source_line_id = ?`,
+      )
+      .get(excludeDocumentId ?? null, salesOrderId, lineId) as { total: bigint };
+    return row.total;
+  }
+
+  /**
+   * ADR 0011 part 5: PO line links must target existing sales-order lines,
+   * and the cumulative linked quantity across non-void purchase orders may
+   * not exceed what the sales order promises.
+   */
+  private validatePurchaseLinks(lines: readonly DocumentLine[], excludeDocumentId?: string): void {
+    const consumed = new Map<string, bigint>();
+    for (const line of lines) {
+      if (line.sourceDocumentId === null || line.sourceLineId === null) continue;
+      const source = this.getDocumentRecord(line.sourceDocumentId);
+      if (!source) {
+        throw new LedgerError('UNKNOWN_DOCUMENT', `No such source document: ${line.sourceDocumentId}`);
+      }
+      if (source.type !== 'sales_order') {
+        throw new LedgerError('INVALID_DOCUMENT', 'Purchase-order lines may only link to sales-order lines');
+      }
+      const current = source.revisions[source.revisions.length - 1]!;
+      if (!current.lines.some((candidate) => candidate.lineId === line.sourceLineId)) {
+        throw new LedgerError('UNKNOWN_LINE', `Sales order ${source.number} has no line ${line.sourceLineId}`);
+      }
+      const key = `${line.sourceDocumentId}#${line.sourceLineId}`;
+      consumed.set(key, (consumed.get(key) ?? 0n) + line.quantityMilli);
+    }
+    for (const [key, quantity] of consumed) {
+      const [documentId, lineId] = key.split('#') as [string, string];
+      const source = this.getDocumentRecord(documentId)!;
+      const sourceLine = source.revisions[source.revisions.length - 1]!.lines.find(
+        (candidate) => candidate.lineId === lineId,
+      )!;
+      const total = this.priorLinkedMilli(documentId, lineId, excludeDocumentId) + quantity;
+      if (total > sourceLine.quantityMilli) {
+        throw new LedgerError(
+          'LINE_OVERDRAWN',
+          `Ordering ${total} (milli) of "${sourceLine.description}" exceeds the ${sourceLine.quantityMilli} on the sales order; order overage as an unlinked line`,
+        );
+      }
+    }
+  }
+
+  /** How much of each sales-order line is on order with suppliers (ADR 0011). */
+  purchaseCoverage(salesOrderId: string): PurchaseCoverageLine[] {
+    const record = this.requireDocumentRecord(salesOrderId);
+    if (record.type !== 'sales_order') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Purchase coverage applies to sales orders');
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT l.source_line_id AS lineId, d.status AS status, sum(l.quantity_milli) AS total
+         FROM documents d
+         JOIN document_revision_lines l ON l.document_id = d.id
+           AND l.revision_no = (SELECT max(revision_no) FROM document_revisions WHERE document_id = d.id)
+         WHERE d.type = 'purchase_order' AND d.status != 'void'
+           AND l.source_document_id = ? AND l.source_line_id IS NOT NULL
+         GROUP BY l.source_line_id, d.status`,
+      )
+      .all(salesOrderId) as { lineId: string; status: 'draft' | 'sent'; total: bigint }[];
+    const linked = new Map<string, { draftMilli: bigint; sentMilli: bigint }>();
+    for (const row of rows) {
+      const entry = linked.get(row.lineId) ?? { draftMilli: 0n, sentMilli: 0n };
+      if (row.status === 'sent') entry.sentMilli += row.total;
+      else entry.draftMilli += row.total;
+      linked.set(row.lineId, entry);
+    }
+    const current = record.revisions[record.revisions.length - 1]!;
+    return computePurchaseCoverage(current.lines, linked);
+  }
+
+  /** Readiness of a purchase order against the supplier's terms (ADR 0011 part 7). */
+  purchaseOrderReadiness(id: string): PurchaseReadiness {
+    const document = this.requireDocumentRecord(id);
+    if (document.type !== 'purchase_order') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Readiness applies to purchase orders');
+    }
+    const current = document.revisions[document.revisions.length - 1]!;
+    const info =
+      document.partyId !== null ? this.supplierInfoAt(document.partyId, current.date) : undefined;
+    return computePurchaseReadiness(current.lines, info);
   }
 
   // ── Payments & credit application (Tier 1, ADR 0008) ────────────────────

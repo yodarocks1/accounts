@@ -112,6 +112,66 @@ describe('document API (Tier 3)', () => {
     expect(unknownRoute.json.error).toBe('NOT_FOUND');
   });
 
+  it('drives the purchase flow: supplier info, PO links, readiness gating', async () => {
+    const widget = (await post('/items', { name: 'Widget', currency: 'USD', unitPrice: '2500', cost: '1000' })).json as { id: string };
+    const supplier = (await post('/parties', { name: 'Widgets Wholesale Inc' })).json as { id: string };
+
+    // Record a supplier snapshot and read it back.
+    const info = await post(`/parties/${supplier.id}/supplier-info`, {
+      source: 'edi-plugin', asOf: '2026-01-01', currency: 'USD',
+      minimumOrderMinor: '10000',
+      shipping: [{ method: 'freight', costMinor: '1200', minDays: 3, maxDays: 7 }],
+      items: [{ itemId: widget.id, unitCost: '900', multipleQuantityMilli: '12000' }],
+    });
+    expect(info.status).toBe(201);
+    const latest = (await get(`/parties/${supplier.id}/supplier-info`)).json as {
+      source: string; minimumOrderMinor: string; items: { unitCost: string }[];
+    };
+    expect(latest.source).toBe('edi-plugin');
+    expect(latest.items[0]!.unitCost).toBe('900');
+
+    // Sales order to link against.
+    const so = (await post('/documents', {
+      type: 'sales_order', number: 'SO-1', date: '2026-07-01', customerName: 'Acme LLC',
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: '10000', lineId: 'L1' }],
+    })).json as { id: string };
+
+    // PO priced from the supplier quote, linked to the SO line.
+    const po = (await post('/documents', {
+      type: 'purchase_order', number: 'PO-1', date: '2026-07-02', partyId: supplier.id,
+      lines: [{
+        itemId: widget.id, description: 'Widget', quantityMilli: '6000',
+        sourceDocumentId: so.id, sourceLineId: 'L1',
+      }],
+    })).json as { id: string; total: string; current: { lines: { unitPrice: string }[] } };
+    expect(po.current.lines[0]!.unitPrice).toBe('900');
+    expect(po.total).toBe('5400');
+
+    const coverage = (await get(`/documents/${so.id}/purchase-coverage`)).json as {
+      draftOrderedMilli: string; unorderedMilli: string;
+    }[];
+    expect(coverage[0]!.draftOrderedMilli).toBe('6000');
+    expect(coverage[0]!.unorderedMilli).toBe('4000');
+
+    // Not ready: below the order minimum and half a case.
+    const readiness = (await get(`/documents/${po.id}/readiness`)).json as { ready: boolean; shortfalls: unknown[] };
+    expect(readiness.ready).toBe(false);
+    const denied = await post(`/documents/${po.id}/send`, {});
+    expect(denied.status).toBe(409);
+    expect(denied.json.error).toBe('MINIMUM_NOT_MET');
+
+    // Accumulate to a full case (link stays within the SO quantity), then send.
+    await post(`/documents/${po.id}/change`, {
+      lines: [
+        { itemId: widget.id, description: 'Widget', quantityMilli: '10000', sourceDocumentId: so.id, sourceLineId: 'L1' },
+        { itemId: widget.id, description: 'Widget (stock)', quantityMilli: '2000' },
+      ],
+    });
+    expect(((await get(`/documents/${po.id}/readiness`)).json as { ready: boolean }).ready).toBe(true);
+    const sent = await post(`/documents/${po.id}/send`, {});
+    expect(sent.status).toBe(201);
+  });
+
   it('gated actions surface 403 APPROVAL_REQUIRED', async () => {
     await post('/policies/approval', { actions: ['void_document'] });
     const item = (await post('/items', { name: 'W', currency: 'USD', unitPrice: '100' })).json as { id: string };

@@ -136,6 +136,22 @@ export {
 } from './statement.js';
 export { type Party, type NewParty, type PartyName } from './parties.js';
 export {
+  type ShippingEstimate,
+  type NewShippingEstimate,
+  type SupplierItemTerm,
+  type NewSupplierItemTerm,
+  type SupplierInfo,
+  type NewSupplierInfo,
+  type ReadinessShortfall,
+  type PurchaseReadiness,
+  type PurchaseCoverageLine,
+  buildSupplierInfo,
+  computePurchaseReadiness,
+  computePurchaseCoverage,
+  specialOrderLines,
+  specialOrderDepositFloor,
+} from './suppliers.js';
+export {
   POSTING_ROLES,
   type PostingRole,
   type PostingKind,

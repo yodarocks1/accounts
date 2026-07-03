@@ -552,7 +552,133 @@ ALTER TABLE document_revisions ADD COLUMN deposit_required_minor INTEGER
 ALTER TABLE credit_applications ADD COLUMN line_id TEXT;
 `;
 
+const V15_SQL = `
+-- ADR 0011: the purchase side. purchase_order joins the document-type and
+-- sequence-kind enums; items gain the special_order deposit policy; supplier
+-- info arrives as append-only, source-tagged snapshots. SQLite cannot alter
+-- CHECK constraints, so the three constrained tables are rebuilt in place.
+DROP TRIGGER documents_status_only_update;
+DROP TRIGGER documents_no_delete;
+DROP INDEX idx_documents_source;
+
+CREATE TABLE documents_v15 (
+  id                      TEXT PRIMARY KEY,
+  type                    TEXT NOT NULL CHECK (type IN ('estimate','sales_order','invoice','credit_memo','purchase_order')),
+  number                  TEXT NOT NULL CHECK (length(trim(number)) > 0),
+  status                  TEXT NOT NULL CHECK (status IN ('draft','sent','void')),
+  source_document_id      TEXT REFERENCES documents(id),
+  inherited_corrections   INTEGER NOT NULL DEFAULT 0 CHECK (inherited_corrections IN (0,1)),
+  inherited_substitutions INTEGER NOT NULL DEFAULT 0 CHECK (inherited_substitutions IN (0,1)),
+  settlement              TEXT CHECK (settlement IN ('account','refund')),
+  party_id                TEXT REFERENCES parties(id),
+  UNIQUE (type, number)
+) STRICT;
+
+INSERT INTO documents_v15 (id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement, party_id)
+  SELECT id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement, party_id FROM documents;
+
+DROP TABLE documents;
+ALTER TABLE documents_v15 RENAME TO documents;
+
+CREATE TRIGGER documents_status_only_update BEFORE UPDATE ON documents
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.type IS NOT OLD.type
+  OR NEW.number IS NOT OLD.number
+  OR NEW.source_document_id IS NOT OLD.source_document_id
+  OR NEW.inherited_corrections IS NOT OLD.inherited_corrections
+  OR NEW.inherited_substitutions IS NOT OLD.inherited_substitutions
+  OR NEW.settlement IS NOT OLD.settlement
+  OR NEW.party_id IS NOT OLD.party_id
+BEGIN SELECT RAISE(ABORT, 'only document status may change'); END;
+
+CREATE TRIGGER documents_no_delete BEFORE DELETE ON documents
+BEGIN SELECT RAISE(ABORT, 'documents are never deleted; void them'); END;
+
+CREATE INDEX idx_documents_source ON documents(source_document_id);
+
+-- items gains the special_order deposit policy (CHECK rebuild).
+CREATE TABLE items_v15 (
+  id             TEXT PRIMARY KEY,
+  name           TEXT NOT NULL CHECK (length(trim(name)) > 0),
+  currency       TEXT NOT NULL CHECK (length(currency) = 3),
+  tax_code       TEXT,
+  deposit_policy TEXT NOT NULL DEFAULT 'never'
+    CHECK (deposit_policy IN ('never','always','when_out_of_stock','special_order')),
+  in_stock       INTEGER NOT NULL DEFAULT 1 CHECK (in_stock IN (0,1))
+) STRICT;
+INSERT INTO items_v15 SELECT id, name, currency, tax_code, deposit_policy, in_stock FROM items;
+DROP TABLE items;
+ALTER TABLE items_v15 RENAME TO items;
+
+-- number_sequences gains the purchase_order kind (CHECK rebuild).
+CREATE TABLE number_sequences_v15 (
+  kind       TEXT PRIMARY KEY CHECK (kind IN ('estimate','sales_order','invoice','credit_memo','purchase_order','payment')),
+  prefix     TEXT NOT NULL,
+  next_value INTEGER NOT NULL CHECK (next_value >= 1),
+  width      INTEGER NOT NULL CHECK (width >= 1)
+) STRICT;
+INSERT INTO number_sequences_v15 SELECT kind, prefix, next_value, width FROM number_sequences;
+DROP TABLE number_sequences;
+ALTER TABLE number_sequences_v15 RENAME TO number_sequences;
+
+-- Supplier info (ADR 0011 part 3): append-only snapshots with provenance.
+CREATE TABLE supplier_info (
+  info_seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  party_id                     TEXT NOT NULL REFERENCES parties(id),
+  source                       TEXT NOT NULL CHECK (length(trim(source)) > 0),
+  as_of                        TEXT NOT NULL CHECK (as_of GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  at                           TEXT NOT NULL,
+  currency                     TEXT NOT NULL CHECK (length(currency) = 3),
+  minimum_order_minor          INTEGER CHECK (minimum_order_minor IS NULL OR minimum_order_minor >= 0),
+  minimum_order_quantity_milli INTEGER CHECK (minimum_order_quantity_milli IS NULL OR minimum_order_quantity_milli >= 0),
+  notes                        TEXT
+) STRICT;
+
+CREATE INDEX idx_supplier_info_party ON supplier_info(party_id, as_of);
+
+CREATE TABLE supplier_info_shipping (
+  info_seq         INTEGER NOT NULL REFERENCES supplier_info(info_seq),
+  shipping_no      INTEGER NOT NULL,
+  method           TEXT NOT NULL CHECK (length(trim(method)) > 0),
+  cost_minor       INTEGER CHECK (cost_minor IS NULL OR cost_minor >= 0),
+  free_above_minor INTEGER CHECK (free_above_minor IS NULL OR free_above_minor >= 0),
+  min_days         INTEGER CHECK (min_days IS NULL OR min_days >= 0),
+  max_days         INTEGER CHECK (max_days IS NULL OR max_days >= 0),
+  PRIMARY KEY (info_seq, shipping_no)
+) STRICT;
+
+CREATE TABLE supplier_info_items (
+  info_seq                INTEGER NOT NULL REFERENCES supplier_info(info_seq),
+  item_id                 TEXT NOT NULL REFERENCES items(id),
+  unit_cost               INTEGER NOT NULL CHECK (unit_cost >= 0),
+  supplier_sku            TEXT,
+  in_stock                INTEGER CHECK (in_stock IS NULL OR in_stock IN (0,1)),
+  min_quantity_milli      INTEGER CHECK (min_quantity_milli IS NULL OR min_quantity_milli > 0),
+  multiple_quantity_milli INTEGER CHECK (multiple_quantity_milli IS NULL OR multiple_quantity_milli > 0),
+  lead_days               INTEGER CHECK (lead_days IS NULL OR lead_days >= 0),
+  PRIMARY KEY (info_seq, item_id)
+) STRICT;
+
+CREATE TRIGGER supplier_info_no_update BEFORE UPDATE ON supplier_info
+BEGIN SELECT RAISE(ABORT, 'supplier info is immutable; record a newer snapshot'); END;
+
+CREATE TRIGGER supplier_info_no_delete BEFORE DELETE ON supplier_info
+BEGIN SELECT RAISE(ABORT, 'supplier info is immutable; record a newer snapshot'); END;
+
+CREATE TRIGGER supplier_info_shipping_no_update BEFORE UPDATE ON supplier_info_shipping
+BEGIN SELECT RAISE(ABORT, 'supplier info is immutable; record a newer snapshot'); END;
+
+CREATE TRIGGER supplier_info_shipping_no_delete BEFORE DELETE ON supplier_info_shipping
+BEGIN SELECT RAISE(ABORT, 'supplier info is immutable; record a newer snapshot'); END;
+
+CREATE TRIGGER supplier_info_items_no_update BEFORE UPDATE ON supplier_info_items
+BEGIN SELECT RAISE(ABORT, 'supplier info is immutable; record a newer snapshot'); END;
+
+CREATE TRIGGER supplier_info_items_no_delete BEFORE DELETE ON supplier_info_items
+BEGIN SELECT RAISE(ABORT, 'supplier info is immutable; record a newer snapshot'); END;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

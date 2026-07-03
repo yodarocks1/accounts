@@ -30,7 +30,8 @@ export type LedgerErrorCode =
   | 'RETURN_WINDOW'
   | 'APPROVAL_REQUIRED'
   | 'UNKNOWN_TAX_CODE'
-  | 'DEPOSIT_REQUIRED';
+  | 'DEPOSIT_REQUIRED'
+  | 'MINIMUM_NOT_MET';
 
 export class LedgerError extends Error {
   constructor(

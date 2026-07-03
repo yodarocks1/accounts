@@ -70,6 +70,46 @@ function mapDeposit(raw: unknown): Record<string, unknown> {
   return { deposit: { percentMilli: money(body.percentMilli, 'deposit.percentMilli') } };
 }
 
+function mapSupplierInfo(partyId: string, body: Body): Record<string, unknown> {
+  return {
+    partyId,
+    asOf: str(body.asOf, 'asOf'),
+    currency: str(body.currency, 'currency'),
+    ...(body.source !== undefined ? { source: str(body.source, 'source') } : {}),
+    ...(optMoney(body.minimumOrderMinor, 'minimumOrderMinor') !== undefined
+      ? { minimumOrderMinor: optMoney(body.minimumOrderMinor, 'minimumOrderMinor')! }
+      : {}),
+    ...(optMoney(body.minimumOrderQuantityMilli, 'minimumOrderQuantityMilli') !== undefined
+      ? { minimumOrderQuantityMilli: optMoney(body.minimumOrderQuantityMilli, 'minimumOrderQuantityMilli')! }
+      : {}),
+    ...(body.shipping !== undefined
+      ? {
+          shipping: (body.shipping as Body[]).map((raw) => ({
+            method: str(raw.method, 'shipping.method'),
+            ...(optMoney(raw.costMinor, 'shipping.costMinor') !== undefined ? { costMinor: optMoney(raw.costMinor, 'shipping.costMinor')! } : {}),
+            ...(optMoney(raw.freeAboveMinor, 'shipping.freeAboveMinor') !== undefined ? { freeAboveMinor: optMoney(raw.freeAboveMinor, 'shipping.freeAboveMinor')! } : {}),
+            ...(optNum(raw.minDays) !== undefined ? { minDays: optNum(raw.minDays)! } : {}),
+            ...(optNum(raw.maxDays) !== undefined ? { maxDays: optNum(raw.maxDays)! } : {}),
+          })),
+        }
+      : {}),
+    ...(body.items !== undefined
+      ? {
+          items: (body.items as Body[]).map((raw) => ({
+            itemId: str(raw.itemId, 'items.itemId'),
+            unitCost: money(raw.unitCost, 'items.unitCost'),
+            ...(raw.supplierSku !== undefined ? { supplierSku: str(raw.supplierSku, 'items.supplierSku') } : {}),
+            ...(optBool(raw.inStock) !== undefined ? { inStock: optBool(raw.inStock)! } : {}),
+            ...(optMoney(raw.minQuantityMilli, 'items.minQuantityMilli') !== undefined ? { minQuantityMilli: optMoney(raw.minQuantityMilli, 'items.minQuantityMilli')! } : {}),
+            ...(optMoney(raw.multipleQuantityMilli, 'items.multipleQuantityMilli') !== undefined ? { multipleQuantityMilli: optMoney(raw.multipleQuantityMilli, 'items.multipleQuantityMilli')! } : {}),
+            ...(optNum(raw.leadDays) !== undefined ? { leadDays: optNum(raw.leadDays)! } : {}),
+          })),
+        }
+      : {}),
+    ...(body.notes !== undefined ? { notes: str(body.notes, 'notes') } : {}),
+  };
+}
+
 const STATUS_BY_CODE: Partial<Record<LedgerErrorCode, number>> = {
   UNKNOWN_ACCOUNT: 404,
   UNKNOWN_ENTRY: 404,
@@ -82,6 +122,7 @@ const STATUS_BY_CODE: Partial<Record<LedgerErrorCode, number>> = {
   ALREADY_REVERSED: 409,
   APPROVAL_REQUIRED: 403,
   DEPOSIT_REQUIRED: 409,
+  MINIMUM_NOT_MET: 409,
 };
 
 async function readBody(request: IncomingMessage): Promise<Body> {
@@ -136,6 +177,16 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     if (method === 'GET' && id !== undefined && sub === undefined) return file.getParty(id);
     if (method === 'GET' && id !== undefined && sub === 'names') return file.partyNameHistory(id);
     if (method === 'POST' && id !== undefined && sub === 'rename') return file.renameParty(id, str(body.name, 'name'));
+    if (method === 'POST' && id !== undefined && sub === 'supplier-info') {
+      return file.recordSupplierInfo(mapSupplierInfo(id, body) as never);
+    }
+    if (method === 'GET' && id !== undefined && sub === 'supplier-info') {
+      const at = query.get('asOf');
+      return (at !== null ? file.supplierInfoAt(id, at) : file.supplierInfo(id)) ?? null;
+    }
+    if (method === 'GET' && id !== undefined && sub === 'supplier-info-history') {
+      return file.supplierInfoHistory(id);
+    }
   }
 
   if (head === 'tax-rates') {
@@ -188,9 +239,12 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     if (method === 'POST' && sub === 'send') {
       return file.sendDocument(id, {
         ...(body.overrideDeposit !== undefined ? { overrideDeposit: Boolean(body.overrideDeposit) } : {}),
+        ...(body.overrideMinimum !== undefined ? { overrideMinimum: Boolean(body.overrideMinimum) } : {}),
         ...(body.approvedBy !== undefined ? { approvedBy: str(body.approvedBy, 'approvedBy') } : {}),
       });
     }
+    if (method === 'GET' && sub === 'readiness') return file.purchaseOrderReadiness(id);
+    if (method === 'GET' && sub === 'purchase-coverage') return file.purchaseCoverage(id);
     if (method === 'POST' && sub === 'void') return file.voidDocument(id, optStr(body.approvedBy));
     if (method === 'POST' && sub === 'change') {
       return file.changeDocument(id, {
@@ -352,7 +406,6 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     }
   }
 
-  void optBool;
   return undefined;
 }
 

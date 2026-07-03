@@ -18,6 +18,16 @@ import {
 } from './customer-rates.js';
 import type { NewParty, Party, PartyName } from './parties.js';
 import {
+  buildSupplierInfo,
+  computePurchaseCoverage,
+  computePurchaseReadiness,
+  specialOrderDepositFloor,
+  type NewSupplierInfo,
+  type PurchaseCoverageLine,
+  type PurchaseReadiness,
+  type SupplierInfo,
+} from './suppliers.js';
+import {
   appliedFromSource,
   appliedToInvoice,
   appliedToLine,
@@ -30,7 +40,7 @@ import {
   type Payment,
 } from './payments.js';
 
-export const DOCUMENT_TYPES = ['estimate', 'sales_order', 'invoice', 'credit_memo'] as const;
+export const DOCUMENT_TYPES = ['estimate', 'sales_order', 'invoice', 'credit_memo', 'purchase_order'] as const;
 export type DocumentType = (typeof DOCUMENT_TYPES)[number];
 
 export type DocumentStatus = 'draft' | 'sent' | 'void';
@@ -48,6 +58,8 @@ export const CONVERSION_TARGETS: Record<DocumentType, readonly DocumentType[]> =
   sales_order: ['invoice'],
   invoice: [],
   credit_memo: [],
+  // Vendor bills will attach here when accounts payable lands (ADR 0011).
+  purchase_order: [],
 };
 
 export interface DocumentLine {
@@ -247,8 +259,12 @@ export interface NewTaxRate {
   effectiveFrom?: string;
 }
 
-/** When an item requires a deposit on sales orders (ADR 0010 part 3). */
-export type DepositPolicy = 'never' | 'always' | 'when_out_of_stock';
+/**
+ * When an item requires a deposit on sales orders (ADR 0010 part 3).
+ * 'special_order' items are purchased per sale and must be prepaid in full
+ * before the sales order is sent (ADR 0011 part 6).
+ */
+export type DepositPolicy = 'never' | 'always' | 'when_out_of_stock' | 'special_order';
 
 /** A deposit request on a sales order: flat or percent of the grand total. */
 export type DepositRequest = { amountMinor: bigint } | { percentMilli: bigint };
@@ -300,6 +316,7 @@ export const APPROVAL_ACTIONS = [
   'close_line',
   'return_window_override',
   'deposit_override',
+  'minimum_order_override',
 ] as const;
 export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];
 
@@ -367,10 +384,11 @@ export function resolveRevisionKind(
       }
       return 'correction';
     case 'sales_order':
+    case 'purchase_order':
       if (requested !== 'correction' && requested !== 'substitution') {
         throw new LedgerError(
           'INVALID_REVISION_KIND',
-          'Changing a sent sales order requires kind "correction" or "substitution"',
+          `Changing a sent ${type === 'sales_order' ? 'sales' : 'purchase'} order requires kind "correction" or "substitution"`,
         );
       }
       return requested;
@@ -618,6 +636,8 @@ export interface ItemCatalog {
   ): bigint | undefined;
   /** The scale-3 percent of a tax code effective on `date` (ADR 0010). */
   taxRateAt(code: string, date: string): bigint | undefined;
+  /** The supplier's quoted unit cost effective on `date`, if any (ADR 0011). */
+  supplierCostAt?(partyId: string, itemId: string, date: string): bigint | undefined;
 }
 
 /** Recorded value of a free item line: at cost, or sales price if lower (ADR 0005). */
@@ -642,6 +662,7 @@ export function resolveDocumentLines(
   previousLines?: readonly DocumentLine[],
   customer?: CustomerQuery,
   taxExempt = false,
+  purchase = false,
 ): DocumentLine[] {
   return lines.map((line, index) => {
     const previous = previousLines?.[index];
@@ -653,6 +674,15 @@ export function resolveDocumentLines(
     let unitPrice: bigint | undefined;
     if (free && item) {
       unitPrice = freeRecordedUnitPrice(item.id, date, catalog);
+    } else if (purchase) {
+      // Purchase pricing (ADR 0011 part 4): explicit → supplier quote → cost
+      // history. Customer rates and sales prices never apply.
+      unitPrice =
+        line.unitPrice ??
+        (item && customer?.partyId !== undefined
+          ? catalog.supplierCostAt?.(customer.partyId, item.id, date)
+          : undefined) ??
+        (item ? catalog.costAt(item.id, date) : undefined);
     } else {
       // Pricing order (ADR 0007): explicit price → customer rate → catalog.
       unitPrice =
@@ -663,7 +693,12 @@ export function resolveDocumentLines(
         (item ? catalog.priceAt(item.id, date) : undefined);
     }
     if (unitPrice === undefined) {
-      throw new LedgerError('INVALID_DOCUMENT', 'Lines without an item need an explicit unitPrice');
+      throw new LedgerError(
+        'INVALID_DOCUMENT',
+        purchase
+          ? 'Purchase lines need an explicit unitPrice, a supplier quote, or item cost history'
+          : 'Lines without an item need an explicit unitPrice',
+      );
     }
     const currency = line.currency ?? item?.currency;
     if (currency === undefined) {
@@ -674,8 +709,9 @@ export function resolveDocumentLines(
     }
     // Tax (ADR 0010): explicit code (null = force untaxed) → previous → item
     // default; a snapshot of the percent effective today rides the line.
+    // Purchase lines carry no sales tax (ADR 0011 part 4).
     let taxCode: string | null;
-    if (taxExempt) taxCode = null;
+    if (taxExempt || purchase) taxCode = null;
     else if (line.taxCode !== undefined) taxCode = line.taxCode;
     else if (previous !== undefined) taxCode = previous.taxCode;
     else taxCode = item?.taxCode ?? null;
@@ -1277,7 +1313,7 @@ export class DocumentBook implements ItemCatalog {
     lines: readonly DocumentLine[],
     approvedBy: string | undefined,
   ): void {
-    if (type === 'credit_memo') return;
+    if (type === 'credit_memo' || type === 'purchase_order') return;
     for (const line of lines) {
       if (line.free || line.itemId === null) continue;
       const cost = this.costAt(line.itemId, date);
@@ -1670,8 +1706,9 @@ export class DocumentBook implements ItemCatalog {
     previousLines?: readonly DocumentLine[],
     customer?: CustomerQuery,
     taxExempt = false,
+    purchase = false,
   ): DocumentLine[] {
-    return resolveDocumentLines(lines, date, this, previousLines, customer, taxExempt);
+    return resolveDocumentLines(lines, date, this, previousLines, customer, taxExempt, purchase);
   }
 
   createDocument(input: NewDocument, id: string = randomUUID(), at?: string): DocumentView {
@@ -1684,6 +1721,7 @@ export class DocumentBook implements ItemCatalog {
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
+    const purchase = input.type === 'purchase_order';
     const customer = this.resolveCustomer(input);
     const lines = this.resolveLines(
       input.lines,
@@ -1695,6 +1733,7 @@ export class DocumentBook implements ItemCatalog {
         ...(customer.partyId !== null ? { partyId: customer.partyId } : {}),
       },
       customer.taxExempt,
+      purchase,
     );
     let inheritedTags: readonly DocumentTag[] = [];
     if (input.sourceDocumentId !== undefined) {
@@ -1713,6 +1752,9 @@ export class DocumentBook implements ItemCatalog {
         (documentId, lineId) => this.sourceLineFor(documentId, lineId),
         (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
       );
+    }
+    if (purchase) {
+      this.validatePurchaseLinks(lines);
     }
     const number = input.number?.trim() ?? this.drawNumber(input.type);
     const numberKey = `${input.type}:${number}`;
@@ -1764,11 +1806,18 @@ export class DocumentBook implements ItemCatalog {
     const accountNumber = changes.accountNumber ?? previous.accountNumber;
     const lines =
       changes.lines !== undefined
-        ? this.resolveLines(changes.lines, date, previous.lines, {
-            customerName,
-            ...(accountNumber !== null ? { accountNumber } : {}),
-            ...(document.partyId !== null ? { partyId: document.partyId } : {}),
-          })
+        ? this.resolveLines(
+            changes.lines,
+            date,
+            previous.lines,
+            {
+              customerName,
+              ...(accountNumber !== null ? { accountNumber } : {}),
+              ...(document.partyId !== null ? { partyId: document.partyId } : {}),
+            },
+            false,
+            document.type === 'purchase_order',
+          )
         : [...previous.lines];
     validateRevisionContent({ date, lines, customerName });
     // ADR 0006: never orphan downstream links or over-consume a shrunk line.
@@ -1785,6 +1834,28 @@ export class DocumentBook implements ItemCatalog {
           throw new LedgerError('LINE_LINKED', `Line ${entry.lineId} cannot shrink below its ${entry.prepaid} prepayment`);
         }
       }
+      // ADR 0011 part 5: lines on order with a supplier cannot vanish or
+      // shrink below the linked quantity — a PO must not point at nothing.
+      for (const entry of this.purchaseCoverage(id)) {
+        const ordered = entry.draftOrderedMilli + entry.sentOrderedMilli;
+        if (ordered === 0n) continue;
+        const stillThere = lines.find((line) => line.lineId === entry.lineId);
+        if (!stillThere) {
+          throw new LedgerError(
+            'LINE_LINKED',
+            `Line ${entry.lineId} has ${ordered} (milli) on purchase orders and cannot be removed`,
+          );
+        }
+        if (stillThere.quantityMilli < ordered) {
+          throw new LedgerError(
+            'LINE_LINKED',
+            `Line ${entry.lineId} cannot shrink below the ${ordered} (milli) on purchase orders`,
+          );
+        }
+      }
+    }
+    if (document.type === 'purchase_order' && changes.lines !== undefined) {
+      this.validatePurchaseLinks(lines, id);
     }
     this.requireBelowCostApproval(document.type, date, lines, changes.approvedBy);
     if (document.type === 'credit_memo' && changes.lines !== undefined) {
@@ -2168,7 +2239,10 @@ export class DocumentBook implements ItemCatalog {
     return this.closures.get(documentId) ?? [];
   }
 
-  sendDocument(id: string, options?: { overrideDeposit?: boolean; approvedBy?: string }): DocumentView {
+  sendDocument(
+    id: string,
+    options?: { overrideDeposit?: boolean; overrideMinimum?: boolean; approvedBy?: string },
+  ): DocumentView {
     const document = this.requireDocument(id);
     if (document.status !== 'draft') {
       throw new LedgerError('INVALID_STATUS', `Only draft documents can be sent (is ${document.status})`);
@@ -2183,6 +2257,34 @@ export class DocumentBook implements ItemCatalog {
           throw new LedgerError(
             'DEPOSIT_REQUIRED',
             `These items require a deposit before sending: ${requiring.map((line) => line.description).join(', ')} (pass overrideDeposit to send anyway)`,
+          );
+        }
+      }
+      // ADR 0011 part 6: special-order items must be prepaid in full — the
+      // deposit request has to cover their gross amount before sending.
+      const floor = specialOrderDepositFloor(current.lines, (itemId) => this.items.get(itemId));
+      if (floor > 0n && (current.depositRequiredMinor ?? 0n) < floor) {
+        if (options?.overrideDeposit === true) {
+          this.requireApproval('deposit_override', options.approvedBy);
+        } else {
+          throw new LedgerError(
+            'DEPOSIT_REQUIRED',
+            `Special-order items must be prepaid: the deposit request must cover at least ${floor}, not ${current.depositRequiredMinor ?? 0n} (pass overrideDeposit to send anyway)`,
+          );
+        }
+      }
+    }
+    if (document.type === 'purchase_order') {
+      const readiness = this.purchaseOrderReadiness(id);
+      if (!readiness.ready) {
+        if (options?.overrideMinimum === true) {
+          this.requireApproval('minimum_order_override', options.approvedBy);
+        } else {
+          throw new LedgerError(
+            'MINIMUM_NOT_MET',
+            `Purchase order does not meet the supplier's terms: ${readiness.shortfalls
+              .map((shortfall) => shortfall.message)
+              .join('; ')} (pass overrideMinimum to send anyway)`,
           );
         }
       }
@@ -2266,6 +2368,145 @@ export class DocumentBook implements ItemCatalog {
         });
       }
     }
+  }
+
+  // ── Purchase side (ADR 0011) ──────────────────────────────────────────
+
+  private readonly supplierInfos: SupplierInfo[] = [];
+
+  /** Record a supplier-info snapshot (append-only; `source` = 'manual' or a plugin id). */
+  recordSupplierInfo(input: NewSupplierInfo, at?: string): SupplierInfo {
+    this.requireParty(input.partyId);
+    for (const term of input.items ?? []) {
+      if (!this.items.has(term.itemId)) {
+        throw new LedgerError('UNKNOWN_ITEM', `No such item: ${term.itemId}`);
+      }
+    }
+    const info = buildSupplierInfo(input, this.supplierInfos.length + 1, at ?? new Date().toISOString());
+    this.supplierInfos.push(info);
+    return info;
+  }
+
+  /** Newest supplier snapshot observed on or before `date`. */
+  supplierInfoAt(partyId: string, date: string): SupplierInfo | undefined {
+    let best: SupplierInfo | undefined;
+    for (const info of this.supplierInfos) {
+      if (info.partyId !== partyId || info.asOf > date) continue;
+      if (!best || info.asOf > best.asOf || (info.asOf === best.asOf && info.infoSeq > best.infoSeq)) {
+        best = info;
+      }
+    }
+    return best;
+  }
+
+  /** The latest supplier snapshot regardless of date. */
+  supplierInfo(partyId: string): SupplierInfo | undefined {
+    let best: SupplierInfo | undefined;
+    for (const info of this.supplierInfos) {
+      if (info.partyId !== partyId) continue;
+      if (!best || info.infoSeq > best.infoSeq) best = info;
+    }
+    return best;
+  }
+
+  supplierInfoHistory(partyId: string): readonly SupplierInfo[] {
+    return this.supplierInfos.filter((info) => info.partyId === partyId);
+  }
+
+  /** The supplier's quoted unit cost effective on `date` (ItemCatalog seam). */
+  supplierCostAt(partyId: string, itemId: string, date: string): bigint | undefined {
+    return this.supplierInfoAt(partyId, date)?.items.find((term) => term.itemId === itemId)?.unitCost;
+  }
+
+  /** Cumulative quantity of a sales-order line already on other purchase orders. */
+  private priorLinkedMilli(salesOrderId: string, lineId: string, excludeDocumentId?: string): bigint {
+    let total = 0n;
+    for (const record of this.documents.values()) {
+      if (record.type !== 'purchase_order' || record.status === 'void' || record.id === excludeDocumentId) {
+        continue;
+      }
+      const current = record.revisions[record.revisions.length - 1]!;
+      for (const line of current.lines) {
+        if (line.sourceDocumentId === salesOrderId && line.sourceLineId === lineId) {
+          total += line.quantityMilli;
+        }
+      }
+    }
+    return total;
+  }
+
+  /**
+   * ADR 0011 part 5: PO line links must target existing sales-order lines,
+   * and the cumulative linked quantity across non-void purchase orders may
+   * not exceed what the sales order promises. Overage for stock is ordered
+   * as an unlinked line.
+   */
+  private validatePurchaseLinks(lines: readonly DocumentLine[], excludeDocumentId?: string): void {
+    const consumed = new Map<string, bigint>();
+    for (const line of lines) {
+      if (line.sourceDocumentId === null || line.sourceLineId === null) continue;
+      const source = this.documents.get(line.sourceDocumentId);
+      if (!source) {
+        throw new LedgerError('UNKNOWN_DOCUMENT', `No such source document: ${line.sourceDocumentId}`);
+      }
+      if (source.type !== 'sales_order') {
+        throw new LedgerError('INVALID_DOCUMENT', 'Purchase-order lines may only link to sales-order lines');
+      }
+      const current = source.revisions[source.revisions.length - 1]!;
+      if (!current.lines.some((candidate) => candidate.lineId === line.sourceLineId)) {
+        throw new LedgerError('UNKNOWN_LINE', `Sales order ${source.number} has no line ${line.sourceLineId}`);
+      }
+      const key = `${line.sourceDocumentId}#${line.sourceLineId}`;
+      consumed.set(key, (consumed.get(key) ?? 0n) + line.quantityMilli);
+    }
+    for (const [key, quantity] of consumed) {
+      const [documentId, lineId] = key.split('#') as [string, string];
+      const source = this.documents.get(documentId)!;
+      const sourceLine = source.revisions[source.revisions.length - 1]!.lines.find(
+        (candidate) => candidate.lineId === lineId,
+      )!;
+      const total = this.priorLinkedMilli(documentId, lineId, excludeDocumentId) + quantity;
+      if (total > sourceLine.quantityMilli) {
+        throw new LedgerError(
+          'LINE_OVERDRAWN',
+          `Ordering ${total} (milli) of "${sourceLine.description}" exceeds the ${sourceLine.quantityMilli} on the sales order; order overage as an unlinked line`,
+        );
+      }
+    }
+  }
+
+  /** How much of each sales-order line is on order with suppliers (ADR 0011). */
+  purchaseCoverage(salesOrderId: string): PurchaseCoverageLine[] {
+    const record = this.requireDocument(salesOrderId);
+    if (record.type !== 'sales_order') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Purchase coverage applies to sales orders');
+    }
+    const linked = new Map<string, { draftMilli: bigint; sentMilli: bigint }>();
+    for (const other of this.documents.values()) {
+      if (other.type !== 'purchase_order' || other.status === 'void') continue;
+      const current = other.revisions[other.revisions.length - 1]!;
+      for (const line of current.lines) {
+        if (line.sourceDocumentId !== salesOrderId || line.sourceLineId === null) continue;
+        const entry = linked.get(line.sourceLineId) ?? { draftMilli: 0n, sentMilli: 0n };
+        if (other.status === 'sent') entry.sentMilli += line.quantityMilli;
+        else entry.draftMilli += line.quantityMilli;
+        linked.set(line.sourceLineId, entry);
+      }
+    }
+    const current = record.revisions[record.revisions.length - 1]!;
+    return computePurchaseCoverage(current.lines, linked);
+  }
+
+  /** Readiness of a purchase order against the supplier's terms (ADR 0011 part 7). */
+  purchaseOrderReadiness(id: string): PurchaseReadiness {
+    const document = this.requireDocument(id);
+    if (document.type !== 'purchase_order') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Readiness applies to purchase orders');
+    }
+    const current = document.revisions[document.revisions.length - 1]!;
+    const info =
+      document.partyId !== null ? this.supplierInfoAt(document.partyId, current.date) : undefined;
+    return computePurchaseReadiness(current.lines, info);
   }
 
   voidDocument(id: string, approvedBy?: string): DocumentView {
