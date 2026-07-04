@@ -213,6 +213,7 @@ export function computeStatement(
   const statementPayments: StatementPayment[] = payments
     .filter(
       (payment) =>
+        payment.direction !== 'out' &&
         payment.status === 'received' &&
         payment.date <= asOf &&
         ((query.partyId !== undefined && payment.partyId === query.partyId) ||

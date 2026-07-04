@@ -26,7 +26,7 @@ Usage:
 
 Document layer:
   accounts item add <file> --name <name> --price <amount> [--cost <amount>] [--tax-code <code>] [--deposit-policy <never|always|when_out_of_stock|special_order>]
-  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order>]
+  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order|bill>]
   accounts doc show <file> <document-id>
   accounts doc send <file> <document-id> [--override-deposit] [--override-minimum] [--approved-by <who>]
   accounts statement <file> (--party <id> | --customer <name> | --acct <number>) [--as-of YYYY-MM-DD]
@@ -406,7 +406,7 @@ function cmdDocShow(args: string[]): string {
       ...(view.taxTotal > 0n ? [`Tax: ${usd(view.taxTotal)}`] : []),
       `Total: ${usd(view.total)}`,
     ];
-    if (view.type === 'invoice' && view.status === 'sent') {
+    if ((view.type === 'invoice' || view.type === 'bill') && view.status === 'sent') {
       const settlement = file.invoiceSettlement(view.id);
       totals.push(`Paid: ${usd(settlement.paid)}  Open: ${usd(settlement.open)}  [${settlement.status}]`);
     }

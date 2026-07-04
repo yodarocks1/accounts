@@ -170,6 +170,19 @@ describe('document API (Tier 3)', () => {
     expect(((await get(`/documents/${po.id}/readiness`)).json as { ready: boolean }).ready).toBe(true);
     const sent = await post(`/documents/${po.id}/send`, {});
     expect(sent.status).toBe(201);
+
+    // Bill the PO and settle it with an outbound payment (ADR 0012).
+    const bill = (await post(`/documents/${po.id}/convert`, {
+      type: 'bill', number: 'BILL-1', date: '2026-07-10',
+    })).json as { id: string; total: string };
+    expect(bill.total).toBe('10800'); // 12 × 9.00 quoted
+    await post(`/documents/${bill.id}/send`, {});
+    await post('/payments', {
+      direction: 'out', number: 'PMT-OUT', date: '2026-07-12', partyId: supplier.id, amount: '10800',
+      applications: [{ invoiceId: bill.id, amount: '10800' }],
+    });
+    const settled = (await get(`/documents/${bill.id}/settlement`)).json as { status: string };
+    expect(settled.status).toBe('paid');
   });
 
   it('gated actions surface 403 APPROVAL_REQUIRED', async () => {

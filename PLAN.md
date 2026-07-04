@@ -355,6 +355,9 @@ A first-class, obsessively-tested onramp — this determines adoption.
       links and coverage, supplier info snapshots (costs, shipping
       estimates, minimums — the plugin seam), minimum-order send gating,
       special_order deposit policy (ADR 0011)
+- [x] Vendor bills & accounts payable: PO→bill conversion, correction-only
+      once approved, A/P + purchases posting roles, outbound payments
+      settling bills with direction guards (ADR 0012)
 - [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging

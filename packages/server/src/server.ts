@@ -327,6 +327,7 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
       return file.recordPayment({
         date: str(body.date, 'date'),
         amount: money(body.amount, 'amount'),
+        ...(body.direction !== undefined ? { direction: str(body.direction, 'direction') as never } : {}),
         ...(body.number !== undefined ? { number: str(body.number, 'number') } : {}),
         ...mapCustomer(body),
         ...(body.memo !== undefined ? { memo: str(body.memo, 'memo') } : {}),

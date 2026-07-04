@@ -73,6 +73,7 @@ import {
   type NumberSequence,
   type NewNumberSequence,
   formatSequenceNumber,
+  isPurchaseType,
   appliedToLine,
   buildSupplierInfo,
   computePurchaseCoverage,
@@ -1082,7 +1083,7 @@ export class CompanyFile implements ItemCatalog {
     lines: readonly DocumentLine[],
     approvedBy: string | undefined,
   ): void {
-    if (type === 'credit_memo' || type === 'purchase_order') return;
+    if (type === 'credit_memo' || isPurchaseType(type)) return;
     for (const line of lines) {
       if (line.free || line.itemId === null) continue;
       const cost = this.costAt(line.itemId, date);
@@ -1124,7 +1125,7 @@ export class CompanyFile implements ItemCatalog {
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
-    const purchase = input.type === 'purchase_order';
+    const purchase = isPurchaseType(input.type);
     const customer = this.resolveCustomer(input);
     const lines = resolveDocumentLines(
       input.lines,
@@ -1157,7 +1158,7 @@ export class CompanyFile implements ItemCatalog {
         (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
       );
     }
-    if (purchase) {
+    if (input.type === 'purchase_order') {
       this.validatePurchaseLinks(lines);
     }
     const id = randomUUID();
@@ -1225,7 +1226,7 @@ export class CompanyFile implements ItemCatalog {
               ...(document.partyId !== null ? { partyId: document.partyId } : {}),
             },
             false,
-            document.type === 'purchase_order',
+            isPurchaseType(document.type),
           )
         : [...previous.lines];
     validateRevisionContent({ date, lines, customerName });
@@ -2090,6 +2091,7 @@ export class CompanyFile implements ItemCatalog {
     const payment: Payment = {
       id: randomUUID(),
       number: input.number ?? '', // resolved inside the transaction
+      direction: input.direction ?? 'in',
       date: input.date,
       partyId: customer.partyId,
       customerName: customer.customerName,
@@ -2106,12 +2108,13 @@ export class CompanyFile implements ItemCatalog {
       try {
         this.db
           .prepare(
-            `INSERT INTO payments (id, number, date, party_id, customer_name, account_number, po_number, memo, method, amount, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
+            `INSERT INTO payments (id, number, direction, date, party_id, customer_name, account_number, po_number, memo, method, amount, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
           )
           .run(
             payment.id,
             resolvedNumber,
+            payment.direction,
             payment.date,
             payment.partyId,
             payment.customerName,
@@ -2139,12 +2142,12 @@ export class CompanyFile implements ItemCatalog {
         );
       }
       const plan = planPosting(
-        'payment',
+        payment.direction === 'out' ? 'disbursement' : 'payment',
         payment.amountMinor,
         this.info().baseCurrency,
         payment.date,
         this.postingAccounts(),
-        `Payment ${resolvedNumber} (${payment.customerName})`,
+        `Payment ${resolvedNumber} (${payment.direction === 'out' ? 'to' : 'from'} ${payment.customerName})`,
       );
       if (plan) {
         const entry = this.postEntry(plan);
@@ -2158,6 +2161,7 @@ export class CompanyFile implements ItemCatalog {
     interface PaymentRow {
       id: string;
       number: string;
+      direction: Payment['direction'];
       date: string;
       party_id: string | null;
       customer_name: string;
@@ -2173,6 +2177,7 @@ export class CompanyFile implements ItemCatalog {
     return {
       id: row.id,
       number: row.number,
+      direction: row.direction,
       date: row.date,
       partyId: row.party_id,
       customerName: row.customer_name,
@@ -2344,6 +2349,7 @@ export class CompanyFile implements ItemCatalog {
   private sourceState(kind: CreditApplication['sourceKind'], id: string): {
     customerName: string;
     accountNumber: string | null;
+    direction: 'in' | 'out';
     total: bigint;
   } {
     if (kind === 'payment') {
@@ -2352,7 +2358,12 @@ export class CompanyFile implements ItemCatalog {
       if (payment.status !== 'received') {
         throw new LedgerError('INVALID_STATUS', 'Void payments cannot be applied');
       }
-      return { customerName: payment.customerName, accountNumber: payment.accountNumber, total: payment.amountMinor };
+      return {
+        customerName: payment.customerName,
+        accountNumber: payment.accountNumber,
+        direction: payment.direction,
+        total: payment.amountMinor,
+      };
     }
     const record = this.getDocumentRecord(id);
     if (!record || record.type !== 'credit_memo') {
@@ -2365,9 +2376,11 @@ export class CompanyFile implements ItemCatalog {
       throw new LedgerError('INVALID_DOCUMENT', 'Refund credit memos were paid out and cannot be applied');
     }
     const current = record.revisions[record.revisions.length - 1]!;
+    // Credit memos are inbound credit; vendor credits are future work.
     return {
       customerName: current.customerName,
       accountNumber: current.accountNumber,
+      direction: 'in',
       total: revisionGrandTotal(current),
     };
   }
@@ -2469,6 +2482,7 @@ export class CompanyFile implements ItemCatalog {
   private postDocumentIfConfigured(record: DocumentRecord): void {
     let kind: PostingKind;
     if (record.type === 'invoice') kind = 'invoice';
+    else if (record.type === 'bill') kind = 'bill';
     else if (record.type === 'credit_memo') {
       kind = record.settlement === 'refund' ? 'credit_refund' : 'credit_account';
     } else return;

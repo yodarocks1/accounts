@@ -10,6 +10,8 @@ import type { DocumentRecord, DocumentRevision } from './documents.js';
 export interface Payment {
   readonly id: string;
   readonly number: string;
+  /** 'in' = received from a customer; 'out' = paid to a supplier (ADR 0012). */
+  readonly direction: 'in' | 'out';
   readonly date: string;
   readonly partyId: string | null;
   readonly customerName: string;
@@ -25,6 +27,8 @@ export interface Payment {
 export interface NewPayment {
   /** Omit to draw from the payment number sequence (ADR 0010 part 2). */
   number?: string;
+  /** Defaults to 'in' (money received); 'out' pays supplier bills (ADR 0012). */
+  direction?: 'in' | 'out';
   date: string;
   /** Required unless partyId supplies it. */
   customerName?: string;
@@ -144,13 +148,23 @@ export function validateApplication(
   sourceRemaining: bigint,
   invoice: DocumentRecord,
   invoiceOpen: bigint,
-  source: { customerName: string; accountNumber: string | null },
+  source: { customerName: string; accountNumber: string | null; direction: 'in' | 'out' },
 ): void {
   if (amount <= 0n) {
     throw new LedgerError('INVALID_ALLOCATION', 'Application amounts must be positive');
   }
-  if (invoice.type !== 'invoice' && invoice.type !== 'sales_order') {
-    throw new LedgerError('INVALID_DOCUMENT', 'Credit can only be applied to invoices or sales orders (deposits)');
+  // Direction check (ADR 0012): bills are settled by outbound payments;
+  // customer documents by inbound credit only.
+  if (invoice.type === 'bill') {
+    if (source.direction !== 'out') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Bills are settled by outbound payments');
+    }
+  } else if (invoice.type === 'invoice' || invoice.type === 'sales_order') {
+    if (source.direction !== 'in') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Outbound payments settle bills, not customer documents');
+    }
+  } else {
+    throw new LedgerError('INVALID_DOCUMENT', 'Credit can only be applied to invoices, sales orders (deposits), or bills');
   }
   if (invoice.status !== 'sent') {
     throw new LedgerError('INVALID_STATUS', 'Credit can only be applied to sent documents');

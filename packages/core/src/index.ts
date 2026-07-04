@@ -31,6 +31,7 @@ export { allocateProportional } from './allocation.js';
 export {
   DOCUMENT_TYPES,
   CONVERSION_TARGETS,
+  isPurchaseType,
   type DocumentType,
   type DocumentStatus,
   type RevisionKind,

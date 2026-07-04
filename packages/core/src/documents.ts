@@ -40,8 +40,13 @@ import {
   type Payment,
 } from './payments.js';
 
-export const DOCUMENT_TYPES = ['estimate', 'sales_order', 'invoice', 'credit_memo', 'purchase_order'] as const;
+export const DOCUMENT_TYPES = ['estimate', 'sales_order', 'invoice', 'credit_memo', 'purchase_order', 'bill'] as const;
 export type DocumentType = (typeof DOCUMENT_TYPES)[number];
+
+/** Purchase-side documents share cost pricing and untaxed lines (ADR 0011/0012). */
+export function isPurchaseType(type: DocumentType): boolean {
+  return type === 'purchase_order' || type === 'bill';
+}
 
 export type DocumentStatus = 'draft' | 'sent' | 'void';
 
@@ -58,8 +63,9 @@ export const CONVERSION_TARGETS: Record<DocumentType, readonly DocumentType[]> =
   sales_order: ['invoice'],
   invoice: [],
   credit_memo: [],
-  // Vendor bills will attach here when accounts payable lands (ADR 0011).
-  purchase_order: [],
+  // A billed purchase order mirrors an invoiced sales order (ADR 0012).
+  purchase_order: ['bill'],
+  bill: [],
 };
 
 export interface DocumentLine {
@@ -376,10 +382,11 @@ export function resolveRevisionKind(
       return 'edit';
     case 'invoice':
     case 'credit_memo':
+    case 'bill':
       if (requested !== undefined && requested !== 'correction') {
         throw new LedgerError(
           'INVALID_REVISION_KIND',
-          `A sent ${type === 'invoice' ? 'invoice' : 'credit memo'} can only be changed by a correction`,
+          `A sent ${type === 'invoice' ? 'invoice' : type === 'bill' ? 'bill' : 'credit memo'} can only be changed by a correction`,
         );
       }
       return 'correction';
@@ -1313,7 +1320,7 @@ export class DocumentBook implements ItemCatalog {
     lines: readonly DocumentLine[],
     approvedBy: string | undefined,
   ): void {
-    if (type === 'credit_memo' || type === 'purchase_order') return;
+    if (type === 'credit_memo' || isPurchaseType(type)) return;
     for (const line of lines) {
       if (line.free || line.itemId === null) continue;
       const cost = this.costAt(line.itemId, date);
@@ -1721,7 +1728,7 @@ export class DocumentBook implements ItemCatalog {
     if (input.settlement !== undefined && input.type !== 'credit_memo') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
     }
-    const purchase = input.type === 'purchase_order';
+    const purchase = isPurchaseType(input.type);
     const customer = this.resolveCustomer(input);
     const lines = this.resolveLines(
       input.lines,
@@ -1753,7 +1760,7 @@ export class DocumentBook implements ItemCatalog {
         (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
       );
     }
-    if (purchase) {
+    if (input.type === 'purchase_order') {
       this.validatePurchaseLinks(lines);
     }
     const number = input.number?.trim() ?? this.drawNumber(input.type);
@@ -1816,7 +1823,7 @@ export class DocumentBook implements ItemCatalog {
               ...(document.partyId !== null ? { partyId: document.partyId } : {}),
             },
             false,
-            document.type === 'purchase_order',
+            isPurchaseType(document.type),
           )
         : [...previous.lines];
     validateRevisionContent({ date, lines, customerName });
@@ -2027,6 +2034,7 @@ export class DocumentBook implements ItemCatalog {
     const payment: Payment = {
       id,
       number,
+      direction: input.direction ?? 'in',
       date: input.date,
       partyId: customer.partyId,
       customerName: customer.customerName,
@@ -2072,6 +2080,7 @@ export class DocumentBook implements ItemCatalog {
   private sourceState(kind: CreditApplication['sourceKind'], id: string): {
     customerName: string;
     accountNumber: string | null;
+    direction: 'in' | 'out';
     total: bigint;
   } {
     if (kind === 'payment') {
@@ -2080,7 +2089,12 @@ export class DocumentBook implements ItemCatalog {
       if (payment.status !== 'received') {
         throw new LedgerError('INVALID_STATUS', 'Void payments cannot be applied');
       }
-      return { customerName: payment.customerName, accountNumber: payment.accountNumber, total: payment.amountMinor };
+      return {
+        customerName: payment.customerName,
+        accountNumber: payment.accountNumber,
+        direction: payment.direction,
+        total: payment.amountMinor,
+      };
     }
     const record = this.documents.get(id);
     if (!record || record.type !== 'credit_memo') {
@@ -2093,9 +2107,11 @@ export class DocumentBook implements ItemCatalog {
       throw new LedgerError('INVALID_DOCUMENT', 'Refund credit memos were paid out and cannot be applied');
     }
     const current = record.revisions[record.revisions.length - 1]!;
+    // Credit memos are inbound credit; vendor credits are future work.
     return {
       customerName: current.customerName,
       accountNumber: current.accountNumber,
+      direction: 'in',
       total: revisionGrandTotal(current),
     };
   }

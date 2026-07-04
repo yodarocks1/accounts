@@ -5,7 +5,14 @@ import type { NewJournalEntry } from './journal.js';
  * configurable account roles. Without configured roles, nothing posts —
  * the document layer keeps working books-less.
  */
-export const POSTING_ROLES = ['accounts_receivable', 'sales_income', 'cash', 'sales_tax_payable'] as const;
+export const POSTING_ROLES = [
+  'accounts_receivable',
+  'sales_income',
+  'cash',
+  'sales_tax_payable',
+  'accounts_payable',
+  'purchases_expense',
+] as const;
 export type PostingRole = (typeof POSTING_ROLES)[number];
 
 export type PostingKind =
@@ -16,13 +23,19 @@ export type PostingKind =
   /** Sent refund credit memo: DR income / CR cash. */
   | 'credit_refund'
   /** Received payment: DR cash / CR AR. */
-  | 'payment';
+  | 'payment'
+  /** Approved vendor bill: DR purchases / CR AP (ADR 0012). */
+  | 'bill'
+  /** Outbound payment to a supplier: DR AP / CR cash (ADR 0012). */
+  | 'disbursement';
 
 const POSTING_SIDES: Record<PostingKind, [debit: PostingRole, credit: PostingRole]> = {
   invoice: ['accounts_receivable', 'sales_income'],
   credit_account: ['sales_income', 'accounts_receivable'],
   credit_refund: ['sales_income', 'cash'],
   payment: ['cash', 'accounts_receivable'],
+  bill: ['purchases_expense', 'accounts_payable'],
+  disbursement: ['accounts_payable', 'cash'],
 };
 
 /** Which roles a posting kind needs; posting is skipped unless all are mapped. */
@@ -52,7 +65,10 @@ export function planPosting(
   const creditAccount = accounts[creditRole];
   if (debitAccount === undefined || creditAccount === undefined) return null;
   const taxAccount = accounts.sales_tax_payable;
-  const splitTax = kind !== 'payment' && taxAmount > 0n && taxAccount !== undefined;
+  const splitTax =
+    (kind === 'invoice' || kind === 'credit_account' || kind === 'credit_refund') &&
+    taxAmount > 0n &&
+    taxAccount !== undefined;
   // Income-side role carries the net when tax splits; the AR/cash side is gross.
   const incomeAmount = splitTax ? amount : gross;
   if (kind === 'invoice') {
