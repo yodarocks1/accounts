@@ -362,6 +362,10 @@ A first-class, obsessively-tested onramp — this determines adoption.
       return-quantity guards, refunds of unapplied credit (both
       directions, posted & reversible), one-step cash sales/expenses,
       supplier statements with A/P aging (ADR 0013)
+- [x] Inventory: item kinds (inventory/non-inventory/service), append-only
+      stock ledger driven by document sends/voids/corrections, damage
+      with per-item dispositions (restock/recycle/trash), assemblies with
+      additive BOM cost derivation and build/break (ADR 0014)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging
 - [ ] Plugin host v1 (in-process, bundled plugins only) — dogfooding the API

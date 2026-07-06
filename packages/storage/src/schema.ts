@@ -876,7 +876,68 @@ CREATE TRIGGER postings_no_delete BEFORE DELETE ON postings
 BEGIN SELECT RAISE(ABORT, 'postings are immutable'); END;
 `;
 
+const V18_SQL = `
+-- ADR 0014: inventory. Items gain a kind and a damaged-stock disposition
+-- policy; stock is an append-only movement log (levels are always derived);
+-- bills of materials are append-only, effective-dated versions.
+ALTER TABLE items ADD COLUMN kind TEXT NOT NULL DEFAULT 'non_inventory'
+  CHECK (kind IN ('inventory','non_inventory','service'));
+-- JSON array of allowed dispositions; NULL = all of restock/recycle/trash.
+ALTER TABLE items ADD COLUMN dispositions TEXT;
+
+CREATE TABLE stock_movements (
+  movement_seq   INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id        TEXT NOT NULL REFERENCES items(id),
+  kind           TEXT NOT NULL CHECK (kind IN ('adjustment','document','correction','void','damage','disposal','build')),
+  condition      TEXT NOT NULL CHECK (condition IN ('good','damaged')),
+  quantity_milli INTEGER NOT NULL CHECK (quantity_milli != 0),
+  date           TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  at             TEXT NOT NULL,
+  reason         TEXT,
+  source_id      TEXT,
+  disposition    TEXT CHECK (disposition IS NULL OR disposition IN ('restock','recycle','trash'))
+) STRICT;
+
+CREATE INDEX idx_stock_movements_item ON stock_movements(item_id, date);
+
+CREATE TRIGGER stock_movements_no_update BEFORE UPDATE ON stock_movements
+BEGIN SELECT RAISE(ABORT, 'stock movements are immutable'); END;
+
+CREATE TRIGGER stock_movements_no_delete BEFORE DELETE ON stock_movements
+BEGIN SELECT RAISE(ABORT, 'stock movements are immutable'); END;
+
+CREATE TABLE item_boms (
+  bom_seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id             TEXT NOT NULL REFERENCES items(id),
+  effective_from      TEXT NOT NULL,
+  assembly_cost_minor INTEGER NOT NULL DEFAULT 0 CHECK (assembly_cost_minor >= 0),
+  at                  TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX idx_item_boms_item ON item_boms(item_id, effective_from);
+
+CREATE TABLE item_bom_components (
+  bom_seq           INTEGER NOT NULL REFERENCES item_boms(bom_seq),
+  component_no      INTEGER NOT NULL,
+  component_item_id TEXT NOT NULL REFERENCES items(id),
+  quantity_milli    INTEGER NOT NULL CHECK (quantity_milli > 0),
+  PRIMARY KEY (bom_seq, component_no)
+) STRICT;
+
+CREATE TRIGGER item_boms_no_update BEFORE UPDATE ON item_boms
+BEGIN SELECT RAISE(ABORT, 'bills of materials are immutable; append a newer version'); END;
+
+CREATE TRIGGER item_boms_no_delete BEFORE DELETE ON item_boms
+BEGIN SELECT RAISE(ABORT, 'bills of materials are immutable; append a newer version'); END;
+
+CREATE TRIGGER item_bom_components_no_update BEFORE UPDATE ON item_bom_components
+BEGIN SELECT RAISE(ABORT, 'bills of materials are immutable; append a newer version'); END;
+
+CREATE TRIGGER item_bom_components_no_delete BEFORE DELETE ON item_bom_components
+BEGIN SELECT RAISE(ABORT, 'bills of materials are immutable; append a newer version'); END;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL, V18_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

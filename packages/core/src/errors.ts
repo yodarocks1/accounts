@@ -31,7 +31,9 @@ export type LedgerErrorCode =
   | 'APPROVAL_REQUIRED'
   | 'UNKNOWN_TAX_CODE'
   | 'DEPOSIT_REQUIRED'
-  | 'MINIMUM_NOT_MET';
+  | 'MINIMUM_NOT_MET'
+  | 'INSUFFICIENT_STOCK'
+  | 'BOM_CYCLE';
 
 export class LedgerError extends Error {
   constructor(

@@ -137,6 +137,8 @@ const STATUS_BY_CODE: Partial<Record<LedgerErrorCode, number>> = {
   APPROVAL_REQUIRED: 403,
   DEPOSIT_REQUIRED: 409,
   MINIMUM_NOT_MET: 409,
+  INSUFFICIENT_STOCK: 409,
+  BOM_CYCLE: 409,
 };
 
 async function readBody(request: IncomingMessage): Promise<Body> {
@@ -168,10 +170,61 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
         ...(body.cost !== undefined ? { cost: money(body.cost, 'cost') } : {}),
         ...(body.taxCode !== undefined ? { taxCode: str(body.taxCode, 'taxCode') } : {}),
         ...(body.depositPolicy !== undefined ? { depositPolicy: str(body.depositPolicy, 'depositPolicy') as never } : {}),
+        ...(body.kind !== undefined ? { kind: str(body.kind, 'kind') as never } : {}),
+        ...(body.dispositions !== undefined ? { dispositions: body.dispositions as never } : {}),
         ...(body.inStock !== undefined ? { inStock: Boolean(body.inStock) } : {}),
       });
     }
     if (method === 'POST' && id !== undefined && sub === 'stock') return file.setItemStock(id, Boolean(body.inStock));
+    if (method === 'GET' && id !== undefined && sub === 'stock') {
+      return file.stockOnHand(id, query.get('asOf') ?? undefined);
+    }
+    if (method === 'GET' && id !== undefined && sub === 'movements') return file.stockMovements(id);
+    if (method === 'POST' && id !== undefined && sub === 'stock-adjustments') {
+      return file.adjustStock(id, money(body.quantityMilli, 'quantityMilli'), {
+        ...(body.reason !== undefined ? { reason: str(body.reason, 'reason') } : {}),
+        ...(body.date !== undefined ? { date: str(body.date, 'date') } : {}),
+        ...(body.condition !== undefined ? { condition: str(body.condition, 'condition') as never } : {}),
+        ...(body.approvedBy !== undefined ? { approvedBy: str(body.approvedBy, 'approvedBy') } : {}),
+      });
+    }
+    if (method === 'POST' && id !== undefined && sub === 'damage') {
+      return file.markDamaged(id, money(body.quantityMilli, 'quantityMilli'), {
+        ...(body.reason !== undefined ? { reason: str(body.reason, 'reason') } : {}),
+        ...(body.date !== undefined ? { date: str(body.date, 'date') } : {}),
+      });
+    }
+    if (method === 'POST' && id !== undefined && sub === 'dispose') {
+      return file.disposeStock(id, money(body.quantityMilli, 'quantityMilli'), str(body.disposition, 'disposition') as never, {
+        ...(body.reason !== undefined ? { reason: str(body.reason, 'reason') } : {}),
+        ...(body.date !== undefined ? { date: str(body.date, 'date') } : {}),
+        ...(body.approvedBy !== undefined ? { approvedBy: str(body.approvedBy, 'approvedBy') } : {}),
+      });
+    }
+    if (method === 'POST' && id !== undefined && (sub === 'build' || sub === 'break')) {
+      const quantity = money(body.quantityMilli, 'quantityMilli');
+      const options = {
+        ...(body.reason !== undefined ? { reason: str(body.reason, 'reason') } : {}),
+        ...(body.date !== undefined ? { date: str(body.date, 'date') } : {}),
+      };
+      return sub === 'build' ? file.buildAssembly(id, quantity, options) : file.breakAssembly(id, quantity, options);
+    }
+    if (method === 'POST' && id !== undefined && sub === 'bom') {
+      return file.setBom({
+        itemId: id,
+        components: (body.components as Body[]).map((raw) => ({
+          componentItemId: str(raw.componentItemId, 'componentItemId'),
+          quantityMilli: money(raw.quantityMilli, 'quantityMilli'),
+        })),
+        ...(body.effectiveFrom !== undefined ? { effectiveFrom: str(body.effectiveFrom, 'effectiveFrom') } : {}),
+        ...(optMoney(body.assemblyCostMinor, 'assemblyCostMinor') !== undefined
+          ? { assemblyCostMinor: optMoney(body.assemblyCostMinor, 'assemblyCostMinor')! }
+          : {}),
+      });
+    }
+    if (method === 'GET' && id !== undefined && sub === 'bom') {
+      return file.bomAt(id, query.get('asOf') ?? new Date().toISOString().slice(0, 10)) ?? null;
+    }
     if (method === 'POST' && id !== undefined && sub === 'prices') {
       const effectiveFrom = str(body.effectiveFrom, 'effectiveFrom');
       const unitPrice = money(body.unitPrice, 'unitPrice');

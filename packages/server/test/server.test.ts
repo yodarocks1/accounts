@@ -214,6 +214,37 @@ describe('document API (Tier 3)', () => {
     expect(denied.status).toBe(422);
   });
 
+  it('inventory: stock ledger, damage, and BOMs over HTTP (ADR 0014)', async () => {
+    const piece = (await post('/items', {
+      name: 'Piece', currency: 'USD', unitPrice: '300', cost: '100', kind: 'inventory',
+    })).json as { id: string };
+    const box = (await post('/items', {
+      name: 'Box', currency: 'USD', unitPrice: '3000', kind: 'inventory', dispositions: ['recycle', 'trash'],
+    })).json as { id: string };
+
+    await post(`/items/${box.id}/bom`, {
+      assemblyCostMinor: '30',
+      components: [{ componentItemId: piece.id, quantityMilli: '12000' }],
+    });
+    const bom = (await get(`/items/${box.id}/bom`)).json as { assemblyCostMinor: string };
+    expect(bom.assemblyCostMinor).toBe('30');
+
+    await post(`/items/${piece.id}/stock-adjustments`, { quantityMilli: '30000', reason: 'initial count' });
+    await post(`/items/${box.id}/build`, { quantityMilli: '2000' });
+    expect((await get(`/items/${box.id}/stock`)).json).toEqual({ goodMilli: '2000', damagedMilli: '0' });
+    expect((await get(`/items/${piece.id}/stock`)).json).toEqual({ goodMilli: '6000', damagedMilli: '0' });
+
+    await post(`/items/${box.id}/damage`, { quantityMilli: '1000', reason: 'dropped' });
+    const restock = await post(`/items/${box.id}/dispose`, { quantityMilli: '1000', disposition: 'restock' });
+    expect(restock.status).toBe(422); // policy forbids restock for this item
+    await post(`/items/${box.id}/dispose`, { quantityMilli: '1000', disposition: 'trash' });
+    expect((await get(`/items/${box.id}/stock`)).json).toEqual({ goodMilli: '1000', damagedMilli: '0' });
+
+    const overbuild = await post(`/items/${box.id}/build`, { quantityMilli: '9000' });
+    expect(overbuild.status).toBe(409);
+    expect(overbuild.json.error).toBe('INSUFFICIENT_STOCK');
+  });
+
   it('gated actions surface 403 APPROVAL_REQUIRED', async () => {
     await post('/policies/approval', { actions: ['void_document'] });
     const item = (await post('/items', { name: 'W', currency: 'USD', unitPrice: '100' })).json as { id: string };

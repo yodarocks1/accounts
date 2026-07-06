@@ -138,6 +138,24 @@ export {
 } from './statement.js';
 export { type Party, type NewParty, type PartyName } from './parties.js';
 export {
+  ITEM_KINDS,
+  type ItemKind,
+  DISPOSITIONS,
+  type Disposition,
+  type StockCondition,
+  type StockMovementKind,
+  type StockMovement,
+  type StockLevel,
+  type StockEffect,
+  type BomComponent,
+  type ItemBom,
+  type NewItemBom,
+  sumStock,
+  stockEffects,
+  diffStockEffects,
+  componentNeed,
+} from './inventory.js';
+export {
   type ShippingEstimate,
   type NewShippingEstimate,
   type SupplierItemTerm,

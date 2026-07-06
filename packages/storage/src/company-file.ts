@@ -94,6 +94,22 @@ import {
   type Statement,
   type NewCashTransaction,
   type TrialBalance,
+  componentNeed,
+  diffStockEffects,
+  DISPOSITIONS,
+  ITEM_KINDS,
+  stockEffects,
+  type Disposition,
+  type ItemBom,
+  type ItemKind,
+  type NewItemBom,
+  type StockCondition,
+  type StockEffect,
+  type StockLevel,
+  type StockMovement,
+  type StockMovementKind,
+  divRoundHalf,
+  QUANTITY_SCALE,
   type Payment,
   type NewPayment,
   type CreditApplication,
@@ -544,18 +560,38 @@ export class CompanyFile implements ItemCatalog {
     if (!input.name.trim()) {
       throw new LedgerError('UNKNOWN_ITEM', 'Item name must not be empty');
     }
+    const kind = input.kind ?? 'non_inventory';
+    if (!ITEM_KINDS.includes(kind)) {
+      throw new LedgerError('INVALID_DOCUMENT', `Invalid item kind: ${String(kind)}`);
+    }
+    for (const disposition of input.dispositions ?? []) {
+      if (!DISPOSITIONS.includes(disposition)) {
+        throw new LedgerError('INVALID_DOCUMENT', `Invalid disposition: ${String(disposition)}`);
+      }
+    }
     const item: Item = {
       id: randomUUID(),
       name: input.name.trim(),
       currency: input.currency,
       taxCode: input.taxCode ?? null,
       depositPolicy: input.depositPolicy ?? 'never',
+      kind,
+      dispositions: input.dispositions ?? [...DISPOSITIONS],
       inStock: input.inStock ?? true,
     };
     this.db.transaction(() => {
       this.db
-        .prepare(`INSERT INTO items (id, name, currency, tax_code, deposit_policy, in_stock) VALUES (?, ?, ?, ?, ?, ?)`)
-        .run(item.id, item.name, item.currency, item.taxCode, item.depositPolicy, item.inStock ? 1 : 0);
+        .prepare(`INSERT INTO items (id, name, currency, tax_code, deposit_policy, in_stock, kind, dispositions) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(
+          item.id,
+          item.name,
+          item.currency,
+          item.taxCode,
+          item.depositPolicy,
+          item.inStock ? 1 : 0,
+          item.kind,
+          input.dispositions !== undefined ? JSON.stringify(input.dispositions) : null,
+        );
       this.insertPrice(item.id, 'sale', input.unitPrice, input.effectiveFrom ?? '0000-01-01');
       if (input.cost !== undefined) {
         this.insertPrice(item.id, 'cost', input.cost, input.effectiveFrom ?? '0000-01-01');
@@ -573,16 +609,25 @@ export class CompanyFile implements ItemCatalog {
       tax_code: string | null;
       deposit_policy: DepositPolicy;
       in_stock: bigint;
+      kind: ItemKind;
+      dispositions: string | null;
     }
     const row = this.db.prepare(`SELECT * FROM items WHERE id = ?`).get(id) as ItemRow | undefined;
     if (!row) return undefined;
+    // inStock: manual for non_inventory, derived for inventory, true for services.
+    const inStock =
+      row.kind === 'inventory'
+        ? this.stockOnHand(id).goodMilli > 0n
+        : row.kind === 'service' || row.in_stock === 1n;
     return {
       id: row.id,
       name: row.name,
       currency: row.currency,
       taxCode: row.tax_code,
       depositPolicy: row.deposit_policy,
-      inStock: row.in_stock === 1n,
+      kind: row.kind,
+      dispositions: row.dispositions !== null ? (JSON.parse(row.dispositions) as Disposition[]) : [...DISPOSITIONS],
+      inStock,
     };
   }
 
@@ -591,10 +636,17 @@ export class CompanyFile implements ItemCatalog {
     return rows.map((row) => this.getItem(row.id)!);
   }
 
-  /** Manual stock flag until inventory tracking lands (ADR 0010 part 3). */
+  /** Manual stock flag for non_inventory items (ADR 0010 part 3 / ADR 0014). */
   setItemStock(itemId: string, inStock: boolean): Item {
-    if (!this.getItem(itemId)) {
+    const item = this.getItem(itemId);
+    if (!item) {
       throw new LedgerError('UNKNOWN_ITEM', `No such item: ${itemId}`);
+    }
+    if (item.kind === 'inventory') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Stock of inventory items is tracked; record an adjustment instead');
+    }
+    if (item.kind === 'service') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Service items have no stock');
     }
     this.db.transaction(() => {
       this.db.prepare(`UPDATE items SET in_stock = ? WHERE id = ?`).run(inStock ? 1 : 0, itemId);
@@ -767,7 +819,27 @@ export class CompanyFile implements ItemCatalog {
   }
 
   costAt(itemId: string, date: string): bigint | undefined {
-    return this.lookupPrice(itemId, 'cost', date);
+    return this.costAtInternal(itemId, date, new Set());
+  }
+
+  /** Explicit cost wins; else additive BOM derivation, recursive (ADR 0014). */
+  private costAtInternal(itemId: string, date: string, visiting: Set<string>): bigint | undefined {
+    const own = this.lookupPrice(itemId, 'cost', date);
+    if (own !== undefined) return own;
+    const bom = this.bomAt(itemId, date);
+    if (!bom) return undefined;
+    if (visiting.has(itemId)) {
+      throw new LedgerError('BOM_CYCLE', `Bill of materials for ${itemId} contains itself`);
+    }
+    visiting.add(itemId);
+    let total = bom.assemblyCostMinor;
+    for (const component of bom.components) {
+      const unit = this.costAtInternal(component.componentItemId, date, visiting);
+      if (unit === undefined) return undefined;
+      total += divRoundHalf(component.quantityMilli * unit, QUANTITY_SCALE);
+    }
+    visiting.delete(itemId);
+    return total;
   }
 
   private lookupPrice(itemId: string, kind: PriceKind, date: string): bigint | undefined {
@@ -1301,6 +1373,19 @@ export class CompanyFile implements ItemCatalog {
         lines,
       });
       this.audit('document.revised', 'document', id, { kind, reason: changes.reason ?? null });
+      if (document.status === 'sent') {
+        // ADR 0014: quantity-changing corrections keep stock consistent.
+        const getItem = (itemId: string) => this.getItem(itemId);
+        this.applyStockEffects(
+          diffStockEffects(
+            stockEffects(document.type, previous.lines, getItem),
+            stockEffects(document.type, lines, getItem),
+          ),
+          'correction',
+          date,
+          id,
+        );
+      }
       this.repostDocumentIfPosted(id);
     })();
     return this.viewDocument(id);
@@ -1626,6 +1711,13 @@ export class CompanyFile implements ItemCatalog {
     this.db.transaction(() => {
       this.db.prepare(`UPDATE documents SET status = 'sent' WHERE id = ?`).run(id);
       this.audit('document.sent', 'document', id, {});
+      // ADR 0014: sending/approving moves stock for inventory items.
+      this.applyStockEffects(
+        stockEffects(document.type, current.lines, (itemId) => this.getItem(itemId)),
+        'document',
+        current.date,
+        id,
+      );
       this.postDocumentIfConfigured(this.requireDocumentRecord(id));
       if (document.type === 'invoice') {
         this.transferDeposits(id);
@@ -1714,9 +1806,20 @@ export class CompanyFile implements ItemCatalog {
       throw new LedgerError('INVALID_STATUS', 'Document is already void');
     }
     const voidCurrent = document.revisions[document.revisions.length - 1]!;
+    const wasSent = document.status === 'sent';
     this.db.transaction(() => {
       this.db.prepare(`UPDATE documents SET status = 'void' WHERE id = ?`).run(id);
       this.audit('document.voided', 'document', id, {});
+      if (wasSent) {
+        // ADR 0014: voiding a sent document puts its stock back.
+        const effects = stockEffects(document.type, voidCurrent.lines, (itemId) => this.getItem(itemId));
+        this.applyStockEffects(
+          effects.map((effect) => ({ ...effect, deltaMilli: -effect.deltaMilli })),
+          'void',
+          voidCurrent.date,
+          id,
+        );
+      }
       this.reversePostingIfActive('document', id, voidCurrent.date, `Reversal: ${document.number} voided`);
     })();
     return this.viewDocument(id);
@@ -1897,6 +2000,315 @@ export class CompanyFile implements ItemCatalog {
         line.taxPercentMilli,
       );
     });
+  }
+
+  // ── Inventory (ADR 0014) ─────────────────────────────────────────────────
+
+  /** Derived on-hand levels, as-of any date; never stored (ADR 0014). */
+  stockOnHand(itemId: string, asOf?: string): StockLevel {
+    if (!this.db.prepare(`SELECT 1 FROM items WHERE id = ?`).get(itemId)) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${itemId}`);
+    }
+    const row = this.db
+      .prepare(
+        `SELECT coalesce(sum(CASE WHEN condition = 'good' THEN quantity_milli END), 0) AS good,
+                coalesce(sum(CASE WHEN condition = 'damaged' THEN quantity_milli END), 0) AS damaged
+         FROM stock_movements WHERE item_id = ? AND (? IS NULL OR date <= ?)`,
+      )
+      .get(itemId, asOf ?? null, asOf ?? null) as { good: bigint; damaged: bigint };
+    return { goodMilli: row.good, damagedMilli: row.damaged };
+  }
+
+  stockMovements(itemId: string): StockMovement[] {
+    interface MovementRow {
+      movement_seq: bigint;
+      item_id: string;
+      kind: StockMovementKind;
+      condition: StockCondition;
+      quantity_milli: bigint;
+      date: string;
+      at: string;
+      reason: string | null;
+      source_id: string | null;
+      disposition: Disposition | null;
+    }
+    const rows = this.db
+      .prepare(`SELECT * FROM stock_movements WHERE item_id = ? ORDER BY movement_seq`)
+      .all(itemId) as MovementRow[];
+    return rows.map((row) => ({
+      movementSeq: Number(row.movement_seq),
+      itemId: row.item_id,
+      kind: row.kind,
+      condition: row.condition,
+      quantityMilli: row.quantity_milli,
+      date: row.date,
+      at: row.at,
+      reason: row.reason,
+      sourceId: row.source_id,
+      disposition: row.disposition,
+    }));
+  }
+
+  private requireInventoryItem(itemId: string): Item {
+    const item = this.getItem(itemId);
+    if (!item) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${itemId}`);
+    }
+    if (item.kind !== 'inventory') {
+      throw new LedgerError('INVALID_DOCUMENT', `${item.name} is ${item.kind.replace('_', '-')}; it has no tracked stock`);
+    }
+    return item;
+  }
+
+  private insertMovement(
+    itemId: string,
+    kind: StockMovementKind,
+    condition: StockCondition,
+    quantityMilli: bigint,
+    date: string,
+    options?: { reason?: string; sourceId?: string; disposition?: Disposition },
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO stock_movements (item_id, kind, condition, quantity_milli, date, at, reason, source_id, disposition)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        itemId,
+        kind,
+        condition,
+        quantityMilli,
+        date,
+        new Date().toISOString(),
+        options?.reason ?? null,
+        options?.sourceId ?? null,
+        options?.disposition ?? null,
+      );
+  }
+
+  private applyStockEffects(effects: readonly StockEffect[], kind: StockMovementKind, date: string, sourceId: string): void {
+    for (const effect of effects) {
+      this.insertMovement(effect.itemId, kind, effect.condition, effect.deltaMilli, date, { sourceId });
+    }
+  }
+
+  /** Manual signed count; negative = shrinkage write-off (approvable). */
+  adjustStock(
+    itemId: string,
+    quantityMilli: bigint,
+    options?: { reason?: string; date?: string; condition?: StockCondition; approvedBy?: string },
+  ): StockLevel {
+    this.requireInventoryItem(itemId);
+    if (quantityMilli === 0n) {
+      throw new LedgerError('INVALID_QUANTITY', 'Adjustments must move a nonzero quantity');
+    }
+    if (quantityMilli < 0n) {
+      this.requireApproval('stock_write_off', options?.approvedBy);
+    }
+    this.db.transaction(() => {
+      this.insertMovement(itemId, 'adjustment', options?.condition ?? 'good', quantityMilli, options?.date ?? new Date().toISOString().slice(0, 10), {
+        ...(options?.reason !== undefined ? { reason: options.reason } : {}),
+      });
+      this.audit('stock.adjusted', 'item', itemId, { quantityMilli: quantityMilli.toString(), reason: options?.reason ?? null });
+    })();
+    return this.stockOnHand(itemId);
+  }
+
+  /** Move good stock into the damaged bucket (ADR 0014 part 2). */
+  markDamaged(itemId: string, quantityMilli: bigint, options?: { reason?: string; date?: string }): StockLevel {
+    this.requireInventoryItem(itemId);
+    if (quantityMilli <= 0n) {
+      throw new LedgerError('INVALID_QUANTITY', 'Damaged quantities must be positive');
+    }
+    const onHand = this.stockOnHand(itemId);
+    if (quantityMilli > onHand.goodMilli) {
+      throw new LedgerError('INSUFFICIENT_STOCK', `Cannot damage ${quantityMilli} (milli); ${onHand.goodMilli} good on hand`);
+    }
+    const date = options?.date ?? new Date().toISOString().slice(0, 10);
+    const reason = options?.reason !== undefined ? { reason: options.reason } : {};
+    this.db.transaction(() => {
+      this.insertMovement(itemId, 'damage', 'good', -quantityMilli, date, reason);
+      this.insertMovement(itemId, 'damage', 'damaged', quantityMilli, date, reason);
+      this.audit('stock.damaged', 'item', itemId, { quantityMilli: quantityMilli.toString(), reason: options?.reason ?? null });
+    })();
+    return this.stockOnHand(itemId);
+  }
+
+  /** Resolve damaged stock per the item's policy (ADR 0014 part 2). */
+  disposeStock(
+    itemId: string,
+    quantityMilli: bigint,
+    disposition: Disposition,
+    options?: { reason?: string; date?: string; approvedBy?: string },
+  ): StockLevel {
+    const item = this.requireInventoryItem(itemId);
+    if (!item.dispositions.includes(disposition)) {
+      throw new LedgerError('INVALID_DOCUMENT', `${item.name} does not allow the "${disposition}" disposition`);
+    }
+    if (quantityMilli <= 0n) {
+      throw new LedgerError('INVALID_QUANTITY', 'Disposal quantities must be positive');
+    }
+    const onHand = this.stockOnHand(itemId);
+    if (quantityMilli > onHand.damagedMilli) {
+      throw new LedgerError('INSUFFICIENT_STOCK', `Cannot dispose ${quantityMilli} (milli); ${onHand.damagedMilli} damaged on hand`);
+    }
+    if (disposition !== 'restock') {
+      this.requireApproval('stock_write_off', options?.approvedBy);
+    }
+    const date = options?.date ?? new Date().toISOString().slice(0, 10);
+    const extra = { disposition, ...(options?.reason !== undefined ? { reason: options.reason } : {}) };
+    this.db.transaction(() => {
+      this.insertMovement(itemId, 'disposal', 'damaged', -quantityMilli, date, extra);
+      if (disposition === 'restock') {
+        this.insertMovement(itemId, 'disposal', 'good', quantityMilli, date, extra);
+      }
+      this.audit('stock.disposed', 'item', itemId, { quantityMilli: quantityMilli.toString(), disposition });
+    })();
+    return this.stockOnHand(itemId);
+  }
+
+  // ── Bills of materials (ADR 0014 part 3) ─────────────────────────────────
+
+  /** Append a BOM version; earlier documents keep their cost snapshots. */
+  setBom(input: NewItemBom): ItemBom {
+    if (!this.getItem(input.itemId)) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${input.itemId}`);
+    }
+    if (input.components.length === 0) {
+      throw new LedgerError('INVALID_DOCUMENT', 'A bill of materials needs at least one component');
+    }
+    if ((input.assemblyCostMinor ?? 0n) < 0n) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Assembly cost must not be negative');
+    }
+    const seen = new Set<string>();
+    for (const component of input.components) {
+      if (!this.getItem(component.componentItemId)) {
+        throw new LedgerError('UNKNOWN_ITEM', `No such item: ${component.componentItemId}`);
+      }
+      if (component.componentItemId === input.itemId || seen.has(component.componentItemId)) {
+        throw new LedgerError('INVALID_DOCUMENT', `Duplicate or self component: ${component.componentItemId}`);
+      }
+      seen.add(component.componentItemId);
+      if (component.quantityMilli <= 0n) {
+        throw new LedgerError('INVALID_QUANTITY', 'Component quantities must be positive');
+      }
+    }
+    const bom: ItemBom = {
+      bomSeq: 0, // assigned below
+      itemId: input.itemId,
+      effectiveFrom: input.effectiveFrom ?? '0000-01-01',
+      assemblyCostMinor: input.assemblyCostMinor ?? 0n,
+      components: input.components.map((component) => ({ ...component })),
+      at: new Date().toISOString(),
+    };
+    // Reject cycles up front (ADR 0014 part 3).
+    const walk = (itemId: string, path: Set<string>): void => {
+      const next = itemId === input.itemId ? bom : this.bomAt(itemId, '9999-12-31');
+      if (!next) return;
+      for (const component of next.components) {
+        if (component.componentItemId === input.itemId || path.has(component.componentItemId)) {
+          throw new LedgerError('BOM_CYCLE', `Adding this bill of materials would make ${input.itemId} contain itself`);
+        }
+        walk(component.componentItemId, new Set([...path, component.componentItemId]));
+      }
+    };
+    walk(input.itemId, new Set());
+    let seq = 0;
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(`INSERT INTO item_boms (item_id, effective_from, assembly_cost_minor, at) VALUES (?, ?, ?, ?)`)
+        .run(bom.itemId, bom.effectiveFrom, bom.assemblyCostMinor, bom.at);
+      seq = Number(result.lastInsertRowid);
+      const insertComponent = this.db.prepare(
+        `INSERT INTO item_bom_components (bom_seq, component_no, component_item_id, quantity_milli) VALUES (?, ?, ?, ?)`,
+      );
+      bom.components.forEach((component, index) => {
+        insertComponent.run(seq, index + 1, component.componentItemId, component.quantityMilli);
+      });
+      this.audit('item.bom_set', 'item', bom.itemId, { components: bom.components.length, effectiveFrom: bom.effectiveFrom });
+    })();
+    return { ...bom, bomSeq: seq };
+  }
+
+  /** The BOM version effective on `date`, if any. */
+  bomAt(itemId: string, date: string): ItemBom | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT bom_seq AS bomSeq, effective_from AS effectiveFrom, assembly_cost_minor AS assemblyCostMinor, at
+         FROM item_boms WHERE item_id = ? AND effective_from <= ?
+         ORDER BY effective_from DESC, bom_seq DESC LIMIT 1`,
+      )
+      .get(itemId, date) as { bomSeq: bigint; effectiveFrom: string; assemblyCostMinor: bigint; at: string } | undefined;
+    if (!row) return undefined;
+    const components = (
+      this.db
+        .prepare(`SELECT component_item_id AS componentItemId, quantity_milli AS quantityMilli FROM item_bom_components WHERE bom_seq = ? ORDER BY component_no`)
+        .all(Number(row.bomSeq)) as { componentItemId: string; quantityMilli: bigint }[]
+    ).map((component) => ({ ...component }));
+    return {
+      bomSeq: Number(row.bomSeq),
+      itemId,
+      effectiveFrom: row.effectiveFrom,
+      assemblyCostMinor: row.assemblyCostMinor,
+      components,
+      at: row.at,
+    };
+  }
+
+  /** Consume components, produce the assembly (ADR 0014 part 3). */
+  buildAssembly(itemId: string, quantityMilli: bigint, options?: { date?: string; reason?: string }): StockLevel {
+    return this.moveAssembly(itemId, quantityMilli, 1n, options);
+  }
+
+  /** The exact inverse: a full box becomes its pieces again. */
+  breakAssembly(itemId: string, quantityMilli: bigint, options?: { date?: string; reason?: string }): StockLevel {
+    return this.moveAssembly(itemId, quantityMilli, -1n, options);
+  }
+
+  private moveAssembly(
+    itemId: string,
+    quantityMilli: bigint,
+    sign: 1n | -1n,
+    options?: { date?: string; reason?: string },
+  ): StockLevel {
+    const item = this.requireInventoryItem(itemId);
+    if (quantityMilli <= 0n) {
+      throw new LedgerError('INVALID_QUANTITY', 'Assembly quantities must be positive');
+    }
+    const date = options?.date ?? new Date().toISOString().slice(0, 10);
+    const bom = this.bomAt(itemId, date);
+    if (!bom) {
+      throw new LedgerError('INVALID_DOCUMENT', `${item.name} has no bill of materials`);
+    }
+    if (sign === -1n && this.stockOnHand(itemId).goodMilli < quantityMilli) {
+      throw new LedgerError('INSUFFICIENT_STOCK', `Cannot break ${quantityMilli} (milli); only ${this.stockOnHand(itemId).goodMilli} on hand`);
+    }
+    const inventoryComponents = bom.components.filter(
+      (component) => this.getItem(component.componentItemId)?.kind === 'inventory',
+    );
+    if (sign === 1n) {
+      for (const component of inventoryComponents) {
+        const need = componentNeed(component, quantityMilli);
+        const onHand = this.stockOnHand(component.componentItemId).goodMilli;
+        if (onHand < need) {
+          throw new LedgerError(
+            'INSUFFICIENT_STOCK',
+            `Building needs ${need} (milli) of ${component.componentItemId}; ${onHand} on hand`,
+          );
+        }
+      }
+    }
+    const reason = options?.reason !== undefined ? { reason: options.reason } : {};
+    this.db.transaction(() => {
+      for (const component of inventoryComponents) {
+        this.insertMovement(component.componentItemId, 'build', 'good', -sign * componentNeed(component, quantityMilli), date, reason);
+      }
+      this.insertMovement(itemId, 'build', 'good', sign * quantityMilli, date, reason);
+      this.audit(sign === 1n ? 'stock.assembled' : 'stock.disassembled', 'item', itemId, {
+        quantityMilli: quantityMilli.toString(),
+      });
+    })();
+    return this.stockOnHand(itemId);
   }
 
   // ── Purchase side (ADR 0011) ─────────────────────────────────────────────

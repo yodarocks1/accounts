@@ -8,6 +8,7 @@ import {
   type Account,
   type DepositPolicy,
   type DocumentType,
+  type ItemKind,
   type NewJournalLine,
 } from '@accounts/core';
 import { CompanyFile } from '@accounts/storage';
@@ -25,7 +26,8 @@ Usage:
   accounts trial-balance <file> [--as-of YYYY-MM-DD]
 
 Document layer:
-  accounts item add <file> --name <name> --price <amount> [--cost <amount>] [--tax-code <code>] [--deposit-policy <never|always|when_out_of_stock|special_order>]
+  accounts item add <file> --name <name> --price <amount> [--cost <amount>] [--tax-code <code>] [--deposit-policy <never|always|when_out_of_stock|special_order>] [--kind <inventory|non_inventory|service>]
+  accounts item stock <file> <item-id> [--as-of YYYY-MM-DD]
   accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order|bill|vendor_credit>]
   accounts doc show <file> <document-id>
   accounts doc send <file> <document-id> [--override-deposit] [--override-minimum] [--approved-by <who>]
@@ -307,6 +309,7 @@ function cmdTrialBalance(args: string[]): string {
 
 function cmdItem(args: string[]): string {
   const [sub, ...rest] = args;
+  if (sub === 'stock') return cmdItemStock(rest);
   if (sub !== 'add') fail(`Unknown subcommand: item ${sub ?? ''}\n\n${USAGE}`);
   const { values, positionals } = parseArgs({
     args: rest,
@@ -318,6 +321,7 @@ function cmdItem(args: string[]): string {
       currency: { type: 'string' },
       'tax-code': { type: 'string' },
       'deposit-policy': { type: 'string' },
+      kind: { type: 'string' },
     },
   });
   const file = CompanyFile.open(requirePath(positionals));
@@ -333,8 +337,29 @@ function cmdItem(args: string[]): string {
       ...(values['deposit-policy'] !== undefined
         ? { depositPolicy: values['deposit-policy'] as DepositPolicy }
         : {}),
+      ...(values.kind !== undefined ? { kind: values.kind as ItemKind } : {}),
     });
     return `Created item ${item.name} (${item.id})`;
+  } finally {
+    file.close();
+  }
+}
+
+function cmdItemStock(args: string[]): string {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: { 'as-of': { type: 'string' } },
+  });
+  const file = CompanyFile.open(requirePath(positionals));
+  try {
+    const itemId = positionals[1];
+    if (!itemId) fail('item stock requires an item id');
+    const item = file.getItem(itemId);
+    if (!item) fail(`No such item: ${itemId}`);
+    if (item.kind !== 'inventory') return `${item.name}: ${item.kind.replace('_', '-')} (no tracked stock)`;
+    const level = file.stockOnHand(itemId, values['as-of']);
+    return `${item.name}: ${formatQuantity(level.goodMilli)} good, ${formatQuantity(level.damagedMilli)} damaged on hand`;
   } finally {
     file.close();
   }
