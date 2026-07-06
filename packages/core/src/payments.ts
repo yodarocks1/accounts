@@ -42,17 +42,19 @@ export interface NewPayment {
   applications?: NewApplication[];
 }
 
-/** A credit source: a received payment or an account-settled credit memo. */
-export type ApplicationSourceKind = 'payment' | 'credit_memo';
+/** A credit source: a payment or an account-settled credit memo / vendor credit. */
+export type ApplicationSourceKind = 'payment' | 'credit_memo' | 'vendor_credit';
 
 export interface CreditApplication {
   readonly applicationSeq: number;
   readonly sourceKind: ApplicationSourceKind;
   readonly sourceId: string;
-  /** Target document: an invoice, or a sent sales order (deposit). */
-  readonly invoiceId: string;
+  /** Target: an invoice, sent sales order (deposit), or bill; null for refunds. */
+  readonly invoiceId: string | null;
   /** Sales orders only: the specific line this prepays (ADR 0010 part 3). */
   readonly lineId: string | null;
+  /** True when this record pays out unapplied credit instead (ADR 0013). */
+  readonly refund: boolean;
   readonly amountMinor: bigint;
   readonly date: string;
   readonly at: string;
@@ -79,6 +81,7 @@ export function activeApplications(applications: readonly CreditApplication[]): 
   );
 }
 
+/** Everything drawn from a source: applications plus refunds (ADR 0013). */
 export function appliedFromSource(
   applications: readonly CreditApplication[],
   sourceKind: ApplicationSourceKind,
@@ -87,6 +90,23 @@ export function appliedFromSource(
 ): bigint {
   let total = 0n;
   for (const application of activeApplications(applications)) {
+    if (application.sourceKind !== sourceKind || application.sourceId !== sourceId) continue;
+    if (asOf !== undefined && application.date > asOf) continue;
+    total += application.amountMinor;
+  }
+  return total;
+}
+
+/** Just the refunded portion of a source (ADR 0013). */
+export function refundedFromSource(
+  applications: readonly CreditApplication[],
+  sourceKind: ApplicationSourceKind,
+  sourceId: string,
+  asOf?: string,
+): bigint {
+  let total = 0n;
+  for (const application of activeApplications(applications)) {
+    if (!application.refund) continue;
     if (application.sourceKind !== sourceKind || application.sourceId !== sourceId) continue;
     if (asOf !== undefined && application.date > asOf) continue;
     total += application.amountMinor;

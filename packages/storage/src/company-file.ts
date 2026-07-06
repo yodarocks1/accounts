@@ -92,6 +92,7 @@ import {
   type SpecialRateSuggestion,
   type AgingRule,
   type Statement,
+  type NewCashTransaction,
   type TrialBalance,
   type Payment,
   type NewPayment,
@@ -1094,18 +1095,18 @@ export class CompanyFile implements ItemCatalog {
     }
   }
 
-  /** Cumulative quantity already returned against a purchase line (SQL). */
-  private priorReturnedMilli(documentId: string, lineId: string): bigint {
+  /** Cumulative quantity already credited against a line by this credit type (SQL). */
+  private priorReturnedMilli(documentId: string, lineId: string, creditType: DocumentType = 'credit_memo'): bigint {
     const row = this.db
       .prepare(
         `SELECT coalesce(sum(l.quantity_milli), 0) AS total
          FROM documents d
          JOIN document_revision_lines l ON l.document_id = d.id
            AND l.revision_no = (SELECT max(revision_no) FROM document_revisions WHERE document_id = d.id)
-         WHERE d.type = 'credit_memo' AND d.status != 'void'
+         WHERE d.type = ? AND d.status != 'void'
            AND l.source_document_id = ? AND l.source_line_id = ?`,
       )
-      .get(documentId, lineId) as { total: bigint };
+      .get(creditType, documentId, lineId) as { total: bigint };
     return row.total;
   }
 
@@ -1122,8 +1123,8 @@ export class CompanyFile implements ItemCatalog {
     if (input.number !== undefined && !input.number.trim()) {
       throw new LedgerError('INVALID_DOCUMENT', 'Document number must not be empty');
     }
-    if (input.settlement !== undefined && input.type !== 'credit_memo') {
-      throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
+    if (input.settlement !== undefined && input.type !== 'credit_memo' && input.type !== 'vendor_credit') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos and vendor credits take a settlement mode');
     }
     const purchase = isPurchaseType(input.type);
     const customer = this.resolveCustomer(input);
@@ -1151,11 +1152,11 @@ export class CompanyFile implements ItemCatalog {
     }
     validateRevisionContent({ date: input.date, lines, customerName: customer.customerName });
     this.requireBelowCostApproval(input.type, input.date, lines, input.approvedBy);
-    if (input.type === 'credit_memo') {
+    if (input.type === 'credit_memo' || input.type === 'vendor_credit') {
       validateReturnQuantities(
         lines,
         (documentId, lineId) => this.sourceLineFor(documentId, lineId),
-        (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
+        (documentId, lineId) => this.priorReturnedMilli(documentId, lineId, input.type),
       );
     }
     if (input.type === 'purchase_order') {
@@ -1177,7 +1178,9 @@ export class CompanyFile implements ItemCatalog {
             input.sourceDocumentId ?? null,
             inherited.includes('with corrections') ? 1 : 0,
             inherited.includes('with substitutions') ? 1 : 0,
-            input.type === 'credit_memo' ? (input.settlement ?? 'account') : null,
+            input.type === 'credit_memo' || input.type === 'vendor_credit'
+              ? (input.settlement ?? 'account')
+              : null,
             customer.partyId,
           );
       } catch (error) {
@@ -1268,12 +1271,12 @@ export class CompanyFile implements ItemCatalog {
       this.validatePurchaseLinks(lines, id);
     }
     this.requireBelowCostApproval(document.type, date, lines, changes.approvedBy);
-    if (document.type === 'credit_memo' && changes.lines !== undefined) {
+    if ((document.type === 'credit_memo' || document.type === 'vendor_credit') && changes.lines !== undefined) {
       validateReturnQuantities(
         lines,
         (documentId, lineId) => this.sourceLineFor(documentId, lineId),
         (documentId, lineId) =>
-          this.priorReturnedMilli(documentId, lineId) -
+          this.priorReturnedMilli(documentId, lineId, document.type) -
           previous.lines
             .filter((line) => line.sourceDocumentId === documentId && line.sourceLineId === lineId)
             .reduce((sum, line) => sum + line.quantityMilli, 0n),
@@ -1405,6 +1408,81 @@ export class CompanyFile implements ItemCatalog {
       })),
     );
     return computeStatement(pairs, this.listPayments(), this.listApplications(), query, asOf, rules);
+  }
+
+  /** What we owe a supplier, aged like a customer statement (ADR 0013). */
+  supplierStatement(query: CustomerQuery, asOf: string, rules?: readonly AgingRule[]): Statement {
+    const pairs = ['bill', 'vendor_credit'].flatMap((type) =>
+      this.listDocumentRecords(type as DocumentType).map((record) => ({
+        record,
+        closures: this.lineClosures(record.id),
+      })),
+    );
+    return computeStatement(pairs, this.listPayments(), this.listApplications(), query, asOf, rules, 'supplier');
+  }
+
+  supplierStatementForParty(partyId: string, asOf: string, rules?: readonly AgingRule[]): Statement {
+    const party = this.requireParty(partyId);
+    return this.supplierStatement(
+      {
+        partyId,
+        customerName: party.name,
+        ...(party.accountNumber !== null ? { accountNumber: party.accountNumber } : {}),
+      },
+      asOf,
+      rules,
+    );
+  }
+
+  /** Cash sale (ADR 0013): invoice at Net 0, sent, and paid in full, atomically. */
+  recordSalesReceipt(input: NewCashTransaction): { document: DocumentView; payment: Payment | null } {
+    return this.recordCashTransaction('invoice', 'in', input);
+  }
+
+  /** Cash expense (ADR 0013): bill approved and paid in one motion. */
+  recordExpense(input: NewCashTransaction): { document: DocumentView; payment: Payment | null } {
+    return this.recordCashTransaction('bill', 'out', input);
+  }
+
+  private recordCashTransaction(
+    type: 'invoice' | 'bill',
+    direction: 'in' | 'out',
+    input: NewCashTransaction,
+  ): { document: DocumentView; payment: Payment | null } {
+    let document!: DocumentView;
+    let payment: Payment | null = null;
+    this.db.transaction(() => {
+      const view = this.createDocument({
+        type,
+        date: input.date,
+        lines: input.lines,
+        termsDays: 0,
+        ...(input.number !== undefined ? { number: input.number } : {}),
+        ...(input.customerName !== undefined ? { customerName: input.customerName } : {}),
+        ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+        ...(input.partyId !== undefined ? { partyId: input.partyId } : {}),
+        ...(input.poNumber !== undefined ? { poNumber: input.poNumber } : {}),
+        ...(input.memo !== undefined ? { memo: input.memo } : {}),
+        ...(input.taxExempt !== undefined ? { taxExempt: input.taxExempt } : {}),
+        ...(input.approvedBy !== undefined ? { approvedBy: input.approvedBy } : {}),
+      });
+      this.sendDocument(view.id);
+      if (view.total > 0n) {
+        payment = this.recordPayment({
+          direction,
+          date: input.date,
+          customerName: view.current.customerName,
+          ...(view.current.accountNumber !== null ? { accountNumber: view.current.accountNumber } : {}),
+          ...(input.partyId !== undefined ? { partyId: input.partyId } : {}),
+          ...(input.paymentNumber !== undefined ? { number: input.paymentNumber } : {}),
+          ...(input.method !== undefined ? { method: input.method } : {}),
+          amount: view.total,
+          applications: [{ invoiceId: view.id, amount: view.total }],
+        });
+      }
+      document = this.viewDocument(view.id);
+    })();
+    return { document, payment };
   }
 
   private listDocumentRecords(type: DocumentType): DocumentRecord[] {
@@ -2216,8 +2294,9 @@ export class CompanyFile implements ItemCatalog {
       application_seq: bigint;
       source_kind: CreditApplication['sourceKind'];
       source_id: string;
-      invoice_id: string;
+      invoice_id: string | null;
       line_id: string | null;
+      refund: bigint;
       amount: bigint;
       date: string;
       at: string;
@@ -2232,6 +2311,7 @@ export class CompanyFile implements ItemCatalog {
       sourceId: row.source_id,
       invoiceId: row.invoice_id,
       lineId: row.line_id,
+      refund: row.refund === 1n,
       amountMinor: row.amount,
       date: row.date,
       at: row.at,
@@ -2287,8 +2367,8 @@ export class CompanyFile implements ItemCatalog {
     const at = new Date().toISOString();
     const result = this.db
       .prepare(
-        `INSERT INTO credit_applications (source_kind, source_id, invoice_id, line_id, amount, date, at, reverses_application_seq)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+        `INSERT INTO credit_applications (source_kind, source_id, invoice_id, line_id, refund, amount, date, at, reverses_application_seq)
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?, NULL)`,
       )
       .run(input.sourceKind, input.sourceId, input.invoiceId, input.lineId ?? null, input.amount, effectiveDate, at);
     const seq = Number(result.lastInsertRowid);
@@ -2304,8 +2384,77 @@ export class CompanyFile implements ItemCatalog {
       sourceId: input.sourceId,
       invoiceId: input.invoiceId,
       lineId: input.lineId ?? null,
+      refund: false,
       amountMinor: input.amount,
       date: effectiveDate,
+      at,
+      reversesApplicationSeq: null,
+    };
+  }
+
+  /**
+   * Pay out (part of) a credit source's unapplied balance (ADR 0013).
+   * Posts by the source's direction (refund_out / refund_in) when the
+   * roles are mapped; reversing the refund reverses the posting too.
+   */
+  refundCredit(input: {
+    sourceKind: CreditApplication['sourceKind'];
+    sourceId: string;
+    amount: bigint;
+    date?: string;
+    approvedBy?: string;
+  }): CreditApplication {
+    this.requireApproval('refund_credit', input.approvedBy);
+    const source = this.sourceState(input.sourceKind, input.sourceId);
+    if (input.amount <= 0n) {
+      throw new LedgerError('INVALID_ALLOCATION', 'Refund amounts must be positive');
+    }
+    const remaining =
+      source.total - appliedFromSource(this.listApplications(), input.sourceKind, input.sourceId);
+    if (input.amount > remaining) {
+      throw new LedgerError(
+        'INVALID_ALLOCATION',
+        `Refunding ${input.amount} exceeds the source's unapplied ${remaining}`,
+      );
+    }
+    const at = new Date().toISOString();
+    const date = input.date ?? at.slice(0, 10);
+    let seq = 0;
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO credit_applications (source_kind, source_id, invoice_id, line_id, refund, amount, date, at, reverses_application_seq)
+           VALUES (?, ?, NULL, NULL, 1, ?, ?, ?, NULL)`,
+        )
+        .run(input.sourceKind, input.sourceId, input.amount, date, at);
+      seq = Number(result.lastInsertRowid);
+      this.audit('credit.refunded', 'credit_application', String(seq), {
+        sourceKind: input.sourceKind,
+        sourceId: input.sourceId,
+        amount: input.amount.toString(),
+      });
+      const plan = planPosting(
+        source.direction === 'out' ? 'refund_in' : 'refund_out',
+        input.amount,
+        this.info().baseCurrency,
+        date,
+        this.postingAccounts(),
+        `Refund of ${input.sourceKind} credit (${source.customerName})`,
+      );
+      if (plan) {
+        const entry = this.postEntry(plan);
+        this.recordPosting('refund', String(seq), entry.id, 'post');
+      }
+    })();
+    return {
+      applicationSeq: seq,
+      sourceKind: input.sourceKind,
+      sourceId: input.sourceId,
+      invoiceId: null,
+      lineId: null,
+      refund: true,
+      amountMinor: input.amount,
+      date,
       at,
       reversesApplicationSeq: null,
     };
@@ -2326,14 +2475,17 @@ export class CompanyFile implements ItemCatalog {
     this.db.transaction(() => {
       const result = this.db
         .prepare(
-          `INSERT INTO credit_applications (source_kind, source_id, invoice_id, line_id, amount, date, at, reverses_application_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO credit_applications (source_kind, source_id, invoice_id, line_id, refund, amount, date, at, reverses_application_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(target.sourceKind, target.sourceId, target.invoiceId, target.lineId, target.amountMinor, target.date, at, applicationSeq);
+        .run(target.sourceKind, target.sourceId, target.invoiceId, target.lineId, target.refund ? 1 : 0, target.amountMinor, target.date, at, applicationSeq);
       seq = Number(result.lastInsertRowid);
       this.audit('credit.application_reversed', 'credit_application', String(seq), {
         reverses: applicationSeq,
       });
+      if (target.refund) {
+        this.reversePostingIfActive('refund', String(applicationSeq), target.date, `Reversal: refund #${applicationSeq} undone`);
+      }
     })();
     return { ...target, applicationSeq: seq, at, reversesApplicationSeq: applicationSeq };
   }
@@ -2343,7 +2495,7 @@ export class CompanyFile implements ItemCatalog {
       return this.getPayment(id)?.status === 'received';
     }
     const record = this.getDocumentRecord(id);
-    return record?.type === 'credit_memo' && record.status === 'sent' && record.settlement === 'account';
+    return record?.type === kind && record.status === 'sent' && record.settlement === 'account';
   }
 
   private sourceState(kind: CreditApplication['sourceKind'], id: string): {
@@ -2365,22 +2517,23 @@ export class CompanyFile implements ItemCatalog {
         total: payment.amountMinor,
       };
     }
+    const label = kind === 'vendor_credit' ? 'vendor credit' : 'credit memo';
     const record = this.getDocumentRecord(id);
-    if (!record || record.type !== 'credit_memo') {
-      throw new LedgerError('UNKNOWN_DOCUMENT', `No such credit memo: ${id}`);
+    if (!record || record.type !== kind) {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such ${label}: ${id}`);
     }
     if (record.status !== 'sent') {
-      throw new LedgerError('INVALID_STATUS', 'Only sent credit memos can be applied');
+      throw new LedgerError('INVALID_STATUS', `Only sent ${label}s can be applied`);
     }
     if (record.settlement !== 'account') {
-      throw new LedgerError('INVALID_DOCUMENT', 'Refund credit memos were paid out and cannot be applied');
+      throw new LedgerError('INVALID_DOCUMENT', `Refund ${label}s were paid out and cannot be applied`);
     }
     const current = record.revisions[record.revisions.length - 1]!;
-    // Credit memos are inbound credit; vendor credits are future work.
+    // A vendor credit reduces what we owe: outbound credit (ADR 0013).
     return {
       customerName: current.customerName,
       accountNumber: current.accountNumber,
-      direction: 'in',
+      direction: kind === 'vendor_credit' ? 'out' : 'in',
       total: revisionGrandTotal(current),
     };
   }
@@ -2423,9 +2576,9 @@ export class CompanyFile implements ItemCatalog {
     return Object.fromEntries(rows.map((row) => [row.role, row.accountId]));
   }
 
-  listPostings(sourceKind?: 'document' | 'payment', sourceId?: string): {
+  listPostings(sourceKind?: 'document' | 'payment' | 'refund', sourceId?: string): {
     postingSeq: number;
-    sourceKind: 'document' | 'payment';
+    sourceKind: 'document' | 'payment' | 'refund';
     sourceId: string;
     entryId: string;
     kind: 'post' | 'reversal';
@@ -2433,7 +2586,7 @@ export class CompanyFile implements ItemCatalog {
   }[] {
     interface PostingRow {
       posting_seq: bigint;
-      source_kind: 'document' | 'payment';
+      source_kind: 'document' | 'payment' | 'refund';
       source_id: string;
       entry_id: string;
       kind: 'post' | 'reversal';
@@ -2456,7 +2609,7 @@ export class CompanyFile implements ItemCatalog {
     }));
   }
 
-  private activePostingEntry(sourceKind: 'document' | 'payment', sourceId: string): string | undefined {
+  private activePostingEntry(sourceKind: 'document' | 'payment' | 'refund', sourceId: string): string | undefined {
     const row = this.db
       .prepare(
         `SELECT entry_id AS entryId, kind FROM postings
@@ -2467,7 +2620,7 @@ export class CompanyFile implements ItemCatalog {
   }
 
   private recordPosting(
-    sourceKind: 'document' | 'payment',
+    sourceKind: 'document' | 'payment' | 'refund',
     sourceId: string,
     entryId: string,
     kind: 'post' | 'reversal',
@@ -2485,6 +2638,8 @@ export class CompanyFile implements ItemCatalog {
     else if (record.type === 'bill') kind = 'bill';
     else if (record.type === 'credit_memo') {
       kind = record.settlement === 'refund' ? 'credit_refund' : 'credit_account';
+    } else if (record.type === 'vendor_credit') {
+      kind = record.settlement === 'refund' ? 'vendor_credit_refund' : 'vendor_credit_account';
     } else return;
     const current = record.revisions[record.revisions.length - 1]!;
     const plan = planPosting(
@@ -2502,7 +2657,7 @@ export class CompanyFile implements ItemCatalog {
   }
 
   private reversePostingIfActive(
-    sourceKind: 'document' | 'payment',
+    sourceKind: 'document' | 'payment' | 'refund',
     sourceId: string,
     date: string,
     memo: string,

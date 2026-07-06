@@ -110,6 +110,20 @@ function mapSupplierInfo(partyId: string, body: Body): Record<string, unknown> {
   };
 }
 
+function mapCashTransaction(body: Body): Record<string, unknown> {
+  return {
+    date: str(body.date, 'date'),
+    lines: (body.lines as Body[]).map(mapLine),
+    ...mapCustomer(body),
+    ...(body.number !== undefined ? { number: str(body.number, 'number') } : {}),
+    ...(body.paymentNumber !== undefined ? { paymentNumber: str(body.paymentNumber, 'paymentNumber') } : {}),
+    ...(body.memo !== undefined ? { memo: str(body.memo, 'memo') } : {}),
+    ...(body.method !== undefined ? { method: str(body.method, 'method') } : {}),
+    ...(body.taxExempt !== undefined ? { taxExempt: Boolean(body.taxExempt) } : {}),
+    ...(body.approvedBy !== undefined ? { approvedBy: str(body.approvedBy, 'approvedBy') } : {}),
+  };
+}
+
 const STATUS_BY_CODE: Partial<Record<LedgerErrorCode, number>> = {
   UNKNOWN_ACCOUNT: 404,
   UNKNOWN_ENTRY: 404,
@@ -346,6 +360,24 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     if (method === 'POST' && id !== undefined && sub === 'void') return file.voidPayment(id);
   }
 
+  if (head === 'refunds' && method === 'POST') {
+    return file.refundCredit({
+      sourceKind: str(body.sourceKind, 'sourceKind') as never,
+      sourceId: str(body.sourceId, 'sourceId'),
+      amount: money(body.amount, 'amount'),
+      ...(body.date !== undefined ? { date: str(body.date, 'date') } : {}),
+      ...(body.approvedBy !== undefined ? { approvedBy: str(body.approvedBy, 'approvedBy') } : {}),
+    });
+  }
+
+  if (head === 'sales-receipts' && method === 'POST') {
+    return file.recordSalesReceipt(mapCashTransaction(body) as never);
+  }
+
+  if (head === 'expenses' && method === 'POST') {
+    return file.recordExpense(mapCashTransaction(body) as never);
+  }
+
   if (head === 'applications') {
     if (method === 'GET') return file.listApplications();
     if (method === 'POST' && id === undefined) {
@@ -364,6 +396,18 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     const partyId = query.get('partyId');
     if (partyId !== null) return file.statementForParty(partyId, asOf);
     return file.statement(
+      {
+        ...(query.get('customerName') !== null ? { customerName: query.get('customerName')! } : {}),
+        ...(query.get('accountNumber') !== null ? { accountNumber: query.get('accountNumber')! } : {}),
+      },
+      asOf,
+    );
+  }
+
+  if (head === 'supplier-statements' && method === 'GET') {
+    const partyId = query.get('partyId');
+    if (partyId !== null) return file.supplierStatementForParty(partyId, asOf);
+    return file.supplierStatement(
       {
         ...(query.get('customerName') !== null ? { customerName: query.get('customerName')! } : {}),
         ...(query.get('accountNumber') !== null ? { accountNumber: query.get('accountNumber')! } : {}),

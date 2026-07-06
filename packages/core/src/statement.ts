@@ -15,6 +15,7 @@ import {
 import {
   appliedFromSource,
   appliedToInvoice,
+  refundedFromSource,
   settle,
   type ApplicationSourceKind,
   type CreditApplication,
@@ -77,6 +78,8 @@ export interface StatementCredit {
   readonly kind: 'return' | 'credit';
   /** Portion applied to invoices (account credits only). */
   readonly appliedAmount: bigint;
+  /** Portion paid back out via refundCredit (ADR 0013). */
+  readonly refundedAmount: bigint;
   readonly unappliedAmount: bigint;
 }
 
@@ -87,6 +90,8 @@ export interface StatementPayment {
   readonly method: string | null;
   readonly amount: bigint;
   readonly appliedAmount: bigint;
+  /** Portion paid back out via refundCredit (ADR 0013). */
+  readonly refundedAmount: bigint;
   readonly unappliedAmount: bigint;
 }
 
@@ -137,16 +142,22 @@ export function computeStatement(
   query: CustomerQuery,
   asOf: string,
   rules: readonly AgingRule[] = DEFAULT_AGING_RULES,
+  side: 'customer' | 'supplier' = 'customer',
 ): Statement {
   if (query.customerName === undefined && query.accountNumber === undefined && query.partyId === undefined) {
     throw new LedgerError('INVALID_DOCUMENT', 'Statement query needs a party, customer name, or account number');
   }
+  // The supplier side mirrors the customer side exactly (ADR 0013): bills for
+  // invoices, vendor credits for credit memos, outbound payments for receipts.
+  const invoiceType = side === 'supplier' ? 'bill' : 'invoice';
+  const creditType: ApplicationSourceKind = side === 'supplier' ? 'vendor_credit' : 'credit_memo';
+  const direction = side === 'supplier' ? 'out' : 'in';
   const recordsById = new Map(documents.map((pair) => [pair.record.id, pair.record]));
   const paymentsById = new Map(payments.map((payment) => [payment.id, payment]));
   const isSourceActive = (kind: ApplicationSourceKind, id: string): boolean => {
     if (kind === 'payment') return paymentsById.get(id)?.status === 'received';
     const record = recordsById.get(id);
-    return record?.type === 'credit_memo' && record.status === 'sent' && record.settlement === 'account';
+    return record?.type === kind && record.status === 'sent' && record.settlement === 'account';
   };
 
   const invoices: StatementInvoice[] = [];
@@ -158,7 +169,7 @@ export function computeStatement(
     if (current.date > asOf || !matchesCustomerOrParty(record, current, query)) continue;
     const tags = deriveTags(record, closures);
 
-    if (record.type === 'invoice') {
+    if (record.type === invoiceType) {
       const settlement = settle(
         revisionGrandTotal(current),
         appliedToInvoice(applications, record.id, isSourceActive, asOf),
@@ -190,12 +201,12 @@ export function computeStatement(
         ageLabel: settlement.open === 0n ? 'paid' : ageLabelFor(ageDays, rules),
         tags,
       });
-    } else if (record.type === 'credit_memo') {
+    } else if (record.type === creditType) {
       const total = revisionGrandTotal(current);
-      const applied =
-        record.settlement === 'account'
-          ? appliedFromSource(applications, 'credit_memo', record.id, asOf)
-          : 0n;
+      const consumed =
+        record.settlement === 'account' ? appliedFromSource(applications, creditType, record.id, asOf) : 0n;
+      const refunded =
+        record.settlement === 'account' ? refundedFromSource(applications, creditType, record.id, asOf) : 0n;
       credits.push({
         documentId: record.id,
         number: record.number,
@@ -204,8 +215,9 @@ export function computeStatement(
         total,
         settlement: record.settlement ?? 'account',
         kind: current.lines.some((line) => line.sourceLineId !== null) ? 'return' : 'credit',
-        appliedAmount: applied,
-        unappliedAmount: record.settlement === 'account' ? total - applied : 0n,
+        appliedAmount: consumed - refunded,
+        refundedAmount: refunded,
+        unappliedAmount: record.settlement === 'account' ? total - consumed : 0n,
       });
     }
   }
@@ -213,22 +225,24 @@ export function computeStatement(
   const statementPayments: StatementPayment[] = payments
     .filter(
       (payment) =>
-        payment.direction !== 'out' &&
+        payment.direction === direction &&
         payment.status === 'received' &&
         payment.date <= asOf &&
         ((query.partyId !== undefined && payment.partyId === query.partyId) ||
           matchesCustomer({ customerName: payment.customerName, accountNumber: payment.accountNumber }, query)),
     )
     .map((payment) => {
-      const applied = appliedFromSource(applications, 'payment', payment.id, asOf);
+      const consumed = appliedFromSource(applications, 'payment', payment.id, asOf);
+      const refunded = refundedFromSource(applications, 'payment', payment.id, asOf);
       return {
         paymentId: payment.id,
         number: payment.number,
         date: payment.date,
         method: payment.method,
         amount: payment.amountMinor,
-        appliedAmount: applied,
-        unappliedAmount: payment.amountMinor - applied,
+        appliedAmount: consumed - refunded,
+        refundedAmount: refunded,
+        unappliedAmount: payment.amountMinor - consumed,
       };
     });
 

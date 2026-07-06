@@ -26,10 +26,10 @@ Usage:
 
 Document layer:
   accounts item add <file> --name <name> --price <amount> [--cost <amount>] [--tax-code <code>] [--deposit-policy <never|always|when_out_of_stock|special_order>]
-  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order|bill>]
+  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order|bill|vendor_credit>]
   accounts doc show <file> <document-id>
   accounts doc send <file> <document-id> [--override-deposit] [--override-minimum] [--approved-by <who>]
-  accounts statement <file> (--party <id> | --customer <name> | --acct <number>) [--as-of YYYY-MM-DD]
+  accounts statement <file> (--party <id> | --customer <name> | --acct <number>) [--as-of YYYY-MM-DD] [--supplier]
   accounts serve <file> [--port 3000]
 
 Accounts in --debit/--credit are referenced by code or id; amounts are decimal
@@ -466,22 +466,25 @@ function cmdStatement(args: string[]): string {
       customer: { type: 'string' },
       acct: { type: 'string' },
       'as-of': { type: 'string' },
+      supplier: { type: 'boolean' },
     },
   });
   const file = CompanyFile.open(requirePath(positionals));
   try {
     const asOf = values['as-of'] ?? new Date().toISOString().slice(0, 10);
-    const statement = values.party
-      ? file.statementForParty(values.party, asOf)
-      : file.statement(
-          {
-            ...(values.customer !== undefined ? { customerName: values.customer } : {}),
-            ...(values.acct !== undefined ? { accountNumber: values.acct } : {}),
-          },
-          asOf,
-        );
+    const query = {
+      ...(values.customer !== undefined ? { customerName: values.customer } : {}),
+      ...(values.acct !== undefined ? { accountNumber: values.acct } : {}),
+    };
+    const statement = values.supplier
+      ? values.party
+        ? file.supplierStatementForParty(values.party, asOf)
+        : file.supplierStatement(query, asOf)
+      : values.party
+        ? file.statementForParty(values.party, asOf)
+        : file.statement(query, asOf);
     const usd = (value: bigint) => formatMoney(money(value, file.info().baseCurrency));
-    const out: string[] = [`STATEMENT as of ${statement.asOf}`];
+    const out: string[] = [`${values.supplier ? 'SUPPLIER STATEMENT' : 'STATEMENT'} as of ${statement.asOf}`];
     for (const invoice of statement.invoices) {
       out.push(
         `  ${invoice.date}  ${invoice.label.padEnd(24)} ${usd(invoice.originalTotal).padStart(10)}  [${invoice.ageLabel}]${invoice.dueDate ? `  due ${invoice.dueDate}` : ''}`,

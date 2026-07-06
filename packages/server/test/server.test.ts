@@ -183,6 +183,35 @@ describe('document API (Tier 3)', () => {
     });
     const settled = (await get(`/documents/${bill.id}/settlement`)).json as { status: string };
     expect(settled.status).toBe('paid');
+
+    // Supplier statement over HTTP (ADR 0013).
+    const supplierStatement = (await get(`/supplier-statements?partyId=${supplier.id}&asOf=2026-08-01`)).json as {
+      invoices: { number: string }[]; balance: string;
+    };
+    expect(supplierStatement.invoices[0]!.number).toBe('BILL-1');
+    expect(supplierStatement.balance).toBe('0');
+  });
+
+  it('cash sales and refunds round-trip over HTTP (ADR 0013)', async () => {
+    const widget = (await post('/items', { name: 'Widget', currency: 'USD', unitPrice: '2500' })).json as { id: string };
+    await post('/sequences/payment', { prefix: 'PMT-' });
+
+    const sale = (await post('/sales-receipts', {
+      number: 'INV-CASH', date: '2026-07-01', customerName: 'Walk-in', method: 'cash',
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: '2000' }],
+    })).json as { document: { id: string; status: string }; payment: { id: string; amountMinor: string } };
+    expect(sale.document.status).toBe('sent');
+    expect(sale.payment.amountMinor).toBe('5000');
+
+    // Overpay a second invoice's payment, then refund the overage.
+    const payment = (await post('/payments', {
+      date: '2026-07-02', customerName: 'Walk-in', amount: '3000',
+    })).json as { id: string };
+    const refund = await post('/refunds', { sourceKind: 'payment', sourceId: payment.id, amount: '3000' });
+    expect(refund.status).toBe(201);
+    expect(refund.json.refund).toBe(true);
+    const denied = await post('/refunds', { sourceKind: 'payment', sourceId: payment.id, amount: '1' });
+    expect(denied.status).toBe(422);
   });
 
   it('gated actions surface 403 APPROVAL_REQUIRED', async () => {

@@ -27,7 +27,15 @@ export type PostingKind =
   /** Approved vendor bill: DR purchases / CR AP (ADR 0012). */
   | 'bill'
   /** Outbound payment to a supplier: DR AP / CR cash (ADR 0012). */
-  | 'disbursement';
+  | 'disbursement'
+  /** Sent account vendor credit: DR AP / CR purchases (ADR 0013). */
+  | 'vendor_credit_account'
+  /** Sent refund vendor credit (supplier paid us): DR cash / CR purchases. */
+  | 'vendor_credit_refund'
+  /** Refund of inbound on-account credit to a customer: DR AR / CR cash. */
+  | 'refund_out'
+  /** Supplier refunds our outbound on-account credit: DR cash / CR AP. */
+  | 'refund_in';
 
 const POSTING_SIDES: Record<PostingKind, [debit: PostingRole, credit: PostingRole]> = {
   invoice: ['accounts_receivable', 'sales_income'],
@@ -36,6 +44,10 @@ const POSTING_SIDES: Record<PostingKind, [debit: PostingRole, credit: PostingRol
   payment: ['cash', 'accounts_receivable'],
   bill: ['purchases_expense', 'accounts_payable'],
   disbursement: ['accounts_payable', 'cash'],
+  vendor_credit_account: ['accounts_payable', 'purchases_expense'],
+  vendor_credit_refund: ['cash', 'purchases_expense'],
+  refund_out: ['accounts_receivable', 'cash'],
+  refund_in: ['cash', 'accounts_payable'],
 };
 
 /** Which roles a posting kind needs; posting is skipped unless all are mapped. */

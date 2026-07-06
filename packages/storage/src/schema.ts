@@ -759,7 +759,124 @@ WHEN NEW.id IS NOT OLD.id
 BEGIN SELECT RAISE(ABORT, 'only payment status may change'); END;
 `;
 
+const V17_SQL = `
+-- ADR 0013: completing the transaction set. vendor_credit joins the
+-- document-type and sequence-kind enums; credit_applications gain the
+-- vendor_credit source kind, a nullable target (refunds pay out unapplied
+-- credit with no target document), and a refund flag; postings can now be
+-- keyed by a refund's application seq so reversals unwind them.
+DROP TRIGGER documents_status_only_update;
+DROP TRIGGER documents_no_delete;
+DROP INDEX idx_documents_source;
+
+CREATE TABLE documents_v17 (
+  id                      TEXT PRIMARY KEY,
+  type                    TEXT NOT NULL CHECK (type IN ('estimate','sales_order','invoice','credit_memo','purchase_order','bill','vendor_credit')),
+  number                  TEXT NOT NULL CHECK (length(trim(number)) > 0),
+  status                  TEXT NOT NULL CHECK (status IN ('draft','sent','void')),
+  source_document_id      TEXT REFERENCES documents(id),
+  inherited_corrections   INTEGER NOT NULL DEFAULT 0 CHECK (inherited_corrections IN (0,1)),
+  inherited_substitutions INTEGER NOT NULL DEFAULT 0 CHECK (inherited_substitutions IN (0,1)),
+  settlement              TEXT CHECK (settlement IN ('account','refund')),
+  party_id                TEXT REFERENCES parties(id),
+  UNIQUE (type, number)
+) STRICT;
+
+INSERT INTO documents_v17 (id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement, party_id)
+  SELECT id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement, party_id FROM documents;
+
+DROP TABLE documents;
+ALTER TABLE documents_v17 RENAME TO documents;
+
+CREATE TRIGGER documents_status_only_update BEFORE UPDATE ON documents
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.type IS NOT OLD.type
+  OR NEW.number IS NOT OLD.number
+  OR NEW.source_document_id IS NOT OLD.source_document_id
+  OR NEW.inherited_corrections IS NOT OLD.inherited_corrections
+  OR NEW.inherited_substitutions IS NOT OLD.inherited_substitutions
+  OR NEW.settlement IS NOT OLD.settlement
+  OR NEW.party_id IS NOT OLD.party_id
+BEGIN SELECT RAISE(ABORT, 'only document status may change'); END;
+
+CREATE TRIGGER documents_no_delete BEFORE DELETE ON documents
+BEGIN SELECT RAISE(ABORT, 'documents are never deleted; void them'); END;
+
+CREATE INDEX idx_documents_source ON documents(source_document_id);
+
+CREATE TABLE number_sequences_v17 (
+  kind       TEXT PRIMARY KEY CHECK (kind IN ('estimate','sales_order','invoice','credit_memo','purchase_order','bill','vendor_credit','payment')),
+  prefix     TEXT NOT NULL,
+  next_value INTEGER NOT NULL CHECK (next_value >= 1),
+  width      INTEGER NOT NULL CHECK (width >= 1)
+) STRICT;
+INSERT INTO number_sequences_v17 SELECT kind, prefix, next_value, width FROM number_sequences;
+DROP TABLE number_sequences;
+ALTER TABLE number_sequences_v17 RENAME TO number_sequences;
+
+DROP TRIGGER credit_applications_no_update;
+DROP TRIGGER credit_applications_no_delete;
+DROP INDEX idx_credit_applications_invoice;
+DROP INDEX idx_credit_applications_source;
+
+CREATE TABLE credit_applications_v17 (
+  application_seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_kind              TEXT NOT NULL CHECK (source_kind IN ('payment','credit_memo','vendor_credit')),
+  source_id                TEXT NOT NULL,
+  invoice_id               TEXT REFERENCES documents(id),
+  line_id                  TEXT,
+  refund                   INTEGER NOT NULL DEFAULT 0 CHECK (refund IN (0,1)),
+  amount                   INTEGER NOT NULL CHECK (amount > 0),
+  date                     TEXT NOT NULL,
+  at                       TEXT NOT NULL,
+  reverses_application_seq INTEGER UNIQUE REFERENCES credit_applications(application_seq),
+  CHECK (refund = 1 OR invoice_id IS NOT NULL)
+) STRICT;
+
+INSERT INTO credit_applications_v17
+    (application_seq, source_kind, source_id, invoice_id, line_id, refund, amount, date, at, reverses_application_seq)
+  SELECT application_seq, source_kind, source_id, invoice_id, line_id, 0, amount, date, at, reverses_application_seq
+  FROM credit_applications;
+
+DROP TABLE credit_applications;
+ALTER TABLE credit_applications_v17 RENAME TO credit_applications;
+
+CREATE INDEX idx_credit_applications_invoice ON credit_applications(invoice_id);
+CREATE INDEX idx_credit_applications_source ON credit_applications(source_kind, source_id);
+
+CREATE TRIGGER credit_applications_no_update BEFORE UPDATE ON credit_applications
+BEGIN SELECT RAISE(ABORT, 'applications are immutable; reverse them'); END;
+
+CREATE TRIGGER credit_applications_no_delete BEFORE DELETE ON credit_applications
+BEGIN SELECT RAISE(ABORT, 'applications are immutable; reverse them'); END;
+
+-- Postings can be keyed by a refund's application seq (ADR 0013).
+DROP TRIGGER postings_no_update;
+DROP TRIGGER postings_no_delete;
+DROP INDEX idx_postings_source;
+
+CREATE TABLE postings_v17 (
+  posting_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('document','payment','refund')),
+  source_id   TEXT NOT NULL,
+  entry_id    TEXT NOT NULL REFERENCES journal_entries(id),
+  kind        TEXT NOT NULL CHECK (kind IN ('post','reversal')),
+  at          TEXT NOT NULL
+) STRICT;
+INSERT INTO postings_v17 SELECT posting_seq, source_kind, source_id, entry_id, kind, at FROM postings;
+DROP TABLE postings;
+ALTER TABLE postings_v17 RENAME TO postings;
+
+CREATE INDEX idx_postings_source ON postings(source_kind, source_id);
+
+CREATE TRIGGER postings_no_update BEFORE UPDATE ON postings
+BEGIN SELECT RAISE(ABORT, 'postings are immutable'); END;
+
+CREATE TRIGGER postings_no_delete BEFORE DELETE ON postings
+BEGIN SELECT RAISE(ABORT, 'postings are immutable'); END;
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

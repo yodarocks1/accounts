@@ -40,12 +40,20 @@ import {
   type Payment,
 } from './payments.js';
 
-export const DOCUMENT_TYPES = ['estimate', 'sales_order', 'invoice', 'credit_memo', 'purchase_order', 'bill'] as const;
+export const DOCUMENT_TYPES = [
+  'estimate',
+  'sales_order',
+  'invoice',
+  'credit_memo',
+  'purchase_order',
+  'bill',
+  'vendor_credit',
+] as const;
 export type DocumentType = (typeof DOCUMENT_TYPES)[number];
 
 /** Purchase-side documents share cost pricing and untaxed lines (ADR 0011/0012). */
 export function isPurchaseType(type: DocumentType): boolean {
-  return type === 'purchase_order' || type === 'bill';
+  return type === 'purchase_order' || type === 'bill' || type === 'vendor_credit';
 }
 
 export type DocumentStatus = 'draft' | 'sent' | 'void';
@@ -66,6 +74,7 @@ export const CONVERSION_TARGETS: Record<DocumentType, readonly DocumentType[]> =
   // A billed purchase order mirrors an invoiced sales order (ADR 0012).
   purchase_order: ['bill'],
   bill: [],
+  vendor_credit: [],
 };
 
 export interface DocumentLine {
@@ -150,7 +159,7 @@ export interface DocumentRecord {
   readonly sourceDocumentId: string | null;
   /** Durable customer identity when known (ADR 0008 part 4). */
   readonly partyId: string | null;
-  /** Only for credit memos: how the credit settles (ADR 0006). */
+  /** Credit memos and vendor credits: how the credit settles (ADR 0006/0013). */
   readonly settlement: SettlementMode | null;
   /** Source document's tags snapshotted at creation (ADR 0004). */
   readonly inheritedTags: readonly DocumentTag[];
@@ -323,6 +332,7 @@ export const APPROVAL_ACTIONS = [
   'return_window_override',
   'deposit_override',
   'minimum_order_override',
+  'refund_credit',
 ] as const;
 export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];
 
@@ -383,10 +393,11 @@ export function resolveRevisionKind(
     case 'invoice':
     case 'credit_memo':
     case 'bill':
+    case 'vendor_credit':
       if (requested !== undefined && requested !== 'correction') {
         throw new LedgerError(
           'INVALID_REVISION_KIND',
-          `A sent ${type === 'invoice' ? 'invoice' : type === 'bill' ? 'bill' : 'credit memo'} can only be changed by a correction`,
+          `A sent ${type.replace('_', ' ')} can only be changed by a correction`,
         );
       }
       return 'correction';
@@ -1208,12 +1219,31 @@ export interface NewDocument {
   sourceDocumentId?: string;
   /** Who authorized gated aspects (e.g. below-cost pricing) (ADR 0009). */
   approvedBy?: string;
-  /** Credit memos only: defaults to 'account'. */
+  /** Credit memos and vendor credits only: defaults to 'account'. */
   settlement?: SettlementMode;
   /** Suppress tax codes on every line (defaults from the party) (ADR 0010). */
   taxExempt?: boolean;
   /** Sales orders only: request a deposit (ADR 0010 part 3). */
   deposit?: DepositRequest;
+}
+
+/** One-step cash sale / cash expense (ADR 0013): document + payment together. */
+export interface NewCashTransaction {
+  /** Document number; omit to draw from the invoice/bill sequence. */
+  number?: string;
+  /** Payment number; omit to draw from the payment sequence. */
+  paymentNumber?: string;
+  date: string;
+  customerName?: string;
+  accountNumber?: string;
+  partyId?: string;
+  poNumber?: string;
+  memo?: string;
+  /** Payment method ("cash", "VISA …9921", …). */
+  method?: string;
+  taxExempt?: boolean;
+  approvedBy?: string;
+  lines: NewDocumentLine[];
 }
 
 export interface DocumentChanges {
@@ -1331,11 +1361,11 @@ export class DocumentBook implements ItemCatalog {
     }
   }
 
-  /** Cumulative quantity already returned against a purchase line. */
-  private priorReturnedMilli(documentId: string, lineId: string): bigint {
+  /** Cumulative quantity already credited against a line by this credit type. */
+  private priorReturnedMilli(documentId: string, lineId: string, creditType: DocumentType = 'credit_memo'): bigint {
     let total = 0n;
     for (const record of this.documents.values()) {
-      if (record.type !== 'credit_memo' || record.status === 'void') continue;
+      if (record.type !== creditType || record.status === 'void') continue;
       const current = record.revisions[record.revisions.length - 1]!;
       for (const line of current.lines) {
         if (line.sourceDocumentId === documentId && line.sourceLineId === lineId) {
@@ -1725,8 +1755,8 @@ export class DocumentBook implements ItemCatalog {
     if (input.number !== undefined && !input.number.trim()) {
       throw new LedgerError('INVALID_DOCUMENT', 'Document number must not be empty');
     }
-    if (input.settlement !== undefined && input.type !== 'credit_memo') {
-      throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos take a settlement mode');
+    if (input.settlement !== undefined && input.type !== 'credit_memo' && input.type !== 'vendor_credit') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Only credit memos and vendor credits take a settlement mode');
     }
     const purchase = isPurchaseType(input.type);
     const customer = this.resolveCustomer(input);
@@ -1753,11 +1783,11 @@ export class DocumentBook implements ItemCatalog {
     }
     validateRevisionContent({ date: input.date, lines, customerName: customer.customerName });
     this.requireBelowCostApproval(input.type, input.date, lines, input.approvedBy);
-    if (input.type === 'credit_memo') {
+    if (input.type === 'credit_memo' || input.type === 'vendor_credit') {
       validateReturnQuantities(
         lines,
         (documentId, lineId) => this.sourceLineFor(documentId, lineId),
-        (documentId, lineId) => this.priorReturnedMilli(documentId, lineId),
+        (documentId, lineId) => this.priorReturnedMilli(documentId, lineId, input.type),
       );
     }
     if (input.type === 'purchase_order') {
@@ -1775,7 +1805,8 @@ export class DocumentBook implements ItemCatalog {
       status: 'draft',
       sourceDocumentId: input.sourceDocumentId ?? null,
       partyId: customer.partyId,
-      settlement: input.type === 'credit_memo' ? (input.settlement ?? 'account') : null,
+      settlement:
+        input.type === 'credit_memo' || input.type === 'vendor_credit' ? (input.settlement ?? 'account') : null,
       inheritedTags,
       revisions: [
         {
@@ -1865,12 +1896,12 @@ export class DocumentBook implements ItemCatalog {
       this.validatePurchaseLinks(lines, id);
     }
     this.requireBelowCostApproval(document.type, date, lines, changes.approvedBy);
-    if (document.type === 'credit_memo' && changes.lines !== undefined) {
+    if ((document.type === 'credit_memo' || document.type === 'vendor_credit') && changes.lines !== undefined) {
       validateReturnQuantities(
         lines,
         (documentId, lineId) => this.sourceLineFor(documentId, lineId),
         (documentId, lineId) =>
-          this.priorReturnedMilli(documentId, lineId) -
+          this.priorReturnedMilli(documentId, lineId, document.type) -
           previous.lines
             .filter((line) => line.sourceDocumentId === documentId && line.sourceLineId === lineId)
             .reduce((sum, line) => sum + line.quantityMilli, 0n),
@@ -2019,6 +2050,36 @@ export class DocumentBook implements ItemCatalog {
     );
   }
 
+  /** What we owe a supplier, aged like a customer statement (ADR 0013). */
+  supplierStatement(query: CustomerQuery, asOf: string, rules?: readonly AgingRule[]): Statement {
+    const pairs = [...this.documents.values()].map((record) => ({
+      record,
+      closures: this.closures.get(record.id) ?? [],
+    }));
+    return computeStatement(
+      pairs,
+      [...this.payments.values()],
+      this.applications,
+      query,
+      asOf,
+      rules,
+      'supplier',
+    );
+  }
+
+  supplierStatementForParty(partyId: string, asOf: string, rules?: readonly AgingRule[]): Statement {
+    const party = this.requireParty(partyId);
+    return this.supplierStatement(
+      {
+        partyId,
+        customerName: party.name,
+        ...(party.accountNumber !== null ? { accountNumber: party.accountNumber } : {}),
+      },
+      asOf,
+      rules,
+    );
+  }
+
   // ── Payments & credit application (Tier 1, ADR 0008) ──────────────────
 
   /** Record money received; optionally apply it to invoices immediately. */
@@ -2074,7 +2135,7 @@ export class DocumentBook implements ItemCatalog {
       return this.payments.get(id)?.status === 'received';
     }
     const record = this.documents.get(id);
-    return record?.type === 'credit_memo' && record.status === 'sent' && record.settlement === 'account';
+    return record?.type === kind && record.status === 'sent' && record.settlement === 'account';
   }
 
   private sourceState(kind: CreditApplication['sourceKind'], id: string): {
@@ -2096,22 +2157,23 @@ export class DocumentBook implements ItemCatalog {
         total: payment.amountMinor,
       };
     }
+    const label = kind === 'vendor_credit' ? 'vendor credit' : 'credit memo';
     const record = this.documents.get(id);
-    if (!record || record.type !== 'credit_memo') {
-      throw new LedgerError('UNKNOWN_DOCUMENT', `No such credit memo: ${id}`);
+    if (!record || record.type !== kind) {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such ${label}: ${id}`);
     }
     if (record.status !== 'sent') {
-      throw new LedgerError('INVALID_STATUS', 'Only sent credit memos can be applied');
+      throw new LedgerError('INVALID_STATUS', `Only sent ${label}s can be applied`);
     }
     if (record.settlement !== 'account') {
-      throw new LedgerError('INVALID_DOCUMENT', 'Refund credit memos were paid out and cannot be applied');
+      throw new LedgerError('INVALID_DOCUMENT', `Refund ${label}s were paid out and cannot be applied`);
     }
     const current = record.revisions[record.revisions.length - 1]!;
-    // Credit memos are inbound credit; vendor credits are future work.
+    // A vendor credit reduces what we owe: outbound credit (ADR 0013).
     return {
       customerName: current.customerName,
       accountNumber: current.accountNumber,
-      direction: 'in',
+      direction: kind === 'vendor_credit' ? 'out' : 'in',
       total: revisionGrandTotal(current),
     };
   }
@@ -2154,6 +2216,7 @@ export class DocumentBook implements ItemCatalog {
       sourceId: input.sourceId,
       invoiceId: input.invoiceId,
       lineId: input.lineId ?? null,
+      refund: false,
       amountMinor: input.amount,
       date: date ?? invoice.revisions[invoice.revisions.length - 1]!.date,
       at: at ?? new Date().toISOString(),
@@ -2161,6 +2224,49 @@ export class DocumentBook implements ItemCatalog {
     };
     this.applications.push(application);
     return application;
+  }
+
+  /**
+   * Pay out (part of) a credit source's unapplied balance (ADR 0013):
+   * a customer overpaid, or a supplier owes us back. Consumes the source
+   * like an application; reversible the same way. Gated by refund_credit.
+   */
+  refundCredit(
+    input: {
+      sourceKind: CreditApplication['sourceKind'];
+      sourceId: string;
+      amount: bigint;
+      date?: string;
+      approvedBy?: string;
+    },
+    at?: string,
+  ): CreditApplication {
+    this.requireApproval('refund_credit', input.approvedBy);
+    const source = this.sourceState(input.sourceKind, input.sourceId);
+    if (input.amount <= 0n) {
+      throw new LedgerError('INVALID_ALLOCATION', 'Refund amounts must be positive');
+    }
+    const remaining = source.total - appliedFromSource(this.applications, input.sourceKind, input.sourceId);
+    if (input.amount > remaining) {
+      throw new LedgerError(
+        'INVALID_ALLOCATION',
+        `Refunding ${input.amount} exceeds the source's unapplied ${remaining}`,
+      );
+    }
+    const refund: CreditApplication = {
+      applicationSeq: this.applications.length + 1,
+      sourceKind: input.sourceKind,
+      sourceId: input.sourceId,
+      invoiceId: null,
+      lineId: null,
+      refund: true,
+      amountMinor: input.amount,
+      date: input.date ?? (at ?? new Date().toISOString()).slice(0, 10),
+      at: at ?? new Date().toISOString(),
+      reversesApplicationSeq: null,
+    };
+    this.applications.push(refund);
+    return refund;
   }
 
   /** Undo an application (appends a reversal record; nothing is edited). */
@@ -2178,6 +2284,7 @@ export class DocumentBook implements ItemCatalog {
       sourceId: target.sourceId,
       invoiceId: target.invoiceId,
       lineId: target.lineId,
+      refund: target.refund,
       amountMinor: target.amountMinor,
       date: target.date,
       at: at ?? new Date().toISOString(),
@@ -2523,6 +2630,57 @@ export class DocumentBook implements ItemCatalog {
     const info =
       document.partyId !== null ? this.supplierInfoAt(document.partyId, current.date) : undefined;
     return computePurchaseReadiness(current.lines, info);
+  }
+
+  /**
+   * Cash sale (ADR 0013): invoice at Net 0, sent, and paid in full — one
+   * atomic motion. Not a new document type: the books show an ordinary
+   * paid invoice plus its payment.
+   */
+  recordSalesReceipt(input: NewCashTransaction): { document: DocumentView; payment: Payment | null } {
+    return this.recordCashTransaction('invoice', 'in', input);
+  }
+
+  /** Cash expense (ADR 0013): bill approved and paid in one motion. */
+  recordExpense(input: NewCashTransaction): { document: DocumentView; payment: Payment | null } {
+    return this.recordCashTransaction('bill', 'out', input);
+  }
+
+  private recordCashTransaction(
+    type: 'invoice' | 'bill',
+    direction: 'in' | 'out',
+    input: NewCashTransaction,
+  ): { document: DocumentView; payment: Payment | null } {
+    const view = this.createDocument({
+      type,
+      date: input.date,
+      lines: input.lines,
+      termsDays: 0,
+      ...(input.number !== undefined ? { number: input.number } : {}),
+      ...(input.customerName !== undefined ? { customerName: input.customerName } : {}),
+      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+      ...(input.partyId !== undefined ? { partyId: input.partyId } : {}),
+      ...(input.poNumber !== undefined ? { poNumber: input.poNumber } : {}),
+      ...(input.memo !== undefined ? { memo: input.memo } : {}),
+      ...(input.taxExempt !== undefined ? { taxExempt: input.taxExempt } : {}),
+      ...(input.approvedBy !== undefined ? { approvedBy: input.approvedBy } : {}),
+    });
+    this.sendDocument(view.id);
+    let payment: Payment | null = null;
+    if (view.total > 0n) {
+      payment = this.recordPayment({
+        direction,
+        date: input.date,
+        customerName: view.current.customerName,
+        ...(view.current.accountNumber !== null ? { accountNumber: view.current.accountNumber } : {}),
+        ...(input.partyId !== undefined ? { partyId: input.partyId } : {}),
+        ...(input.paymentNumber !== undefined ? { number: input.paymentNumber } : {}),
+        ...(input.method !== undefined ? { method: input.method } : {}),
+        amount: view.total,
+        applications: [{ invoiceId: view.id, amount: view.total }],
+      });
+    }
+    return { document: this.view(view.id), payment };
   }
 
   voidDocument(id: string, approvedBy?: string): DocumentView {

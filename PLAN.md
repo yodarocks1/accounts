@@ -358,7 +358,10 @@ A first-class, obsessively-tested onramp — this determines adoption.
 - [x] Vendor bills & accounts payable: PO→bill conversion, correction-only
       once approved, A/P + purchases posting roles, outbound payments
       settling bills with direction guards (ADR 0012)
-- [ ] Documents: bills, payments; invoice posting to the ledger (as bundled plugins)
+- [x] Complete transaction set: vendor credits applied to bills with
+      return-quantity guards, refunds of unapplied credit (both
+      directions, posted & reversible), one-step cash sales/expenses,
+      supplier statements with A/P aging (ADR 0013)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging
 - [ ] Plugin host v1 (in-process, bundled plugins only) — dogfooding the API
