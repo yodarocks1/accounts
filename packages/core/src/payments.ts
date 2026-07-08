@@ -175,16 +175,16 @@ export function validateApplication(
   }
   // Direction check (ADR 0012): bills are settled by outbound payments;
   // customer documents by inbound credit only.
-  if (invoice.type === 'bill') {
+  if (invoice.type === 'bill' || invoice.type === 'purchase_order') {
     if (source.direction !== 'out') {
-      throw new LedgerError('INVALID_DOCUMENT', 'Bills are settled by outbound payments');
+      throw new LedgerError('INVALID_DOCUMENT', 'Bills and purchase-order deposits are settled by outbound payments');
     }
   } else if (invoice.type === 'invoice' || invoice.type === 'sales_order') {
     if (source.direction !== 'in') {
       throw new LedgerError('INVALID_DOCUMENT', 'Outbound payments settle bills, not customer documents');
     }
   } else {
-    throw new LedgerError('INVALID_DOCUMENT', 'Credit can only be applied to invoices, sales orders (deposits), or bills');
+    throw new LedgerError('INVALID_DOCUMENT', 'Credit can only be applied to invoices, orders (deposits), or bills');
   }
   if (invoice.status !== 'sent') {
     throw new LedgerError('INVALID_STATUS', 'Credit can only be applied to sent documents');

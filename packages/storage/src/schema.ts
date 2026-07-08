@@ -1004,6 +1004,13 @@ ALTER TABLE stock_movements ADD COLUMN value_minor INTEGER
 `;
 
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL, V18_SQL, V19_SQL];
+const V20_SQL = `
+-- ADR 0016: suppliers may require a prepayment; append-only like the rest of
+-- the supplier-info snapshot.
+ALTER TABLE supplier_info ADD COLUMN prepayment_percent_milli INTEGER
+  CHECK (prepayment_percent_milli IS NULL OR prepayment_percent_milli >= 0);
+`;
+
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL, V18_SQL, V19_SQL, V20_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

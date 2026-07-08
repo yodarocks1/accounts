@@ -269,6 +269,44 @@ describe('document API (Tier 3)', () => {
     expect(valuation.valueMinor).toBe('9000');
   });
 
+  it('purchase prepayments: supplier deposit over HTTP (ADR 0016)', async () => {
+    const widget = (await post('/items', { name: 'Widget', currency: 'USD', unitPrice: '2500', kind: 'inventory' })).json as { id: string };
+    const supplier = (await post('/parties', { name: 'Supplier Inc' })).json as { id: string };
+    await post(`/parties/${supplier.id}/supplier-info`, {
+      asOf: '2026-01-01', currency: 'USD', prepaymentPercentMilli: '50000', // 50% down
+      items: [{ itemId: widget.id, unitCost: '1000' }],
+    });
+
+    // Without a deposit request, the PO cannot be sent.
+    const bare = (await post('/documents', {
+      type: 'purchase_order', number: 'PO-1', date: '2026-07-01', partyId: supplier.id,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: '10000', unitPrice: '1000' }],
+    })).json as { id: string };
+    const denied = await post(`/documents/${bare.id}/send`, {});
+    expect(denied.status).toBe(409);
+    expect(denied.json.error).toBe('DEPOSIT_REQUIRED');
+
+    // With the deposit committed, it sends; the outbound payment holds against it.
+    const po = (await post('/documents', {
+      type: 'purchase_order', number: 'PO-2', date: '2026-07-01', partyId: supplier.id,
+      deposit: { percentMilli: '50000' },
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: '10000', unitPrice: '1000' }],
+    })).json as { id: string };
+    await post(`/documents/${po.id}/send`, {});
+    await post('/payments', {
+      number: 'PMT-OUT-1', direction: 'out', date: '2026-07-02', partyId: supplier.id, amount: '5000',
+      applications: [{ invoiceId: po.id, amount: '5000' }],
+    });
+    expect((await get(`/documents/${po.id}/deposit`)).json).toEqual({ held: '5000' });
+
+    // Billing transfers the deposit, leaving half open.
+    const bill = (await post(`/documents/${po.id}/convert`, { type: 'bill', number: 'BILL-1', date: '2026-07-10' })).json as { id: string };
+    await post(`/documents/${bill.id}/send`, {});
+    const settled = (await get(`/documents/${bill.id}/settlement`)).json as { paid: string; open: string };
+    expect(settled.paid).toBe('5000');
+    expect(settled.open).toBe('5000');
+  });
+
   it('gated actions surface 403 APPROVAL_REQUIRED', async () => {
     await post('/policies/approval', { actions: ['void_document'] });
     await post('/policies/approval', { actions: ['void_document'] });

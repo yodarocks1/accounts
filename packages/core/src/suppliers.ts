@@ -1,6 +1,6 @@
 import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
-import { formatQuantity } from './quantity.js';
+import { divRoundHalf, formatQuantity, PERCENT_SCALE } from './quantity.js';
 import { lineGrossTotal, revisionGrandTotal, type DocumentLine } from './documents.js';
 
 /**
@@ -46,6 +46,8 @@ export interface SupplierInfo {
   readonly minimumOrderMinor: bigint | null;
   /** Minimum order quantity across all lines (milli), when imposed. */
   readonly minimumOrderQuantityMilli: bigint | null;
+  /** Deposit the supplier requires up front, as scale-3 % of the order (ADR 0016). */
+  readonly prepaymentPercentMilli: bigint | null;
   readonly shipping: readonly ShippingEstimate[];
   readonly items: readonly SupplierItemTerm[];
   readonly notes: string | null;
@@ -77,6 +79,7 @@ export interface NewSupplierInfo {
   currency: string;
   minimumOrderMinor?: bigint;
   minimumOrderQuantityMilli?: bigint;
+  prepaymentPercentMilli?: bigint;
   shipping?: NewShippingEstimate[];
   items?: NewSupplierItemTerm[];
   notes?: string;
@@ -100,6 +103,9 @@ export function buildSupplierInfo(input: NewSupplierInfo, infoSeq: number, at: s
   currencyExponent(input.currency);
   if ((input.minimumOrderMinor ?? 0n) < 0n || (input.minimumOrderQuantityMilli ?? 0n) < 0n) {
     throw new LedgerError('INVALID_DOCUMENT', 'Order minimums must not be negative');
+  }
+  if ((input.prepaymentPercentMilli ?? 0n) < 0n) {
+    throw new LedgerError('INVALID_DOCUMENT', 'Prepayment percent must not be negative');
   }
   const shipping: ShippingEstimate[] = (input.shipping ?? []).map((estimate) => {
     if (!estimate.method.trim()) {
@@ -152,6 +158,7 @@ export function buildSupplierInfo(input: NewSupplierInfo, infoSeq: number, at: s
     currency: input.currency,
     minimumOrderMinor: input.minimumOrderMinor ?? null,
     minimumOrderQuantityMilli: input.minimumOrderQuantityMilli ?? null,
+    prepaymentPercentMilli: input.prepaymentPercentMilli ?? null,
     shipping,
     items,
     notes: input.notes ?? null,
@@ -284,4 +291,22 @@ export function specialOrderDepositFloor(
   getItem: (id: string) => { depositPolicy: string } | undefined,
 ): bigint {
   return specialOrderLines(lines, getItem).reduce((sum, line) => sum + lineGrossTotal(line), 0n);
+}
+
+/**
+ * The deposit a purchase order must have on file before it can be sent
+ * (ADR 0016): the greater of the special-order lines' full gross (item-driven)
+ * and the supplier's required percentage of the order total (supplier-driven).
+ */
+export function purchaseDepositFloor(
+  lines: readonly DocumentLine[],
+  getItem: (id: string) => { depositPolicy: string } | undefined,
+  prepaymentPercentMilli: bigint | null,
+): bigint {
+  const special = specialOrderDepositFloor(lines, getItem);
+  const supplier =
+    prepaymentPercentMilli && prepaymentPercentMilli > 0n
+      ? divRoundHalf(revisionGrandTotal({ lines }) * prepaymentPercentMilli, PERCENT_SCALE)
+      : 0n;
+  return special > supplier ? special : supplier;
 }

@@ -82,6 +82,7 @@ import {
   lineGrossTotal,
   resolveDepositRequest,
   specialOrderDepositFloor,
+  purchaseDepositFloor,
   type NewSupplierInfo,
   type PurchaseCoverageLine,
   type PurchaseReadiness,
@@ -1713,6 +1714,24 @@ export class CompanyFile implements ItemCatalog {
           );
         }
       }
+      // ADR 0016: special-order items and supplier prepayment terms require a
+      // deposit committed before the order is submitted to the supplier.
+      const info = document.partyId !== null ? this.supplierInfoAt(document.partyId, current.date) : undefined;
+      const floor = purchaseDepositFloor(
+        current.lines,
+        (itemId) => this.getItem(itemId),
+        info?.prepaymentPercentMilli ?? null,
+      );
+      if (floor > 0n && (current.depositRequiredMinor ?? 0n) < floor) {
+        if (options?.overrideDeposit === true) {
+          this.requireApproval('deposit_override', options.approvedBy);
+        } else {
+          throw new LedgerError(
+            'DEPOSIT_REQUIRED',
+            `Supplier requires prepayment: the deposit request must cover at least ${floor}, not ${current.depositRequiredMinor ?? 0n} (pass overrideDeposit to send anyway)`,
+          );
+        }
+      }
     }
     this.db.transaction(() => {
       this.db.prepare(`UPDATE documents SET status = 'sent' WHERE id = ?`).run(id);
@@ -1731,7 +1750,14 @@ export class CompanyFile implements ItemCatalog {
       );
       this.postDocumentIfConfigured(this.requireDocumentRecord(id));
       if (document.type === 'invoice') {
-        this.transferDeposits(id);
+        const source = document.sourceDocumentId !== null ? this.getDocumentRecord(document.sourceDocumentId) : undefined;
+        if (source?.type === 'sales_order') this.transferDeposits(id, source);
+      }
+      if (document.type === 'bill') {
+        // ADR 0016: deposits ride from the originating PO onto the bill,
+        // resolving through a receipt in the three-way flow (ADR 0015).
+        const po = this.originatingPurchaseOrder(this.requireDocumentRecord(id));
+        if (po) this.transferDeposits(id, po);
       }
     })();
     return this.viewDocument(id);
@@ -1761,11 +1787,16 @@ export class CompanyFile implements ItemCatalog {
    * (ADR 0010 part 3): line prepayments whose line converted here first,
    * then document-level deposits, oldest first; remainders stay held.
    */
-  private transferDeposits(invoiceId: string): void {
+  private originatingPurchaseOrder(bill: DocumentRecord): DocumentRecord | undefined {
+    let source = bill.sourceDocumentId !== null ? this.getDocumentRecord(bill.sourceDocumentId) : undefined;
+    if (source?.type === 'receipt') {
+      source = source.sourceDocumentId !== null ? this.getDocumentRecord(source.sourceDocumentId) : undefined;
+    }
+    return source?.type === 'purchase_order' ? source : undefined;
+  }
+
+  private transferDeposits(invoiceId: string, source: DocumentRecord): void {
     const invoice = this.requireDocumentRecord(invoiceId);
-    if (invoice.sourceDocumentId === null) return;
-    const source = this.getDocumentRecord(invoice.sourceDocumentId);
-    if (!source || source.type !== 'sales_order') return;
     const invoiceCurrent = invoice.revisions[invoice.revisions.length - 1]!;
     const convertedLineIds = new Set(
       invoiceCurrent.lines
@@ -2357,8 +2388,8 @@ export class CompanyFile implements ItemCatalog {
     this.db.transaction(() => {
       const result = this.db
         .prepare(
-          `INSERT INTO supplier_info (party_id, source, as_of, at, currency, minimum_order_minor, minimum_order_quantity_milli, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO supplier_info (party_id, source, as_of, at, currency, minimum_order_minor, minimum_order_quantity_milli, prepayment_percent_milli, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           info.partyId,
@@ -2368,6 +2399,7 @@ export class CompanyFile implements ItemCatalog {
           info.currency,
           info.minimumOrderMinor,
           info.minimumOrderQuantityMilli,
+          info.prepaymentPercentMilli,
           info.notes,
         );
       seq = Number(result.lastInsertRowid);
@@ -2445,6 +2477,7 @@ export class CompanyFile implements ItemCatalog {
       at: string;
       currency: string;
       minimum_order_minor: bigint | null;
+      prepayment_percent_milli: bigint | null;
       minimum_order_quantity_milli: bigint | null;
       notes: string | null;
     }
@@ -2500,6 +2533,7 @@ export class CompanyFile implements ItemCatalog {
       at: row.at,
       currency: row.currency,
       minimumOrderMinor: row.minimum_order_minor,
+      prepaymentPercentMilli: row.prepayment_percent_milli,
       minimumOrderQuantityMilli: row.minimum_order_quantity_milli,
       shipping,
       items,

@@ -34,7 +34,7 @@ describe('deposit requests on sales orders (Tier 3)', () => {
         deposit: { amountMinor: 100n },
         lines: [{ itemId: stocked.id, description: 'Widget', quantityMilli: 1000n }],
       }),
-    ).toThrowError(/only be requested on sales orders/);
+    ).toThrowError(/only be requested on sales or purchase orders/);
   });
 
   it('item policies gate sending: always, when_out_of_stock, and the override', () => {

@@ -82,6 +82,9 @@ function mapSupplierInfo(partyId: string, body: Body): Record<string, unknown> {
     ...(optMoney(body.minimumOrderQuantityMilli, 'minimumOrderQuantityMilli') !== undefined
       ? { minimumOrderQuantityMilli: optMoney(body.minimumOrderQuantityMilli, 'minimumOrderQuantityMilli')! }
       : {}),
+    ...(optMoney(body.prepaymentPercentMilli, 'prepaymentPercentMilli') !== undefined
+      ? { prepaymentPercentMilli: optMoney(body.prepaymentPercentMilli, 'prepaymentPercentMilli')! }
+      : {}),
     ...(body.shipping !== undefined
       ? {
           shipping: (body.shipping as Body[]).map((raw) => ({

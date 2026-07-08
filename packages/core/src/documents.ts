@@ -40,6 +40,7 @@ import {
   buildSupplierInfo,
   computePurchaseCoverage,
   computePurchaseReadiness,
+  purchaseDepositFloor,
   specialOrderDepositFloor,
   type NewSupplierInfo,
   type PurchaseCoverageLine,
@@ -570,15 +571,15 @@ export function computeDepositRequired(
   return amount;
 }
 
-/** Deposits belong to sales orders only (ADR 0010 part 3). */
+/** Deposits belong to sales and purchase orders (ADR 0010 part 3, ADR 0016). */
 export function resolveDepositRequest(
   type: DocumentType,
   request: DepositRequest | undefined,
   lines: readonly DocumentLine[],
 ): bigint | null {
   if (request === undefined) return null;
-  if (type !== 'sales_order') {
-    throw new LedgerError('INVALID_DOCUMENT', 'Deposits can only be requested on sales orders');
+  if (type !== 'sales_order' && type !== 'purchase_order') {
+    throw new LedgerError('INVALID_DOCUMENT', 'Deposits can only be requested on sales or purchase orders');
   }
   return computeDepositRequired(request, revisionGrandTotal({ lines }));
 }
@@ -2505,6 +2506,24 @@ export class DocumentBook implements ItemCatalog {
           );
         }
       }
+      // ADR 0016: special-order items and supplier prepayment terms require a
+      // deposit committed before the order is submitted to the supplier.
+      const info = document.partyId !== null ? this.supplierInfoAt(document.partyId, current.date) : undefined;
+      const floor = purchaseDepositFloor(
+        current.lines,
+        (itemId) => this.getItem(itemId),
+        info?.prepaymentPercentMilli ?? null,
+      );
+      if (floor > 0n && (current.depositRequiredMinor ?? 0n) < floor) {
+        if (options?.overrideDeposit === true) {
+          this.requireApproval('deposit_override', options.approvedBy);
+        } else {
+          throw new LedgerError(
+            'DEPOSIT_REQUIRED',
+            `Supplier requires prepayment: the deposit request must cover at least ${floor}, not ${current.depositRequiredMinor ?? 0n} (pass overrideDeposit to send anyway)`,
+          );
+        }
+      }
     }
     this.documents.set(id, { ...document, status: 'sent' });
     // ADR 0014: sending/approving moves stock for inventory items.
@@ -2520,12 +2539,28 @@ export class DocumentBook implements ItemCatalog {
       id,
     );
     if (document.type === 'invoice') {
-      this.transferDeposits(id);
+      const source = document.sourceDocumentId !== null ? this.documents.get(document.sourceDocumentId) : undefined;
+      if (source?.type === 'sales_order') this.transferDeposits(id, source);
+    }
+    if (document.type === 'bill') {
+      // ADR 0016: deposits ride from the originating PO onto the bill,
+      // resolving through a receipt in the three-way flow (ADR 0015).
+      const po = this.originatingPurchaseOrder(document);
+      if (po) this.transferDeposits(id, po);
     }
     return this.view(id);
   }
 
-  /** Total deposit money held against a sales order (ADR 0010 part 3). */
+  /** Walk a bill's source chain (bill → receipt? → purchase_order). */
+  private originatingPurchaseOrder(bill: DocumentRecord): DocumentRecord | undefined {
+    let source = bill.sourceDocumentId !== null ? this.documents.get(bill.sourceDocumentId) : undefined;
+    if (source?.type === 'receipt') {
+      source = source.sourceDocumentId !== null ? this.documents.get(source.sourceDocumentId) : undefined;
+    }
+    return source?.type === 'purchase_order' ? source : undefined;
+  }
+
+  /** Total deposit money held against a sales or purchase order (ADR 0010/0016). */
   depositHeld(documentId: string): bigint {
     this.requireDocument(documentId);
     return appliedToInvoice(this.applications, documentId, (kind, id) => this.isSourceActive(kind, id));
@@ -2544,16 +2579,13 @@ export class DocumentBook implements ItemCatalog {
   }
 
   /**
-   * Move deposits held on the source sales order onto a just-sent invoice:
-   * line-level prepayments whose line converted into this invoice first,
-   * then document-level deposits, oldest first (ADR 0010 part 3). Each move
-   * is a reversal plus a fresh application — fully auditable.
+   * Move deposits held on a source order onto a just-finalized document:
+   * line-level prepayments whose line converted here first, then
+   * document-level deposits, oldest first (ADR 0010 part 3, ADR 0016). Each
+   * move is a reversal plus a fresh application — fully auditable.
    */
-  private transferDeposits(invoiceId: string): void {
+  private transferDeposits(invoiceId: string, source: DocumentRecord): void {
     const invoice = this.requireDocument(invoiceId);
-    if (invoice.sourceDocumentId === null) return;
-    const source = this.documents.get(invoice.sourceDocumentId);
-    if (!source || source.type !== 'sales_order') return;
     const invoiceCurrent = invoice.revisions[invoice.revisions.length - 1]!;
     const convertedLineIds = new Set(
       invoiceCurrent.lines

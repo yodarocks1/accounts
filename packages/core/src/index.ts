@@ -173,6 +173,7 @@ export {
   computePurchaseCoverage,
   specialOrderLines,
   specialOrderDepositFloor,
+  purchaseDepositFloor,
 } from './suppliers.js';
 export {
   POSTING_ROLES,

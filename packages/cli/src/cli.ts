@@ -437,7 +437,7 @@ function cmdDocShow(args: string[]): string {
       const settlement = file.invoiceSettlement(view.id);
       totals.push(`Paid: ${usd(settlement.paid)}  Open: ${usd(settlement.open)}  [${settlement.status}]`);
     }
-    if (view.type === 'sales_order' && view.status === 'sent') {
+    if ((view.type === 'sales_order' || view.type === 'purchase_order') && view.status === 'sent') {
       totals.push(`Deposit held: ${usd(file.depositHeld(view.id))}`);
     }
     if (view.type === 'purchase_order' && view.status === 'draft') {

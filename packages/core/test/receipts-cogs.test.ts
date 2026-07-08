@@ -56,7 +56,7 @@ describe('receipts (ADR 0015)', () => {
     });
     expect(() =>
       book.applyCredit({ sourceKind: 'payment', sourceId: payment.id, invoiceId: receipt.id, amount: 900n }),
-    ).toThrowError(/invoices, sales orders \(deposits\), or bills/);
+    ).toThrowError(/invoices, orders \(deposits\), or bills/);
     // Direct-billed lines (no receipt source) still move stock at approval.
     billIn(book, supplier.id, widget.id, 2000n, 950n, 'BILL-2', '2026-07-03');
     expect(book.stockOnHand(widget.id).goodMilli).toBe(3000n);

@@ -370,6 +370,10 @@ A first-class, obsessively-tested onramp — this determines adoption.
       FIFO valuation engine over the movement ledger, inventory-asset/COGS
       posting on sale, graceful degradation when roles are unmapped
       (ADR 0015)
+- [x] Purchase prepayments: supplier deposits mirror the sales side —
+      special_order items and a supplier prepayment-% gate PO send, outbound
+      payments deposit against the PO and transfer to the bill (through a
+      receipt in the three-way flow) (ADR 0016)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging
 - [ ] Plugin host v1 (in-process, bundled plugins only) — dogfooding the API
