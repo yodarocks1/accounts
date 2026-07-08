@@ -366,6 +366,10 @@ A first-class, obsessively-tested onramp — this determines adoption.
       stock ledger driven by document sends/voids/corrections, damage
       with per-item dispositions (restock/recycle/trash), assemblies with
       additive BOM cost derivation and build/break (ADR 0014)
+- [x] Receipts & COGS: three-way flow (PO→receipt→bill) with GRNI accrual,
+      FIFO valuation engine over the movement ledger, inventory-asset/COGS
+      posting on sale, graceful degradation when roles are unmapped
+      (ADR 0015)
 - [ ] CSV/OFX bank import + manual reconciliation
 - [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging
 - [ ] Plugin host v1 (in-process, bundled plugins only) — dogfooding the API

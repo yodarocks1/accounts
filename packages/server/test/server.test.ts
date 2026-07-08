@@ -245,7 +245,32 @@ describe('document API (Tier 3)', () => {
     expect(overbuild.json.error).toBe('INSUFFICIENT_STOCK');
   });
 
+  it('receipts and FIFO valuation over HTTP (ADR 0015)', async () => {
+    const widget = (await post('/items', { name: 'Widget', currency: 'USD', unitPrice: '2500', kind: 'inventory' })).json as { id: string };
+    const supplier = (await post('/parties', { name: 'Supplier Inc' })).json as { id: string };
+
+    const po = (await post('/documents', {
+      type: 'purchase_order', number: 'PO-1', date: '2026-07-01', partyId: supplier.id,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: '10000', unitPrice: '900', lineId: 'P1' }],
+    })).json as { id: string };
+    await post(`/documents/${po.id}/send`, {});
+
+    // Receipt lands stock; bill clears it without re-stocking.
+    const receipt = (await post(`/documents/${po.id}/convert`, { type: 'receipt', number: 'RCT-1', date: '2026-07-05' })).json as { id: string };
+    await post(`/documents/${receipt.id}/send`, {});
+    expect((await get(`/items/${widget.id}/stock`)).json).toEqual({ goodMilli: '10000', damagedMilli: '0' });
+    const bill = (await post(`/documents/${receipt.id}/convert`, { type: 'bill', number: 'BILL-1', date: '2026-07-10' })).json as { id: string };
+    await post(`/documents/${bill.id}/send`, {});
+    expect((await get(`/items/${widget.id}/stock`)).json).toEqual({ goodMilli: '10000', damagedMilli: '0' });
+
+    // FIFO valuation carries the PO price.
+    const valuation = (await get(`/items/${widget.id}/valuation`)).json as { quantityMilli: string; valueMinor: string };
+    expect(valuation.quantityMilli).toBe('10000');
+    expect(valuation.valueMinor).toBe('9000');
+  });
+
   it('gated actions surface 403 APPROVAL_REQUIRED', async () => {
+    await post('/policies/approval', { actions: ['void_document'] });
     await post('/policies/approval', { actions: ['void_document'] });
     const item = (await post('/items', { name: 'W', currency: 'USD', unitPrice: '100' })).json as { id: string };
     const doc = (await post('/documents', {

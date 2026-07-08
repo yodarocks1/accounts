@@ -19,6 +19,7 @@ import {
   planPosting,
   resolveRateForQuantity,
   revisionGrandTotal,
+  customerLineTotal,
   revisionTax,
   revisionTotal,
   settle,
@@ -54,7 +55,6 @@ import {
   type NewLineClosure,
   type NewReturn,
   type PriceKind,
-  type PostingKind,
   type PostingRole,
   type CustomerQuery,
   type CustomerRate,
@@ -96,9 +96,14 @@ import {
   type TrialBalance,
   componentNeed,
   diffStockEffects,
+  valueInventory,
+  planDocumentPosting,
   DISPOSITIONS,
   ITEM_KINDS,
   stockEffects,
+  type ItemValuation,
+  type DocumentPostingKind,
+  type DocumentPostingAmounts,
   type Disposition,
   type ItemBom,
   type ItemKind,
@@ -1376,10 +1381,11 @@ export class CompanyFile implements ItemCatalog {
       if (document.status === 'sent') {
         // ADR 0014: quantity-changing corrections keep stock consistent.
         const getItem = (itemId: string) => this.getItem(itemId);
+        const sourceTypeOf = (documentId: string) => this.getDocumentRecord(documentId)?.type;
         this.applyStockEffects(
           diffStockEffects(
-            stockEffects(document.type, previous.lines, getItem),
-            stockEffects(document.type, lines, getItem),
+            stockEffects(document.type, previous.lines, getItem, sourceTypeOf),
+            stockEffects(document.type, lines, getItem, sourceTypeOf),
           ),
           'correction',
           date,
@@ -1713,7 +1719,12 @@ export class CompanyFile implements ItemCatalog {
       this.audit('document.sent', 'document', id, {});
       // ADR 0014: sending/approving moves stock for inventory items.
       this.applyStockEffects(
-        stockEffects(document.type, current.lines, (itemId) => this.getItem(itemId)),
+        stockEffects(
+          document.type,
+          current.lines,
+          (itemId) => this.getItem(itemId),
+          (documentId) => this.getDocumentRecord(documentId)?.type,
+        ),
         'document',
         current.date,
         id,
@@ -1812,7 +1823,12 @@ export class CompanyFile implements ItemCatalog {
       this.audit('document.voided', 'document', id, {});
       if (wasSent) {
         // ADR 0014: voiding a sent document puts its stock back.
-        const effects = stockEffects(document.type, voidCurrent.lines, (itemId) => this.getItem(itemId));
+        const effects = stockEffects(
+          document.type,
+          voidCurrent.lines,
+          (itemId) => this.getItem(itemId),
+          (documentId) => this.getDocumentRecord(documentId)?.type,
+        );
         this.applyStockEffects(
           effects.map((effect) => ({ ...effect, deltaMilli: -effect.deltaMilli })),
           'void',
@@ -2031,6 +2047,7 @@ export class CompanyFile implements ItemCatalog {
       reason: string | null;
       source_id: string | null;
       disposition: Disposition | null;
+      value_minor: bigint | null;
     }
     const rows = this.db
       .prepare(`SELECT * FROM stock_movements WHERE item_id = ? ORDER BY movement_seq`)
@@ -2046,7 +2063,17 @@ export class CompanyFile implements ItemCatalog {
       reason: row.reason,
       sourceId: row.source_id,
       disposition: row.disposition,
+      valueMinor: row.value_minor,
     }));
+  }
+
+  /** FIFO valuation, derived from the movement ledger (ADR 0015). */
+  itemValuation(itemId: string, asOf?: string): ItemValuation {
+    if (!this.db.prepare(`SELECT 1 FROM items WHERE id = ?`).get(itemId)) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${itemId}`);
+    }
+    const movements = this.stockMovements(itemId).filter((movement) => asOf === undefined || movement.date <= asOf);
+    return valueInventory(movements, (date) => this.costAt(itemId, date));
   }
 
   private requireInventoryItem(itemId: string): Item {
@@ -2066,12 +2093,12 @@ export class CompanyFile implements ItemCatalog {
     condition: StockCondition,
     quantityMilli: bigint,
     date: string,
-    options?: { reason?: string; sourceId?: string; disposition?: Disposition },
+    options?: { reason?: string; sourceId?: string; disposition?: Disposition; valueMinor?: bigint },
   ): void {
     this.db
       .prepare(
-        `INSERT INTO stock_movements (item_id, kind, condition, quantity_milli, date, at, reason, source_id, disposition)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO stock_movements (item_id, kind, condition, quantity_milli, date, at, reason, source_id, disposition, value_minor)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         itemId,
@@ -2083,12 +2110,16 @@ export class CompanyFile implements ItemCatalog {
         options?.reason ?? null,
         options?.sourceId ?? null,
         options?.disposition ?? null,
+        options?.valueMinor ?? null,
       );
   }
 
   private applyStockEffects(effects: readonly StockEffect[], kind: StockMovementKind, date: string, sourceId: string): void {
     for (const effect of effects) {
-      this.insertMovement(effect.itemId, kind, effect.condition, effect.deltaMilli, date, { sourceId });
+      this.insertMovement(effect.itemId, kind, effect.condition, effect.deltaMilli, date, {
+        sourceId,
+        ...(effect.valueMinor !== undefined ? { valueMinor: effect.valueMinor } : {}),
+      });
     }
   }
 
@@ -3043,29 +3074,72 @@ export class CompanyFile implements ItemCatalog {
     this.audit('ledger.posted', 'posting', sourceId, { sourceKind, entryId, kind });
   }
 
-  /** Post a sent invoice/credit memo if the needed roles are mapped. */
+  /**
+   * Post a sent document with inventory accounting (ADR 0015). COGS and
+   * inventory values come from the FIFO engine over the (already-written)
+   * movement ledger; with the inventory roles unmapped, this degrades to the
+   * pre-inventory revenue/purchases behavior.
+   */
   private postDocumentIfConfigured(record: DocumentRecord): void {
-    let kind: PostingKind;
+    let kind: DocumentPostingKind;
     if (record.type === 'invoice') kind = 'invoice';
     else if (record.type === 'bill') kind = 'bill';
+    else if (record.type === 'receipt') kind = 'receipt';
     else if (record.type === 'credit_memo') {
       kind = record.settlement === 'refund' ? 'credit_refund' : 'credit_account';
     } else if (record.type === 'vendor_credit') {
       kind = record.settlement === 'refund' ? 'vendor_credit_refund' : 'vendor_credit_account';
     } else return;
     const current = record.revisions[record.revisions.length - 1]!;
-    const plan = planPosting(
+    const amounts: DocumentPostingAmounts = {
+      net: revisionTotal(current),
+      tax: revisionTax(current),
+      inventory: this.documentInventoryValue(record),
+    };
+    if (record.type === 'bill') {
+      const grni = this.billGrniValue(record);
+      amounts.grni = grni;
+      amounts.inventory += grni; // direct-billed value + GRNI-cleared portion
+    }
+    const plan = planDocumentPosting(
       kind,
-      revisionTotal(current),
+      amounts,
       current.lines[0]!.currency,
       current.date,
       this.postingAccounts(),
       `${record.number} (${current.customerName})`,
-      revisionTax(current),
     );
     if (!plan) return;
     const entry = this.postEntry(plan);
     this.recordPosting('document', record.id, entry.id, 'post');
+  }
+
+  /** Absolute net FIFO inventory value this document moved (ADR 0015). */
+  private documentInventoryValue(record: DocumentRecord): bigint {
+    const current = record.revisions[record.revisions.length - 1]!;
+    const items = new Set<string>();
+    for (const line of current.lines) {
+      if (line.itemId !== null) items.add(line.itemId);
+    }
+    let net = 0n;
+    for (const itemId of items) {
+      if (this.getItem(itemId)?.kind !== 'inventory') continue;
+      net += this.itemValuation(itemId).costBySource.get(record.id) ?? 0n;
+    }
+    return net < 0n ? -net : net;
+  }
+
+  /** Value of a bill's inventory lines already received via a receipt (GRNI). */
+  private billGrniValue(record: DocumentRecord): bigint {
+    const current = record.revisions[record.revisions.length - 1]!;
+    let grni = 0n;
+    for (const line of current.lines) {
+      if (line.itemId === null || this.getItem(line.itemId)?.kind !== 'inventory') continue;
+      if (line.sourceDocumentId !== null && this.getDocumentRecord(line.sourceDocumentId)?.type === 'receipt') {
+        grni += customerLineTotal(line);
+      }
+    }
+    return grni;
   }
 
   private reversePostingIfActive(

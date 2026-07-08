@@ -937,7 +937,73 @@ CREATE TRIGGER item_bom_components_no_delete BEFORE DELETE ON item_bom_component
 BEGIN SELECT RAISE(ABORT, 'bills of materials are immutable; append a newer version'); END;
 `;
 
+const V19_SQL = `
+-- ADR 0015: receipts and COGS. receipt joins the document-type and
+-- sequence-kind enums; posting roles gain inventory_asset, cogs, and
+-- goods_received_not_invoiced; inbound purchase stock movements snapshot
+-- their line value for the FIFO valuation engine.
+DROP TRIGGER documents_status_only_update;
+DROP TRIGGER documents_no_delete;
+DROP INDEX idx_documents_source;
+
+CREATE TABLE documents_v19 (
+  id                      TEXT PRIMARY KEY,
+  type                    TEXT NOT NULL CHECK (type IN ('estimate','sales_order','invoice','credit_memo','purchase_order','bill','vendor_credit','receipt')),
+  number                  TEXT NOT NULL CHECK (length(trim(number)) > 0),
+  status                  TEXT NOT NULL CHECK (status IN ('draft','sent','void')),
+  source_document_id      TEXT REFERENCES documents(id),
+  inherited_corrections   INTEGER NOT NULL DEFAULT 0 CHECK (inherited_corrections IN (0,1)),
+  inherited_substitutions INTEGER NOT NULL DEFAULT 0 CHECK (inherited_substitutions IN (0,1)),
+  settlement              TEXT CHECK (settlement IN ('account','refund')),
+  party_id                TEXT REFERENCES parties(id),
+  UNIQUE (type, number)
+) STRICT;
+
+INSERT INTO documents_v19 (id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement, party_id)
+  SELECT id, type, number, status, source_document_id, inherited_corrections, inherited_substitutions, settlement, party_id FROM documents;
+
+DROP TABLE documents;
+ALTER TABLE documents_v19 RENAME TO documents;
+
+CREATE TRIGGER documents_status_only_update BEFORE UPDATE ON documents
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.type IS NOT OLD.type
+  OR NEW.number IS NOT OLD.number
+  OR NEW.source_document_id IS NOT OLD.source_document_id
+  OR NEW.inherited_corrections IS NOT OLD.inherited_corrections
+  OR NEW.inherited_substitutions IS NOT OLD.inherited_substitutions
+  OR NEW.settlement IS NOT OLD.settlement
+  OR NEW.party_id IS NOT OLD.party_id
+BEGIN SELECT RAISE(ABORT, 'only document status may change'); END;
+
+CREATE TRIGGER documents_no_delete BEFORE DELETE ON documents
+BEGIN SELECT RAISE(ABORT, 'documents are never deleted; void them'); END;
+
+CREATE INDEX idx_documents_source ON documents(source_document_id);
+
+CREATE TABLE number_sequences_v19 (
+  kind       TEXT PRIMARY KEY CHECK (kind IN ('estimate','sales_order','invoice','credit_memo','purchase_order','bill','vendor_credit','receipt','payment')),
+  prefix     TEXT NOT NULL,
+  next_value INTEGER NOT NULL CHECK (next_value >= 1),
+  width      INTEGER NOT NULL CHECK (width >= 1)
+) STRICT;
+INSERT INTO number_sequences_v19 SELECT kind, prefix, next_value, width FROM number_sequences;
+DROP TABLE number_sequences;
+ALTER TABLE number_sequences_v19 RENAME TO number_sequences;
+
+CREATE TABLE posting_accounts_v19 (
+  role       TEXT PRIMARY KEY CHECK (role IN ('accounts_receivable','sales_income','cash','sales_tax_payable','accounts_payable','purchases_expense','inventory_asset','cogs','goods_received_not_invoiced')),
+  account_id TEXT NOT NULL REFERENCES accounts(id)
+) STRICT;
+INSERT INTO posting_accounts_v19 SELECT role, account_id FROM posting_accounts;
+DROP TABLE posting_accounts;
+ALTER TABLE posting_accounts_v19 RENAME TO posting_accounts;
+
+ALTER TABLE stock_movements ADD COLUMN value_minor INTEGER
+  CHECK (value_minor IS NULL OR value_minor >= 0);
+`;
+
 /** MIGRATIONS[n] takes a file from version n to n+1. */
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL, V18_SQL];
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL, V18_SQL, V19_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

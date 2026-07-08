@@ -12,6 +12,9 @@ export const POSTING_ROLES = [
   'sales_tax_payable',
   'accounts_payable',
   'purchases_expense',
+  'inventory_asset',
+  'cogs',
+  'goods_received_not_invoiced',
 ] as const;
 export type PostingRole = (typeof POSTING_ROLES)[number];
 
@@ -117,4 +120,136 @@ export function planPosting(
       { accountId: creditAccount, side: 'credit', amount: gross, currency },
     ],
   };
+}
+
+// ── Document entries with inventory accounting (ADR 0015) ──────────────────
+
+export type DocumentPostingKind =
+  | 'invoice'
+  | 'credit_account'
+  | 'credit_refund'
+  | 'bill'
+  | 'receipt'
+  | 'vendor_credit_account'
+  | 'vendor_credit_refund';
+
+export interface DocumentPostingAmounts {
+  /** Pre-tax customer/supplier amount. */
+  net: bigint;
+  tax: bigint;
+  /**
+   * Inventory value moved (positive): FIFO cost for invoices/credits and
+   * vendor credits, line value for bills/receipts. Zero when the document
+   * touches no tracked stock.
+   */
+  inventory: bigint;
+  /** Portion of a bill's inventory value that clears GRNI (received earlier). */
+  grni?: bigint;
+}
+
+interface EntryLine {
+  accountId: string;
+  side: 'debit' | 'credit';
+  amount: bigint;
+  currency: string;
+}
+
+/**
+ * One balanced entry per document (ADR 0015). With inventory_asset unmapped,
+ * bills post entirely to purchases and invoices post revenue only — exactly
+ * the pre-inventory behavior; books opt in by mapping the roles.
+ */
+export function planDocumentPosting(
+  kind: DocumentPostingKind,
+  amounts: DocumentPostingAmounts,
+  currency: string,
+  date: string,
+  accounts: Partial<Record<PostingRole, string>>,
+  memo?: string,
+): NewJournalEntry | null {
+  const gross = amounts.net + amounts.tax;
+  if (gross <= 0n) return null;
+  const lines: EntryLine[] = [];
+  const push = (accountId: string | undefined, side: 'debit' | 'credit', amount: bigint): boolean => {
+    if (amount === 0n) return true;
+    if (amount < 0n || accountId === undefined) return false;
+    lines.push({ accountId, side, amount, currency });
+    return true;
+  };
+  const done = (): NewJournalEntry | null =>
+    lines.length === 0 ? null : { date, ...(memo !== undefined ? { memo } : {}), lines };
+
+  if (kind === 'invoice' || kind === 'credit_account' || kind === 'credit_refund') {
+    const splitTax = amounts.tax > 0n && accounts.sales_tax_payable !== undefined;
+    const income = splitTax ? amounts.net : gross;
+    const facing = kind === 'invoice' || kind === 'credit_account' ? accounts.accounts_receivable : accounts.cash;
+    if (facing === undefined || accounts.sales_income === undefined) return null;
+    if (kind === 'invoice') {
+      push(facing, 'debit', gross);
+      push(accounts.sales_income, 'credit', income);
+      if (splitTax) push(accounts.sales_tax_payable, 'credit', amounts.tax);
+    } else {
+      push(accounts.sales_income, 'debit', income);
+      if (splitTax) push(accounts.sales_tax_payable, 'debit', amounts.tax);
+      push(facing, 'credit', gross);
+    }
+    // COGS rides in the same entry when the inventory roles are mapped.
+    if (amounts.inventory > 0n && accounts.cogs !== undefined && accounts.inventory_asset !== undefined) {
+      if (kind === 'invoice') {
+        push(accounts.cogs, 'debit', amounts.inventory);
+        push(accounts.inventory_asset, 'credit', amounts.inventory);
+      } else {
+        push(accounts.inventory_asset, 'debit', amounts.inventory);
+        push(accounts.cogs, 'credit', amounts.inventory);
+      }
+    }
+    return done();
+  }
+
+  if (kind === 'receipt') {
+    // DR inventory / CR goods-received-not-invoiced; both roles or nothing.
+    if (
+      amounts.inventory <= 0n ||
+      accounts.inventory_asset === undefined ||
+      accounts.goods_received_not_invoiced === undefined
+    ) {
+      return null;
+    }
+    push(accounts.inventory_asset, 'debit', amounts.inventory);
+    push(accounts.goods_received_not_invoiced, 'credit', amounts.inventory);
+    return done();
+  }
+
+  if (kind === 'bill') {
+    if (accounts.accounts_payable === undefined) return null;
+    let inventory = accounts.inventory_asset !== undefined ? amounts.inventory : 0n;
+    if (inventory > amounts.net) inventory = amounts.net;
+    let grni = accounts.goods_received_not_invoiced !== undefined ? (amounts.grni ?? 0n) : 0n;
+    if (grni > inventory) grni = inventory;
+    const expensed = amounts.net - inventory;
+    if (grni > 0n) push(accounts.goods_received_not_invoiced, 'debit', grni);
+    if (inventory - grni > 0n && !push(accounts.inventory_asset, 'debit', inventory - grni)) return null;
+    if (expensed > 0n && !push(accounts.purchases_expense, 'debit', expensed)) return null;
+    push(accounts.accounts_payable, 'credit', amounts.net);
+    return done();
+  }
+
+  // Vendor credits: DR AP/cash gross, CR inventory at consumed FIFO value,
+  // remainder (price variance) against purchases.
+  const facing = kind === 'vendor_credit_account' ? accounts.accounts_payable : accounts.cash;
+  if (facing === undefined) return null;
+  const inventory = accounts.inventory_asset !== undefined ? amounts.inventory : 0n;
+  const remainder = amounts.net - inventory;
+  push(facing, 'debit', amounts.net);
+  if (inventory > 0n) push(accounts.inventory_asset, 'credit', inventory);
+  if (remainder !== 0n) {
+    if (accounts.purchases_expense === undefined) return null;
+    if (remainder > 0n) push(accounts.purchases_expense, 'credit', remainder);
+    else push(accounts.purchases_expense, 'debit', -remainder);
+  }
+  // A pure-variance entry with nothing mapped degenerates; require balance.
+  const debits = lines.filter((line) => line.side === 'debit').reduce((sum, line) => sum + line.amount, 0n);
+  const credits = lines.filter((line) => line.side === 'credit').reduce((sum, line) => sum + line.amount, 0n);
+  if (debits !== credits) return null;
+  return done();
 }

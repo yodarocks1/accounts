@@ -24,8 +24,10 @@ import {
   ITEM_KINDS,
   stockEffects,
   sumStock,
+  valueInventory,
   type Disposition,
   type ItemBom,
+  type ItemValuation,
   type ItemKind,
   type NewItemBom,
   type StockCondition,
@@ -65,12 +67,13 @@ export const DOCUMENT_TYPES = [
   'purchase_order',
   'bill',
   'vendor_credit',
+  'receipt',
 ] as const;
 export type DocumentType = (typeof DOCUMENT_TYPES)[number];
 
 /** Purchase-side documents share cost pricing and untaxed lines (ADR 0011/0012). */
 export function isPurchaseType(type: DocumentType): boolean {
-  return type === 'purchase_order' || type === 'bill' || type === 'vendor_credit';
+  return type === 'purchase_order' || type === 'bill' || type === 'vendor_credit' || type === 'receipt';
 }
 
 export type DocumentStatus = 'draft' | 'sent' | 'void';
@@ -88,10 +91,12 @@ export const CONVERSION_TARGETS: Record<DocumentType, readonly DocumentType[]> =
   sales_order: ['invoice'],
   invoice: [],
   credit_memo: [],
-  // A billed purchase order mirrors an invoiced sales order (ADR 0012).
-  purchase_order: ['bill'],
+  // A billed purchase order mirrors an invoiced sales order (ADR 0012);
+  // goods arriving before the bill go PO → receipt → bill (ADR 0015).
+  purchase_order: ['bill', 'receipt'],
   bill: [],
   vendor_credit: [],
+  receipt: ['bill'],
 };
 
 export interface DocumentLine {
@@ -428,10 +433,11 @@ export function resolveRevisionKind(
       return 'correction';
     case 'sales_order':
     case 'purchase_order':
+    case 'receipt':
       if (requested !== 'correction' && requested !== 'substitution') {
         throw new LedgerError(
           'INVALID_REVISION_KIND',
-          `Changing a sent ${type === 'sales_order' ? 'sales' : 'purchase'} order requires kind "correction" or "substitution"`,
+          `Changing a sent ${type.replace('_', ' ')} requires kind "correction" or "substitution"`,
         );
       }
       return requested;
@@ -2001,10 +2007,11 @@ export class DocumentBook implements ItemCatalog {
     if (document.status === 'sent') {
       // ADR 0014: quantity-changing corrections keep stock consistent.
       const getItem = (itemId: string) => this.items.get(itemId);
+      const sourceTypeOf = (documentId: string) => this.documents.get(documentId)?.type;
       this.applyStockEffects(
         diffStockEffects(
-          stockEffects(document.type, previous.lines, getItem),
-          stockEffects(document.type, lines, getItem),
+          stockEffects(document.type, previous.lines, getItem, sourceTypeOf),
+          stockEffects(document.type, lines, getItem, sourceTypeOf),
         ),
         'correction',
         date,
@@ -2502,7 +2509,12 @@ export class DocumentBook implements ItemCatalog {
     this.documents.set(id, { ...document, status: 'sent' });
     // ADR 0014: sending/approving moves stock for inventory items.
     this.applyStockEffects(
-      stockEffects(document.type, current.lines, (itemId) => this.items.get(itemId)),
+      stockEffects(
+        document.type,
+        current.lines,
+        (itemId) => this.items.get(itemId),
+        (documentId) => this.documents.get(documentId)?.type,
+      ),
       'document',
       current.date,
       id,
@@ -2621,7 +2633,7 @@ export class DocumentBook implements ItemCatalog {
     condition: StockCondition,
     quantityMilli: bigint,
     date: string,
-    options?: { reason?: string; sourceId?: string; disposition?: Disposition; at?: string },
+    options?: { reason?: string; sourceId?: string; disposition?: Disposition; valueMinor?: bigint; at?: string },
   ): StockMovement {
     const movement: StockMovement = {
       movementSeq: this.movements.length + 1,
@@ -2634,6 +2646,7 @@ export class DocumentBook implements ItemCatalog {
       reason: options?.reason ?? null,
       sourceId: options?.sourceId ?? null,
       disposition: options?.disposition ?? null,
+      valueMinor: options?.valueMinor ?? null,
     };
     this.movements.push(movement);
     return movement;
@@ -2641,8 +2654,22 @@ export class DocumentBook implements ItemCatalog {
 
   private applyStockEffects(effects: readonly StockEffect[], kind: StockMovementKind, date: string, sourceId: string): void {
     for (const effect of effects) {
-      this.pushMovement(effect.itemId, kind, effect.condition, effect.deltaMilli, date, { sourceId });
+      this.pushMovement(effect.itemId, kind, effect.condition, effect.deltaMilli, date, {
+        sourceId,
+        ...(effect.valueMinor !== undefined ? { valueMinor: effect.valueMinor } : {}),
+      });
     }
+  }
+
+  /** FIFO valuation, derived from the movement ledger (ADR 0015). */
+  itemValuation(itemId: string, asOf?: string): ItemValuation {
+    if (!this.items.has(itemId)) {
+      throw new LedgerError('UNKNOWN_ITEM', `No such item: ${itemId}`);
+    }
+    const movements = this.movements.filter(
+      (movement) => movement.itemId === itemId && (asOf === undefined || movement.date <= asOf),
+    );
+    return valueInventory(movements, (date) => this.costAt(itemId, date));
   }
 
   /** Manual signed count; negative = shrinkage write-off (approvable). */
@@ -3028,7 +3055,12 @@ export class DocumentBook implements ItemCatalog {
     this.documents.set(id, { ...document, status: 'void' });
     if (wasSent) {
       // ADR 0014: voiding a sent document puts its stock back.
-      const effects = stockEffects(document.type, current.lines, (itemId) => this.items.get(itemId));
+      const effects = stockEffects(
+        document.type,
+        current.lines,
+        (itemId) => this.items.get(itemId),
+        (documentId) => this.documents.get(documentId)?.type,
+      );
       this.applyStockEffects(
         effects.map((effect) => ({ ...effect, deltaMilli: -effect.deltaMilli })),
         'void',

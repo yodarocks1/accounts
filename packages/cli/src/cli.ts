@@ -359,7 +359,9 @@ function cmdItemStock(args: string[]): string {
     if (!item) fail(`No such item: ${itemId}`);
     if (item.kind !== 'inventory') return `${item.name}: ${item.kind.replace('_', '-')} (no tracked stock)`;
     const level = file.stockOnHand(itemId, values['as-of']);
-    return `${item.name}: ${formatQuantity(level.goodMilli)} good, ${formatQuantity(level.damagedMilli)} damaged on hand`;
+    const valuation = file.itemValuation(itemId, values['as-of']);
+    const value = formatMoney(money(valuation.valueMinor, item.currency));
+    return `${item.name}: ${formatQuantity(level.goodMilli)} good, ${formatQuantity(level.damagedMilli)} damaged on hand (FIFO value ${value})`;
   } finally {
     file.close();
   }

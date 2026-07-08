@@ -180,6 +180,9 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
       return file.stockOnHand(id, query.get('asOf') ?? undefined);
     }
     if (method === 'GET' && id !== undefined && sub === 'movements') return file.stockMovements(id);
+    if (method === 'GET' && id !== undefined && sub === 'valuation') {
+      return file.itemValuation(id, query.get('asOf') ?? undefined);
+    }
     if (method === 'POST' && id !== undefined && sub === 'stock-adjustments') {
       return file.adjustStock(id, money(body.quantityMilli, 'quantityMilli'), {
         ...(body.reason !== undefined ? { reason: str(body.reason, 'reason') } : {}),

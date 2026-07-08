@@ -150,10 +150,13 @@ export {
   type BomComponent,
   type ItemBom,
   type NewItemBom,
+  type FifoLayer,
+  type ItemValuation,
   sumStock,
   stockEffects,
   diffStockEffects,
   componentNeed,
+  valueInventory,
 } from './inventory.js';
 export {
   type ShippingEstimate,
@@ -175,8 +178,11 @@ export {
   POSTING_ROLES,
   type PostingRole,
   type PostingKind,
+  type DocumentPostingKind,
+  type DocumentPostingAmounts,
   rolesFor,
   planPosting,
+  planDocumentPosting,
 } from './posting.js';
 export {
   type Payment,
