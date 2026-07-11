@@ -31,6 +31,7 @@ Document layer:
   accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order|bill|vendor_credit>]
   accounts doc show <file> <document-id>
   accounts doc send <file> <document-id> [--override-deposit] [--override-minimum] [--approved-by <who>]
+  accounts report <pnl|balance-sheet|ar-aging|ap-aging|inventory> <file> [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--as-of YYYY-MM-DD]
   accounts statement <file> (--party <id> | --customer <name> | --acct <number>) [--as-of YYYY-MM-DD] [--supplier]
   accounts serve <file> [--port 3000]
 
@@ -107,6 +108,8 @@ export function run(argv: string[]): string {
       return cmdItem(rest);
     case 'doc':
       return cmdDoc(rest);
+    case 'report':
+      return cmdReport(rest);
     case 'statement':
       return cmdStatement(rest);
     case 'serve':
@@ -479,6 +482,77 @@ function cmdDocSend(args: string[]): string {
         `ASK: keep ${suggestion.itemName} at ${formatMoney(money(suggestion.givenPrice, view.currency))} for ${suggestion.customerName}? (list ${formatMoney(money(suggestion.catalogPrice, view.currency))})`,
     );
     return [`Sent ${view.label}`, ...ask].join('\n');
+  } finally {
+    file.close();
+  }
+}
+
+function cmdReport(args: string[]): string {
+  const [kind, ...rest] = args;
+  const { values, positionals } = parseArgs({
+    args: rest,
+    allowPositionals: true,
+    options: {
+      from: { type: 'string' },
+      to: { type: 'string' },
+      'as-of': { type: 'string' },
+    },
+  });
+  const file = CompanyFile.open(requirePath(positionals));
+  try {
+    const asOf = values['as-of'] ?? new Date().toISOString().slice(0, 10);
+    const usd = (value: bigint) => formatMoney(money(value, file.info().baseCurrency));
+    if (kind === 'pnl') {
+      if (!values.from || !values.to) fail('report pnl requires --from and --to');
+      const report = file.profitAndLoss(values.from, values.to);
+      const rows = [
+        ['', 'ACCOUNT', 'AMOUNT'],
+        ...report.income.map((row) => ['income', `${row.code ? `[${row.code}] ` : ''}${row.name}`, usd(row.amount)]),
+        ['', 'Total income', usd(report.totalIncome)],
+        ...report.expense.map((row) => ['expense', `${row.code ? `[${row.code}] ` : ''}${row.name}`, usd(row.amount)]),
+        ['', 'Total expense', usd(report.totalExpense)],
+      ];
+      return `PROFIT & LOSS ${report.from} … ${report.to}\n${table(rows, ['left', 'left', 'right'])}\n\nNet profit: ${usd(report.netProfit)}`;
+    }
+    if (kind === 'balance-sheet') {
+      const report = file.balanceSheet(asOf);
+      const section = (label: string, rows: typeof report.assets, total: bigint) => [
+        [label.toUpperCase(), ''],
+        ...rows.map((row) => [`  ${row.code ? `[${row.code}] ` : ''}${row.name}`, usd(row.amount)]),
+        [`  Total ${label}`, usd(total)],
+      ];
+      const rows = [
+        ...section('assets', report.assets, report.totalAssets),
+        ...section('liabilities', report.liabilities, report.totalLiabilities),
+        ...section('equity', report.equity, report.totalEquity),
+      ];
+      return `BALANCE SHEET as of ${report.asOf}\n${table(rows, ['left', 'right'])}\n\n${report.balanced ? 'BALANCED' : '*** OUT OF BALANCE ***'}`;
+    }
+    if (kind === 'ar-aging' || kind === 'ap-aging') {
+      const report = kind === 'ar-aging' ? file.arAging(asOf) : file.apAging(asOf);
+      const shown = report.labels.filter((label) => report.totals.find((t) => t.label === label)!.amount !== 0n);
+      const rows = [
+        ['NAME', ...shown.map((label) => label.toUpperCase()), 'TOTAL'],
+        ...report.rows.map((row) => [
+          row.name,
+          ...shown.map((label) => usd(row.buckets.find((bucket) => bucket.label === label)!.amount)),
+          usd(row.total),
+        ]),
+        ['TOTAL', ...shown.map((label) => usd(report.totals.find((t) => t.label === label)!.amount)), usd(report.grandTotal)],
+      ];
+      const title = kind === 'ar-aging' ? 'A/R AGING' : 'A/P AGING';
+      return `${title} as of ${report.asOf}\n${table(rows, ['left', ...shown.map(() => 'right' as const), 'right'])}`;
+    }
+    if (kind === 'inventory') {
+      const report = file.inventorySummary(values['as-of']);
+      const rows = [
+        ['ITEM', 'ON HAND', 'FIFO VALUE'],
+        ...report.rows.map((row) => [row.name, formatQuantity(row.quantityMilli), usd(row.valueMinor)]),
+        ['TOTAL', '', usd(report.totalValueMinor)],
+      ];
+      return `INVENTORY VALUATION${report.asOf ? ` as of ${report.asOf}` : ''}\n${table(rows, ['left', 'right', 'right'])}`;
+    }
+    fail(`Unknown report ${JSON.stringify(kind)}\n\n${USAGE}`);
   } finally {
     file.close();
   }

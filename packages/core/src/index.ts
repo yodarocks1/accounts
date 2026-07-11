@@ -138,6 +138,19 @@ export {
 } from './statement.js';
 export { type Party, type NewParty, type PartyName } from './parties.js';
 export {
+  type ReportAccountRow,
+  type ProfitAndLoss,
+  type BalanceSheet,
+  type AgingBucket,
+  type AgingRow,
+  type AgingSummary,
+  type InventorySummaryRow,
+  type InventorySummary,
+  computeProfitAndLoss,
+  computeBalanceSheet,
+  computeAgingSummary,
+} from './reports.js';
+export {
   ITEM_KINDS,
   type ItemKind,
   DISPOSITIONS,

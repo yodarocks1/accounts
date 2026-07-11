@@ -475,6 +475,21 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     );
   }
 
+  if (head === 'reports' && method === 'GET') {
+    if (id === 'pnl') {
+      const from = query.get('from');
+      const to = query.get('to');
+      if (from === null || to === null) {
+        throw new LedgerError('INVALID_DOCUMENT', 'P&L needs from and to dates');
+      }
+      return file.profitAndLoss(from, to);
+    }
+    if (id === 'balance-sheet') return file.balanceSheet(asOf);
+    if (id === 'ar-aging') return file.arAging(asOf);
+    if (id === 'ap-aging') return file.apAging(asOf);
+    if (id === 'inventory') return file.inventorySummary(query.get('asOf') ?? undefined);
+  }
+
   if (head === 'rate-review' && method === 'GET') return file.rateReview(asOf);
 
   if (head === 'trial-balance' && method === 'GET') {

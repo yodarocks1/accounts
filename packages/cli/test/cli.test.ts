@@ -101,6 +101,34 @@ describe('accounts CLI', () => {
   });
 });
 
+describe('reports (ADR 0017)', () => {
+  it('renders P&L, balance sheet, and aging from a posted book', () => {
+    setUpCompany();
+    run(['post', books, '--date', '2026-07-01', '--memo', 'Sale', '--debit', '1000:500.00', '--credit', '4000:500.00']);
+    run(['post', books, '--date', '2026-07-02', '--memo', 'Rent', '--debit', '6000:200.00', '--credit', '1000:200.00']);
+
+    const pnl = run(['report', 'pnl', books, '--from', '2026-07-01', '--to', '2026-07-31']);
+    expect(pnl).toContain('Net profit: 300.00');
+
+    const sheet = run(['report', 'balance-sheet', books, '--as-of', '2026-07-31']);
+    expect(sheet).toContain('BALANCED');
+    expect(sheet).toContain('Retained earnings');
+
+    // Aging needs a document-layer invoice.
+    const file = CompanyFile.open(books);
+    const item = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    const invoice = file.createDocument({
+      type: 'invoice', number: 'INV-1', date: '2026-05-01', customerName: 'Slowpay LLC', termsDays: 30,
+      lines: [{ itemId: item.id, description: 'Widget', quantityMilli: 4000n }],
+    });
+    file.sendDocument(invoice.id);
+    file.close();
+    const aging = run(['report', 'ar-aging', books, '--as-of', '2026-07-31']);
+    expect(aging).toContain('Slowpay LLC');
+    expect(aging).toContain('PAST DUE');
+  });
+});
+
 describe('document commands (Tier 3)', () => {
   it('item add, doc list/show/send, statement', () => {
     run(['init', books, '--name', 'Demo Co']);

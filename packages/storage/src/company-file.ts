@@ -12,6 +12,13 @@ import {
   computeRateSuggestions,
   computeStatement,
   computeTrialBalance,
+  computeAgingSummary,
+  computeBalanceSheet,
+  computeProfitAndLoss,
+  type AgingSummary,
+  type BalanceSheet,
+  type InventorySummary,
+  type ProfitAndLoss,
   currencyExponent,
   defaultAllowBelowCost,
   deriveTags,
@@ -400,6 +407,43 @@ export class CompanyFile implements ItemCatalog {
    */
   trialBalance(asOf?: string): TrialBalance {
     return computeTrialBalance(this.listEntriesUpTo(asOf), this.accountsById(), asOf);
+  }
+
+  /** Income vs expense over a period (ADR 0017); pure read, never stored. */
+  profitAndLoss(from: string, to: string): ProfitAndLoss {
+    return computeProfitAndLoss(this.listEntries(), this.accountsById(), from, to);
+  }
+
+  /** Assets vs liabilities + equity (incl. derived retained earnings) (ADR 0017). */
+  balanceSheet(asOf: string): BalanceSheet {
+    return computeBalanceSheet(this.listEntries(), this.accountsById(), asOf);
+  }
+
+  /** Who owes us, bucketed by age across the whole book (ADR 0017). */
+  arAging(asOf: string): AgingSummary {
+    return this.agingSummary(asOf, 'customer');
+  }
+
+  /** Whom we owe, bucketed by age across the whole book (ADR 0017). */
+  apAging(asOf: string): AgingSummary {
+    return this.agingSummary(asOf, 'supplier');
+  }
+
+  private agingSummary(asOf: string, side: 'customer' | 'supplier'): AgingSummary {
+    const types = side === 'supplier' ? ['bill', 'vendor_credit'] : ['invoice', 'credit_memo'];
+    const records = types.flatMap((type) => this.listDocumentRecords(type as DocumentType));
+    return computeAgingSummary(records, this.listPayments(), this.listApplications(), asOf, side);
+  }
+
+  /** Per-item FIFO quantity and value for every tracked item (ADR 0017). */
+  inventorySummary(asOf?: string): InventorySummary {
+    const rows = this.listItems()
+      .filter((item) => item.kind === 'inventory')
+      .map((item) => {
+        const valuation = this.itemValuation(item.id, asOf);
+        return { itemId: item.id, name: item.name, quantityMilli: valuation.quantityMilli, valueMinor: valuation.valueMinor };
+      });
+    return { asOf: asOf ?? null, rows, totalValueMinor: rows.reduce((sum, row) => sum + row.valueMinor, 0n) };
   }
 
   /** Per-account debit/credit sums computed by SQLite, for cross-checking. */

@@ -4,6 +4,7 @@ import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
 import { divRoundHalf, PERCENT_SCALE, QUANTITY_SCALE } from './quantity.js';
 import { computeStatement, daysBetween, type AgingRule, type Statement } from './statement.js';
+import { computeAgingSummary, type AgingSummary, type InventorySummary } from './reports.js';
 import {
   computeRateReview,
   computeRateSuggestions,
@@ -2173,6 +2174,28 @@ export class DocumentBook implements ItemCatalog {
       asOf,
       rules,
     );
+  }
+
+  /** Who owes us, bucketed by age across the whole book (ADR 0017). */
+  arAging(asOf: string, rules?: readonly AgingRule[]): AgingSummary {
+    return computeAgingSummary([...this.documents.values()], [...this.payments.values()], this.applications, asOf, 'customer', rules);
+  }
+
+  /** Whom we owe, bucketed by age across the whole book (ADR 0017). */
+  apAging(asOf: string, rules?: readonly AgingRule[]): AgingSummary {
+    return computeAgingSummary([...this.documents.values()], [...this.payments.values()], this.applications, asOf, 'supplier', rules);
+  }
+
+  /** Per-item FIFO quantity and value for every tracked item (ADR 0017). */
+  inventorySummary(asOf?: string): InventorySummary {
+    const rows = [...this.items.values()]
+      .filter((item) => item.kind === 'inventory')
+      .sort((a, b) => (a.name < b.name ? -1 : 1))
+      .map((item) => {
+        const valuation = this.itemValuation(item.id, asOf);
+        return { itemId: item.id, name: item.name, quantityMilli: valuation.quantityMilli, valueMinor: valuation.valueMinor };
+      });
+    return { asOf: asOf ?? null, rows, totalValueMinor: rows.reduce((sum, row) => sum + row.valueMinor, 0n) };
   }
 
   // ── Payments & credit application (Tier 1, ADR 0008) ──────────────────

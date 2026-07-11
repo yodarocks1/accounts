@@ -375,7 +375,8 @@ A first-class, obsessively-tested onramp — this determines adoption.
       payments deposit against the PO and transfer to the bill (through a
       receipt in the three-way flow) (ADR 0016)
 - [ ] CSV/OFX bank import + manual reconciliation
-- [ ] Core reports: P&L, balance sheet, trial balance, AR/AP aging
+- [x] Core reports: P&L, balance sheet (derived retained earnings),
+      AR/AP aging summaries, inventory valuation — pure reads (ADR 0017)
 - [ ] Plugin host v1 (in-process, bundled plugins only) — dogfooding the API
 - **Exit criteria:** a freelancer can run their real books on it.
 
