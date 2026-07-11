@@ -374,7 +374,9 @@ A first-class, obsessively-tested onramp — this determines adoption.
       special_order items and a supplier prepayment-% gate PO send, outbound
       payments deposit against the PO and transfer to the bill (through a
       receipt in the three-way flow) (ADR 0016)
-- [ ] CSV/OFX bank import + manual reconciliation
+- [x] Bank import (CSV, idempotent per source) + suggestion-based manual
+      reconciliation with reversal-only undo (ADR 0019; OFX = plugin
+      territory)
 - [x] Core reports: P&L, balance sheet (derived retained earnings),
       AR/AP aging summaries, inventory valuation — pure reads (ADR 0017)
 - [x] Plugin host v1: in-process registry with supplier connectors,

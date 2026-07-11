@@ -1011,6 +1011,45 @@ ALTER TABLE supplier_info ADD COLUMN prepayment_percent_milli INTEGER
   CHECK (prepayment_percent_milli IS NULL OR prepayment_percent_milli >= 0);
 `;
 
-export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL, V18_SQL, V19_SQL, V20_SQL];
+const V21_SQL = `
+-- ADR 0019: bank import & reconciliation. Imported lines are append-only
+-- facts, idempotent per source; reconciliation marks follow the
+-- credit-application pattern (append + reversal), never a status column.
+CREATE TABLE bank_transactions (
+  bank_seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+  source      TEXT NOT NULL CHECK (length(trim(source)) > 0),
+  date        TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  amount      INTEGER NOT NULL CHECK (amount != 0),
+  description TEXT NOT NULL CHECK (length(trim(description)) > 0),
+  reference   TEXT,
+  dedupe_key  TEXT NOT NULL,
+  imported_at TEXT NOT NULL,
+  UNIQUE (source, dedupe_key)
+) STRICT;
+
+CREATE TRIGGER bank_transactions_no_update BEFORE UPDATE ON bank_transactions
+BEGIN SELECT RAISE(ABORT, 'bank transactions are immutable'); END;
+
+CREATE TRIGGER bank_transactions_no_delete BEFORE DELETE ON bank_transactions
+BEGIN SELECT RAISE(ABORT, 'bank transactions are immutable'); END;
+
+CREATE TABLE bank_reconciliations (
+  recon_seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  bank_seq           INTEGER NOT NULL REFERENCES bank_transactions(bank_seq),
+  payment_id         TEXT NOT NULL REFERENCES payments(id),
+  at                 TEXT NOT NULL,
+  reverses_recon_seq INTEGER UNIQUE REFERENCES bank_reconciliations(recon_seq)
+) STRICT;
+
+CREATE INDEX idx_bank_reconciliations_bank ON bank_reconciliations(bank_seq);
+
+CREATE TRIGGER bank_reconciliations_no_update BEFORE UPDATE ON bank_reconciliations
+BEGIN SELECT RAISE(ABORT, 'reconciliations are immutable; reverse them'); END;
+
+CREATE TRIGGER bank_reconciliations_no_delete BEFORE DELETE ON bank_reconciliations
+BEGIN SELECT RAISE(ABORT, 'reconciliations are immutable; reverse them'); END;
+`;
+
+export const MIGRATIONS: readonly string[] = [V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL, V8_SQL, V9_SQL, V10_SQL, V11_SQL, V12_SQL, V13_SQL, V14_SQL, V15_SQL, V16_SQL, V17_SQL, V18_SQL, V19_SQL, V20_SQL, V21_SQL];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

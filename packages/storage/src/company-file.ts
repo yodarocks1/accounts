@@ -13,6 +13,11 @@ import {
   computeStatement,
   computeTrialBalance,
   computeAgingSummary,
+  bankDedupeKey,
+  matchBankTransactions,
+  parseBankCsv,
+  type BankMatchSuggestion,
+  type BankTransaction,
   PluginHost,
   type PluginManifest,
   computeBalanceSheet,
@@ -3248,6 +3253,149 @@ export class CompanyFile implements ItemCatalog {
     const current = record.revisions[record.revisions.length - 1]!;
     this.reversePostingIfActive('document', id, current.date, `Reversal: ${record.number} corrected`);
     this.postDocumentIfConfigured(record);
+  }
+
+  // ── Bank import & reconciliation (ADR 0019) ──────────────────────────────
+
+  /** Idempotent per source: overlapping exports skip already-imported rows. */
+  importBankTransactions(source: string, csvText: string): { imported: number; skipped: number } {
+    if (!source.trim()) {
+      throw new LedgerError('INVALID_DOCUMENT', 'Bank import needs a source name');
+    }
+    const rows = parseBankCsv(csvText, this.info().baseCurrency);
+    let imported = 0;
+    this.db.transaction(() => {
+      const insert = this.db.prepare(
+        `INSERT INTO bank_transactions (source, date, amount, description, reference, dedupe_key, imported_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (source, dedupe_key) DO NOTHING`,
+      );
+      for (const row of rows) {
+        const result = insert.run(
+          source.trim(),
+          row.date,
+          row.amountMinor,
+          row.description,
+          row.reference ?? null,
+          bankDedupeKey(row),
+          new Date().toISOString(),
+        );
+        if (result.changes > 0) imported += 1;
+      }
+      this.audit('bank.imported', 'bank_source', source.trim(), { rows: rows.length, imported });
+    })();
+    return { imported, skipped: rows.length - imported };
+  }
+
+  listBankTransactions(source?: string): BankTransaction[] {
+    interface Row {
+      bank_seq: bigint;
+      source: string;
+      date: string;
+      amount: bigint;
+      description: string;
+      reference: string | null;
+      dedupe_key: string;
+      imported_at: string;
+    }
+    const rows = (
+      source !== undefined
+        ? this.db.prepare(`SELECT * FROM bank_transactions WHERE source = ? ORDER BY bank_seq`).all(source)
+        : this.db.prepare(`SELECT * FROM bank_transactions ORDER BY bank_seq`).all()
+    ) as Row[];
+    return rows.map((row) => ({
+      bankSeq: Number(row.bank_seq),
+      source: row.source,
+      date: row.date,
+      amountMinor: row.amount,
+      description: row.description,
+      reference: row.reference,
+      dedupeKey: row.dedupe_key,
+      importedAt: row.imported_at,
+    }));
+  }
+
+  /** Active (non-reversed) marks: bankSeq → paymentId. */
+  private activeReconciliations(): Map<number, { reconSeq: number; paymentId: string }> {
+    interface Row { recon_seq: bigint; bank_seq: bigint; payment_id: string; reverses_recon_seq: bigint | null }
+    const rows = this.db.prepare(`SELECT * FROM bank_reconciliations ORDER BY recon_seq`).all() as Row[];
+    const reversed = new Set(rows.map((row) => row.reverses_recon_seq).filter((seq): seq is bigint => seq !== null).map(Number));
+    const active = new Map<number, { reconSeq: number; paymentId: string }>();
+    for (const row of rows) {
+      if (row.reverses_recon_seq !== null || reversed.has(Number(row.recon_seq))) continue;
+      active.set(Number(row.bank_seq), { reconSeq: Number(row.recon_seq), paymentId: row.payment_id });
+    }
+    return active;
+  }
+
+  /** Pure suggestions: nothing is written until the user confirms a match. */
+  bankMatchSuggestions(source?: string, windowDays = 3): BankMatchSuggestion[] {
+    const active = this.activeReconciliations();
+    const reconciledPayments = new Set([...active.values()].map((entry) => entry.paymentId));
+    return matchBankTransactions(
+      this.listBankTransactions(source),
+      this.listPayments(),
+      (bankSeq) => active.has(bankSeq),
+      reconciledPayments,
+      windowDays,
+    );
+  }
+
+  /** Confirm a match; amount and direction are re-validated at write time. */
+  reconcileBankTransaction(bankSeq: number, paymentId: string): { reconSeq: number } {
+    const transaction = this.listBankTransactions().find((row) => row.bankSeq === bankSeq);
+    if (!transaction) {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such bank transaction: ${bankSeq}`);
+    }
+    const payment = this.getPayment(paymentId);
+    if (!payment || payment.status !== 'received') {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No received payment: ${paymentId}`);
+    }
+    const active = this.activeReconciliations();
+    if (active.has(bankSeq)) {
+      throw new LedgerError('ALREADY_RECONCILED', `Bank transaction ${bankSeq} is already reconciled`);
+    }
+    if ([...active.values()].some((entry) => entry.paymentId === paymentId)) {
+      throw new LedgerError('ALREADY_RECONCILED', `Payment ${payment.number} is already reconciled`);
+    }
+    const direction = transaction.amountMinor > 0n ? 'in' : 'out';
+    const magnitude = transaction.amountMinor > 0n ? transaction.amountMinor : -transaction.amountMinor;
+    if (payment.direction !== direction || payment.amountMinor !== magnitude) {
+      throw new LedgerError(
+        'INVALID_ALLOCATION',
+        `Bank line ${bankSeq} (${transaction.amountMinor}) does not match payment ${payment.number} (${payment.direction} ${payment.amountMinor})`,
+      );
+    }
+    let seq = 0;
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(`INSERT INTO bank_reconciliations (bank_seq, payment_id, at, reverses_recon_seq) VALUES (?, ?, ?, NULL)`)
+        .run(bankSeq, paymentId, new Date().toISOString());
+      seq = Number(result.lastInsertRowid);
+      this.audit('bank.reconciled', 'bank_transaction', String(bankSeq), { paymentId, reconSeq: seq });
+    })();
+    return { reconSeq: seq };
+  }
+
+  /** Undo a mark by appending a reversal — never a delete (ADR 0019). */
+  unreconcileBankTransaction(reconSeq: number): { reconSeq: number } {
+    interface Row { recon_seq: bigint; bank_seq: bigint; payment_id: string; reverses_recon_seq: bigint | null }
+    const target = this.db.prepare(`SELECT * FROM bank_reconciliations WHERE recon_seq = ?`).get(reconSeq) as Row | undefined;
+    if (!target || target.reverses_recon_seq !== null) {
+      throw new LedgerError('UNKNOWN_DOCUMENT', `No such reconciliation: ${reconSeq}`);
+    }
+    if (this.db.prepare(`SELECT 1 FROM bank_reconciliations WHERE reverses_recon_seq = ?`).get(reconSeq)) {
+      throw new LedgerError('ALREADY_REVERSED', `Reconciliation already reversed: ${reconSeq}`);
+    }
+    let seq = 0;
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(`INSERT INTO bank_reconciliations (bank_seq, payment_id, at, reverses_recon_seq) VALUES (?, ?, ?, ?)`)
+        .run(target.bank_seq, target.payment_id, new Date().toISOString(), reconSeq);
+      seq = Number(result.lastInsertRowid);
+      this.audit('bank.unreconciled', 'bank_transaction', String(Number(target.bank_seq)), { reverses: reconSeq });
+    })();
+    return { reconSeq: seq };
   }
 
   // ── Plugin host binding (ADR 0018) ───────────────────────────────────────

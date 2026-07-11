@@ -139,6 +139,7 @@ const STATUS_BY_CODE: Partial<Record<LedgerErrorCode, number>> = {
   ALREADY_REVERSED: 409,
   APPROVAL_REQUIRED: 403,
   PLUGIN_ERROR: 409,
+  ALREADY_RECONCILED: 409,
   UNKNOWN_REPORT: 404,
   DEPOSIT_REQUIRED: 409,
   MINIMUM_NOT_MET: 409,
@@ -485,6 +486,25 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
       },
       asOf,
     );
+  }
+
+  if (head === 'bank') {
+    if (method === 'POST' && id === 'import') {
+      return file.importBankTransactions(str(body.source, 'source'), str(body.csv, 'csv'));
+    }
+    if (method === 'GET' && id === 'transactions') {
+      return file.listBankTransactions(query.get('source') ?? undefined);
+    }
+    if (method === 'GET' && id === 'suggestions') {
+      const window = query.get('windowDays');
+      return file.bankMatchSuggestions(query.get('source') ?? undefined, window !== null ? Number(window) : undefined);
+    }
+    if (method === 'POST' && id === 'reconcile' && sub === undefined) {
+      return file.reconcileBankTransaction(Number(body.bankSeq), str(body.paymentId, 'paymentId'));
+    }
+    if (method === 'POST' && id === 'reconcile' && sub !== undefined) {
+      return file.unreconcileBankTransaction(Number(sub));
+    }
   }
 
   if (head === 'plugins' && method === 'GET') {

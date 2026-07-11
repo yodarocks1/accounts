@@ -35,7 +35,8 @@ export type LedgerErrorCode =
   | 'INSUFFICIENT_STOCK'
   | 'BOM_CYCLE'
   | 'PLUGIN_ERROR'
-  | 'UNKNOWN_REPORT';
+  | 'UNKNOWN_REPORT'
+  | 'ALREADY_RECONCILED';
 
 export class LedgerError extends Error {
   constructor(

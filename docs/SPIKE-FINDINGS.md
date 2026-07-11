@@ -94,8 +94,8 @@ explicit `lineId`s at the API boundary.
   the one place FIFO valuation and the G/L legitimately diverge today.
 - Bill-correction FIFO vs G/L price variance in mixed-layer edge cases.
 - Negative-stock issues are costed at `costAt` and never retro-costed.
-- Bank import/reconciliation (WS3) — designed as droppable; drop confirmed
-  or shipped by end of spike.
+- ~~Bank import/reconciliation (WS3)~~ — shipped within its time-box
+  (ADR 0019); OFX/rules/feeds remain plugin territory as designed.
 - Multi-currency, sandboxed plugins, web UI: Phase 2+ by plan, unchanged.
 
 ## Verdict

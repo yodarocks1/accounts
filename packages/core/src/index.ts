@@ -199,6 +199,14 @@ export {
   planDocumentPosting,
 } from './posting.js';
 export {
+  type BankTransaction,
+  type NewBankTransaction,
+  type BankMatchSuggestion,
+  bankDedupeKey,
+  parseBankCsv,
+  matchBankTransactions,
+} from './bank.js';
+export {
   type PluginManifest,
   type DocumentEvent,
   type SupplierQuote,
