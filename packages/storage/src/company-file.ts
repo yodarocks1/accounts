@@ -13,6 +13,8 @@ import {
   computeStatement,
   computeTrialBalance,
   computeAgingSummary,
+  PluginHost,
+  type PluginManifest,
   computeBalanceSheet,
   computeProfitAndLoss,
   type AgingSummary,
@@ -1327,6 +1329,7 @@ export class CompanyFile implements ItemCatalog {
       });
       this.audit('document.created', 'document', id, { type: input.type, number });
     })();
+    this.emitDocumentEvent('document.created', id);
     return this.viewDocument(id);
   }
 
@@ -1804,6 +1807,7 @@ export class CompanyFile implements ItemCatalog {
         if (po) this.transferDeposits(id, po);
       }
     })();
+    this.emitDocumentEvent('document.sent', id);
     return this.viewDocument(id);
   }
 
@@ -1913,6 +1917,7 @@ export class CompanyFile implements ItemCatalog {
       }
       this.reversePostingIfActive('document', id, voidCurrent.date, `Reversal: ${document.number} voided`);
     })();
+    this.emitDocumentEvent('document.voided', id);
     return this.viewDocument(id);
   }
 
@@ -3243,6 +3248,72 @@ export class CompanyFile implements ItemCatalog {
     const current = record.revisions[record.revisions.length - 1]!;
     this.reversePostingIfActive('document', id, current.date, `Reversal: ${record.number} corrected`);
     this.postDocumentIfConfigured(record);
+  }
+
+  // ── Plugin host binding (ADR 0018) ───────────────────────────────────────
+
+  private pluginHost: PluginHost<CompanyFile> | undefined;
+
+  /** Bind an activated host; hook failures are audited, never thrown. */
+  attachPlugins(host: PluginHost<CompanyFile>): void {
+    this.pluginHost = host;
+    host.onError = (pluginId, error) => {
+      this.audit('plugin.error', 'plugin', pluginId, {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    };
+  }
+
+  plugins(): readonly PluginManifest[] {
+    return this.pluginHost?.list() ?? [];
+  }
+
+  private emitDocumentEvent(event: 'document.created' | 'document.sent' | 'document.voided', id: string): void {
+    this.pluginHost?.emit(event, this.viewDocument(id));
+  }
+
+  /** Pull fresh terms from the party's connector; recorded with plugin provenance. */
+  async refreshSupplierInfo(partyId: string): Promise<SupplierInfo> {
+    const entry = this.pluginHost?.connectorFor(partyId);
+    if (!entry?.connector.fetchSupplierInfo) {
+      throw new LedgerError('PLUGIN_ERROR', `No supplier connector can quote party ${partyId}`);
+    }
+    const quote = await entry.connector.fetchSupplierInfo();
+    return this.recordSupplierInfo({ ...quote, partyId, source: entry.pluginId });
+  }
+
+  /**
+   * Send a purchase order (every ADR 0011/0016 gate applies), then deliver it
+   * through the party's connector when one exists. Manual send otherwise.
+   */
+  async submitPurchaseOrder(
+    id: string,
+    options?: { overrideDeposit?: boolean; overrideMinimum?: boolean; approvedBy?: string },
+  ): Promise<{ view: DocumentView; reference: string | null }> {
+    const record = this.requireDocumentRecord(id);
+    if (record.type !== 'purchase_order') {
+      throw new LedgerError('INVALID_DOCUMENT', 'Only purchase orders can be submitted');
+    }
+    const view = this.sendDocument(id, options);
+    const entry = record.partyId !== null ? this.pluginHost?.connectorFor(record.partyId) : undefined;
+    if (!entry?.connector.submitPurchaseOrder) {
+      return { view, reference: null };
+    }
+    const result = await entry.connector.submitPurchaseOrder(view);
+    const reference = result.reference ?? null;
+    this.audit('po.submitted', 'document', id, { pluginId: entry.pluginId, reference });
+    return { view, reference };
+  }
+
+  pluginReportNames(): string[] {
+    return this.pluginHost?.reportNames() ?? [];
+  }
+
+  runPluginReport(name: string, params: Readonly<Record<string, string>> = {}): unknown {
+    if (!this.pluginHost) {
+      throw new LedgerError('UNKNOWN_REPORT', 'No plugin host attached');
+    }
+    return this.pluginHost.runReport(name, this, params);
   }
 
   // ── Audit ───────────────────────────────────────────────────────────────

@@ -377,7 +377,10 @@ A first-class, obsessively-tested onramp — this determines adoption.
 - [ ] CSV/OFX bank import + manual reconciliation
 - [x] Core reports: P&L, balance sheet (derived retained earnings),
       AR/AP aging summaries, inventory valuation — pure reads (ADR 0017)
-- [ ] Plugin host v1 (in-process, bundled plugins only) — dogfooding the API
+- [x] Plugin host v1: in-process registry with supplier connectors,
+      isolated document lifecycle hooks, and report contributions;
+      dogfooded by @accounts/plugin-demo-supplier through public API
+      only (ADR 0018)
 - **Exit criteria:** a freelancer can run their real books on it.
 
 ### Phase 2 — Moddable (months 6–10) → **v0.5 beta**

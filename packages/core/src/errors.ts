@@ -33,7 +33,9 @@ export type LedgerErrorCode =
   | 'DEPOSIT_REQUIRED'
   | 'MINIMUM_NOT_MET'
   | 'INSUFFICIENT_STOCK'
-  | 'BOM_CYCLE';
+  | 'BOM_CYCLE'
+  | 'PLUGIN_ERROR'
+  | 'UNKNOWN_REPORT';
 
 export class LedgerError extends Error {
   constructor(

@@ -138,6 +138,8 @@ const STATUS_BY_CODE: Partial<Record<LedgerErrorCode, number>> = {
   DUPLICATE_DOCUMENT_NUMBER: 409,
   ALREADY_REVERSED: 409,
   APPROVAL_REQUIRED: 403,
+  PLUGIN_ERROR: 409,
+  UNKNOWN_REPORT: 404,
   DEPOSIT_REQUIRED: 409,
   MINIMUM_NOT_MET: 409,
   INSUFFICIENT_STOCK: 409,
@@ -253,6 +255,9 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     if (method === 'POST' && id !== undefined && sub === 'supplier-info') {
       return file.recordSupplierInfo(mapSupplierInfo(id, body) as never);
     }
+    if (method === 'POST' && id !== undefined && sub === 'refresh-supplier-info') {
+      return await file.refreshSupplierInfo(id);
+    }
     if (method === 'GET' && id !== undefined && sub === 'supplier-info') {
       const at = query.get('asOf');
       return (at !== null ? file.supplierInfoAt(id, at) : file.supplierInfo(id)) ?? null;
@@ -311,6 +316,13 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     if (method === 'GET' && sub === 'prepayments') return file.linePrepayments(id);
     if (method === 'POST' && sub === 'send') {
       return file.sendDocument(id, {
+        ...(body.overrideDeposit !== undefined ? { overrideDeposit: Boolean(body.overrideDeposit) } : {}),
+        ...(body.overrideMinimum !== undefined ? { overrideMinimum: Boolean(body.overrideMinimum) } : {}),
+        ...(body.approvedBy !== undefined ? { approvedBy: str(body.approvedBy, 'approvedBy') } : {}),
+      });
+    }
+    if (method === 'POST' && sub === 'submit') {
+      return await file.submitPurchaseOrder(id, {
         ...(body.overrideDeposit !== undefined ? { overrideDeposit: Boolean(body.overrideDeposit) } : {}),
         ...(body.overrideMinimum !== undefined ? { overrideMinimum: Boolean(body.overrideMinimum) } : {}),
         ...(body.approvedBy !== undefined ? { approvedBy: str(body.approvedBy, 'approvedBy') } : {}),
@@ -475,6 +487,10 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     );
   }
 
+  if (head === 'plugins' && method === 'GET') {
+    return { plugins: file.plugins(), reports: file.pluginReportNames() };
+  }
+
   if (head === 'reports' && method === 'GET') {
     if (id === 'pnl') {
       const from = query.get('from');
@@ -488,6 +504,10 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     if (id === 'ar-aging') return file.arAging(asOf);
     if (id === 'ap-aging') return file.apAging(asOf);
     if (id === 'inventory') return file.inventorySummary(query.get('asOf') ?? undefined);
+    if (id !== undefined && file.pluginReportNames().includes(id)) {
+      // Plugin contributions share the namespace; built-ins win collisions.
+      return file.runPluginReport(id, Object.fromEntries(query.entries()));
+    }
   }
 
   if (head === 'rate-review' && method === 'GET') return file.rateReview(asOf);

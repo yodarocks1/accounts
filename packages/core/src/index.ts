@@ -199,6 +199,17 @@ export {
   planDocumentPosting,
 } from './posting.js';
 export {
+  type PluginManifest,
+  type DocumentEvent,
+  type SupplierQuote,
+  type SupplierConnector,
+  type ReportContribution,
+  type PluginHostApi,
+  type AccountsPlugin,
+  type PluginLogEntry,
+  PluginHost,
+} from './plugins.js';
+export {
   type Payment,
   type NewPayment,
   type ApplicationSourceKind,

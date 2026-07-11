@@ -89,6 +89,9 @@ importers:
         specifier: ^12.2.0
         version: 12.11.1
     devDependencies:
+      '@accounts/plugin-demo-supplier':
+        specifier: workspace:*
+        version: link:../../plugins/demo-supplier
       '@types/better-sqlite3':
         specifier: ^7.6.13
         version: 7.6.13
@@ -104,6 +107,16 @@ importers:
       vitest:
         specifier: ^3.2.4
         version: 3.2.6(@types/node@26.1.0)
+
+  plugins/demo-supplier:
+    dependencies:
+      '@accounts/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+    devDependencies:
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
 
 packages:
 
