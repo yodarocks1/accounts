@@ -70,6 +70,9 @@ importers:
         specifier: workspace:*
         version: link:../storage
     devDependencies:
+      '@accounts/plugin-demo-supplier':
+        specifier: workspace:*
+        version: link:../../plugins/demo-supplier
       '@types/node':
         specifier: ^26.1.0
         version: 26.1.0

@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
+import { PluginHost } from '@accounts/core';
 import { CompanyFile } from '@accounts/storage';
+import { demoSupplierPlugin } from '@accounts/plugin-demo-supplier';
 import { createApiServer } from '../src/index.js';
 
 let dir: string;
@@ -305,6 +307,58 @@ describe('document API (Tier 3)', () => {
     const settled = (await get(`/documents/${bill.id}/settlement`)).json as { paid: string; open: string };
     expect(settled.paid).toBe('5000');
     expect(settled.open).toBe('5000');
+  });
+
+  it('plugins, reports, and banking round-trip over HTTP (ADR 0017–0019)', async () => {
+    const widget = (await post('/items', { name: 'Widget', currency: 'USD', unitPrice: '2500', kind: 'inventory' })).json as { id: string };
+    const supplier = (await post('/parties', { name: 'Supplier Inc' })).json as { id: string };
+
+    // Attach the bundled plugin to the served file (v1 wiring, ADR 0018).
+    const host = new PluginHost<CompanyFile>();
+    host.register(demoSupplierPlugin({ partyId: supplier.id, itemCosts: { [widget.id]: 900n } }));
+    file.attachPlugins(host);
+
+    expect((await get('/plugins')).json).toEqual({
+      plugins: [{ id: 'demo-supplier', name: 'Demo Supplier Connector', version: '0.0.1' }],
+      reports: ['demo.purchase-pipeline'],
+    });
+    const quoted = (await post(`/parties/${supplier.id}/refresh-supplier-info`, {})).json as { source: string; asOf: string };
+    expect(quoted.source).toBe('demo-supplier');
+
+    // Priced from the quote, so dated on/after the quote's asOf.
+    const po = (await post('/documents', {
+      type: 'purchase_order', number: 'PO-1', date: quoted.asOf, partyId: supplier.id,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: '10000' }],
+    })).json as { id: string };
+    const submitted = (await post(`/documents/${po.id}/submit`, {})).json as { reference: string; view: { status: string } };
+    expect(submitted).toMatchObject({ reference: 'DEMO-0001', view: { status: 'sent' } });
+    // Plugin report contributions share the /reports namespace.
+    expect((await get('/reports/demo.purchase-pipeline')).json).toMatchObject({ openOrders: 1 });
+    expect((await get('/reports/nope')).status).toBe(404);
+
+    // Built-in reports over HTTP.
+    const sheet = (await get('/reports/balance-sheet?asOf=2026-07-31')).json as { balanced: boolean };
+    expect(sheet.balanced).toBe(true);
+    expect((await get('/reports/pnl?from=2026-07-01&to=2026-07-31')).status).toBe(200);
+    expect((await get('/reports/pnl')).status).toBe(422); // needs from/to
+
+    // Banking: import, suggest, reconcile, reverse.
+    await post('/sequences/payment', { prefix: 'PMT-' });
+    const payment = (await post('/payments', {
+      date: '2026-07-02', customerName: 'Acme LLC', amount: '15000',
+    })).json as { id: string };
+    const imported = (await post('/bank/import', {
+      source: 'chase', csv: 'date,amount,description\n2026-07-02,150.00,ACH ACME',
+    })).json as { imported: number };
+    expect(imported.imported).toBe(1);
+    const suggestions = (await get('/bank/suggestions?source=chase')).json as { bankSeq: number; paymentId: string }[];
+    expect(suggestions).toHaveLength(1);
+    const mark = (await post('/bank/reconcile', { bankSeq: suggestions[0]!.bankSeq, paymentId: payment.id })).json as { reconSeq: number };
+    expect((await get('/bank/suggestions?source=chase')).json).toHaveLength(0);
+    const again = await post('/bank/reconcile', { bankSeq: suggestions[0]!.bankSeq, paymentId: payment.id });
+    expect(again.status).toBe(409);
+    await post(`/bank/reconcile/${mark.reconSeq}/reverse`, {});
+    expect((await get('/bank/suggestions?source=chase')).json).toHaveLength(1);
   });
 
   it('gated actions surface 403 APPROVAL_REQUIRED', async () => {

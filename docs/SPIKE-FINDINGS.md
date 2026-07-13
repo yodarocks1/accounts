@@ -3,7 +3,7 @@
 This project was a spike for **manual writing and design**: every feature
 began as a written ADR, was implemented against that ADR, tested, and
 pushed before the next began. Nineteen ADRs, twenty-one schema versions,
-five packages, 273 tests, and one golden scenario later, these are the
+five packages, 274 tests, and one golden scenario later, these are the
 conclusions.
 
 ## What worked — keep these
