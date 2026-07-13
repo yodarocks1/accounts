@@ -3433,6 +3433,8 @@ export class CompanyFile implements ItemCatalog {
   /**
    * Send a purchase order (every ADR 0011/0016 gate applies), then deliver it
    * through the party's connector when one exists. Manual send otherwise.
+   * Submitting an already-sent order skips the send and retries delivery —
+   * a connector failure never strands the order sent-but-undeliverable.
    */
   async submitPurchaseOrder(
     id: string,
@@ -3442,7 +3444,10 @@ export class CompanyFile implements ItemCatalog {
     if (record.type !== 'purchase_order') {
       throw new LedgerError('INVALID_DOCUMENT', 'Only purchase orders can be submitted');
     }
-    const view = this.sendDocument(id, options);
+    if (record.status === 'void') {
+      throw new LedgerError('INVALID_STATUS', 'Void purchase orders cannot be submitted');
+    }
+    const view = record.status === 'draft' ? this.sendDocument(id, options) : this.viewDocument(id);
     const entry = record.partyId !== null ? this.pluginHost?.connectorFor(record.partyId) : undefined;
     if (!entry?.connector.submitPurchaseOrder) {
       return { view, reference: null };

@@ -28,7 +28,7 @@ Usage:
 Document layer:
   accounts item add <file> --name <name> --price <amount> [--cost <amount>] [--tax-code <code>] [--deposit-policy <never|always|when_out_of_stock|special_order>] [--kind <inventory|non_inventory|service>]
   accounts item stock <file> <item-id> [--as-of YYYY-MM-DD]
-  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order|bill|vendor_credit>]
+  accounts doc list <file> [--type <estimate|sales_order|invoice|credit_memo|purchase_order|receipt|bill|vendor_credit>]
   accounts doc show <file> <document-id>
   accounts doc send <file> <document-id> [--override-deposit] [--override-minimum] [--approved-by <who>]
   accounts report <pnl|balance-sheet|ar-aging|ap-aging|inventory> <file> [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--as-of YYYY-MM-DD]

@@ -91,6 +91,71 @@ describe('plugin host v1 (ADR 0018)', () => {
     expect(audit?.details).toContain('plugin exploded');
   });
 
+  it('activation is transactional: a plugin that throws leaves nothing behind', () => {
+    const supplier = file.createParty({ name: 'Supplier Inc' });
+    const host = new PluginHost<CompanyFile>();
+    const halfway: AccountsPlugin<CompanyFile> = {
+      manifest: { id: 'halfway', name: 'Halfway Plugin', version: '0.0.1' },
+      activate(api) {
+        api.registerSupplierConnector({ partyId: supplier.id });
+        api.registerReport({ name: 'half.report', run: () => ({}) });
+        throw new Error('activation exploded');
+      },
+    };
+    expect(() => host.register(halfway)).toThrowError(/activation exploded/);
+    // Nothing was kept: not the manifest, connector, or report.
+    expect(host.list()).toHaveLength(0);
+    expect(host.connectorFor(supplier.id)).toBeUndefined();
+    expect(host.reportNames()).toHaveLength(0);
+    // The party is still free for a well-behaved plugin.
+    host.register({
+      manifest: { id: 'ok', name: 'OK', version: '0.0.1' },
+      activate(api) {
+        api.registerSupplierConnector({ partyId: supplier.id });
+      },
+    });
+    expect(host.connectorFor(supplier.id)?.pluginId).toBe('ok');
+  });
+
+  it('a failed connector delivery never strands the order: submit retries', async () => {
+    const widget = file.createItem({ name: 'Widget', currency: 'USD', unitPrice: 2500n });
+    const supplier = file.createParty({ name: 'Supplier Inc' });
+    const host = new PluginHost<CompanyFile>();
+    let attempts = 0;
+    host.register({
+      manifest: { id: 'flaky', name: 'Flaky Connector', version: '0.0.1' },
+      activate(api) {
+        api.registerSupplierConnector({
+          partyId: supplier.id,
+          submitPurchaseOrder() {
+            attempts += 1;
+            if (attempts === 1) throw new Error('supplier API timed out');
+            return { reference: `FLAKY-${attempts}` };
+          },
+        });
+      },
+    });
+    file.attachPlugins(host);
+
+    const po = file.createDocument({
+      type: 'purchase_order', number: 'PO-1', date: '2026-07-01', partyId: supplier.id,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n, unitPrice: 900n }],
+    });
+    // First attempt: the send commits, delivery fails.
+    await expect(file.submitPurchaseOrder(po.id)).rejects.toThrowError(/timed out/);
+    expect(file.viewDocument(po.id).status).toBe('sent');
+    // Retry skips the send and just delivers.
+    const retry = await file.submitPurchaseOrder(po.id);
+    expect(retry.reference).toBe('FLAKY-2');
+    // Voided orders cannot be submitted at all.
+    const dead = file.createDocument({
+      type: 'purchase_order', number: 'PO-2', date: '2026-07-01', partyId: supplier.id,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n, unitPrice: 900n }],
+    });
+    file.voidDocument(dead.id);
+    await expect(file.submitPurchaseOrder(dead.id)).rejects.toThrowError(/Void purchase orders/);
+  });
+
   it('registration conflicts fail loudly; unknown reports 404-shaped', async () => {
     const host = new PluginHost<CompanyFile>();
     const supplier = file.createParty({ name: 'Supplier Inc' });

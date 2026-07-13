@@ -63,7 +63,12 @@ export class PluginHost<TBook = unknown> {
   /** Error sink for isolated hook failures; the storage binding audits these. */
   onError: ((pluginId: string, error: unknown) => void) | null = null;
 
-  /** Activate a plugin; every capability is an explicit registration. */
+  /**
+   * Activate a plugin; every capability is an explicit registration.
+   * Activation is transactional: registrations are staged and committed
+   * only if `activate` returns — a plugin that throws partway leaves
+   * nothing behind.
+   */
   register(plugin: AccountsPlugin<TBook>): void {
     const { id } = plugin.manifest;
     if (!id.trim()) {
@@ -72,33 +77,43 @@ export class PluginHost<TBook = unknown> {
     if (this.manifests.some((manifest) => manifest.id === id)) {
       throw new LedgerError('PLUGIN_ERROR', `Plugin already registered: ${id}`);
     }
+    const staged = {
+      connectors: new Map<string, { pluginId: string; connector: SupplierConnector }>(),
+      reports: new Map<string, { pluginId: string; report: ReportContribution<TBook> }>(),
+      listeners: [] as { event: DocumentEvent; pluginId: string; listener: (view: DocumentView) => void }[],
+    };
     const api: PluginHostApi<TBook> = {
       registerSupplierConnector: (connector) => {
-        const existing = this.connectors.get(connector.partyId);
+        const existing = this.connectors.get(connector.partyId) ?? staged.connectors.get(connector.partyId);
         if (existing) {
           throw new LedgerError(
             'PLUGIN_ERROR',
             `Party ${connector.partyId} already has a connector from ${existing.pluginId}`,
           );
         }
-        this.connectors.set(connector.partyId, { pluginId: id, connector });
+        staged.connectors.set(connector.partyId, { pluginId: id, connector });
       },
       registerReport: (report) => {
-        if (this.reports.has(report.name)) {
+        if (this.reports.has(report.name) || staged.reports.has(report.name)) {
           throw new LedgerError('PLUGIN_ERROR', `Report already registered: ${report.name}`);
         }
-        this.reports.set(report.name, { pluginId: id, report });
+        staged.reports.set(report.name, { pluginId: id, report });
       },
       onDocumentEvent: (event, listener) => {
-        const bucket = this.listeners.get(event) ?? [];
-        bucket.push({ pluginId: id, listener });
-        this.listeners.set(event, bucket);
+        staged.listeners.push({ event, pluginId: id, listener });
       },
       log: (message) => {
         this.logs.push({ pluginId: id, at: new Date().toISOString(), message });
       },
     };
-    plugin.activate(api);
+    plugin.activate(api); // may throw: nothing below runs, nothing is kept
+    for (const [partyId, entry] of staged.connectors) this.connectors.set(partyId, entry);
+    for (const [name, entry] of staged.reports) this.reports.set(name, entry);
+    for (const { event, pluginId, listener } of staged.listeners) {
+      const bucket = this.listeners.get(event) ?? [];
+      bucket.push({ pluginId, listener });
+      this.listeners.set(event, bucket);
+    }
     this.manifests.push({ ...plugin.manifest });
   }
 
