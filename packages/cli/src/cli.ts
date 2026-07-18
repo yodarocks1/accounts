@@ -33,7 +33,7 @@ Document layer:
   accounts doc send <file> <document-id> [--override-deposit] [--override-minimum] [--approved-by <who>]
   accounts report <pnl|balance-sheet|ar-aging|ap-aging|inventory> <file> [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--as-of YYYY-MM-DD]
   accounts statement <file> (--party <id> | --customer <name> | --acct <number>) [--as-of YYYY-MM-DD] [--supplier]
-  accounts serve <file> [--port 3000]
+  accounts serve <file> [--port 3000] [--web <dist-dir>]
 
 Accounts in --debit/--credit are referenced by code or id; amounts are decimal
 strings in the account's currency ("1500.00").`;
@@ -612,12 +612,12 @@ function cmdServe(args: string[]): string {
   const { values, positionals } = parseArgs({
     args,
     allowPositionals: true,
-    options: { port: { type: 'string' } },
+    options: { port: { type: 'string' }, web: { type: 'string' } },
   });
   const path = requirePath(positionals);
   const file = CompanyFile.open(path);
   const port = Number(values.port ?? 3000);
-  const server = createApiServer(file);
+  const server = createApiServer(file, values.web !== undefined ? { webRoot: values.web } : {});
   server.listen(port);
   // The server owns the process from here; close on SIGINT.
   process.on('SIGINT', () => {
@@ -626,5 +626,10 @@ function cmdServe(args: string[]): string {
       process.exit(0);
     });
   });
-  return `Serving ${path} on http://127.0.0.1:${port} (Ctrl-C to stop)\nDashboard: http://127.0.0.1:${port}/ — JSON API on every other path`;
+  const lines = [
+    `Serving ${path} on http://127.0.0.1:${port} (Ctrl-C to stop)`,
+    `Dashboard: http://127.0.0.1:${port}/ — JSON API on every other path (also under /api)`,
+    ...(values.web !== undefined ? [`Web app: http://127.0.0.1:${port}/app (from ${values.web})`] : []),
+  ];
+  return lines.join('\n');
 }

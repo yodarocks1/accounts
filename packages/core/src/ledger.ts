@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from './ids.js';
 import type { Account, NewAccount } from './account.js';
 import { ACCOUNT_TYPES } from './account.js';
 import { LedgerError } from './errors.js';

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -355,6 +355,10 @@ describe('document API (Tier 3)', () => {
     expect(suggestions).toHaveLength(1);
     const mark = (await post('/bank/reconcile', { bankSeq: suggestions[0]!.bankSeq, paymentId: payment.id })).json as { reconSeq: number };
     expect((await get('/bank/suggestions?source=chase')).json).toHaveLength(0);
+    // Active marks are readable — added for the web UI (ADR 0020).
+    expect((await get('/bank/reconciliations')).json).toEqual([
+      { bankSeq: suggestions[0]!.bankSeq, reconSeq: mark.reconSeq, paymentId: payment.id },
+    ]);
     const again = await post('/bank/reconcile', { bankSeq: suggestions[0]!.bankSeq, paymentId: payment.id });
     expect(again.status).toBe(409);
     await post(`/bank/reconcile/${mark.reconSeq}/reverse`, {});
@@ -399,5 +403,39 @@ describe('document API (Tier 3)', () => {
     const missing = await fetch(`${base}/nope`);
     expect(missing.status).toBe(404);
     expect(missing.headers.get('content-type')).toContain('application/json');
+  });
+
+  it('the same API answers under /api — one prefix for dev proxies (ADR 0020)', async () => {
+    expect((await get('/api/company')).json).toEqual({ name: 'API Co', baseCurrency: 'USD' });
+    const item = (await post('/api/items', { name: 'W', currency: 'USD', unitPrice: '100' })).json as { id: string };
+    expect((await get(`/items`)).json).toMatchObject([{ id: item.id }]);
+    // Without a webRoot, /app is just another unknown path.
+    expect((await fetch(`${base}/app`)).status).toBe(404);
+  });
+
+  it('serves the built web app under /app when webRoot is configured (ADR 0020)', async () => {
+    const webRoot = join(dir, 'web');
+    mkdirSync(join(webRoot, 'assets'), { recursive: true });
+    writeFileSync(join(webRoot, 'index.html'), '<!doctype html><title>Accounts app shell</title>');
+    writeFileSync(join(webRoot, 'assets', 'app.js'), 'console.log("app")');
+    const webServer = createApiServer(file, { webRoot });
+    await new Promise<void>((resolve) => webServer.listen(0, resolve));
+    const webBase = `http://127.0.0.1:${(webServer.address() as AddressInfo).port}`;
+    try {
+      const index = await fetch(`${webBase}/app`);
+      expect(index.headers.get('content-type')).toContain('text/html');
+      expect(await index.text()).toContain('Accounts app shell');
+      const asset = await fetch(`${webBase}/app/assets/app.js`);
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get('content-type')).toContain('text/javascript');
+      // Extensionless deep links fall back to the SPA shell; missing assets 404.
+      expect(await (await fetch(`${webBase}/app/documents/abc`)).text()).toContain('Accounts app shell');
+      expect((await fetch(`${webBase}/app/assets/missing.js`)).status).toBe(404);
+      // The API and dashboard still answer on the same server.
+      const company = (await (await fetch(`${webBase}/api/company`)).json()) as { name: string };
+      expect(company.name).toBe('API Co');
+    } finally {
+      await new Promise<void>((resolve, reject) => webServer.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 });

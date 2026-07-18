@@ -2,9 +2,9 @@
 
 This project was a spike for **manual writing and design**: every feature
 began as a written ADR, was implemented against that ADR, tested, and
-pushed before the next began. Nineteen ADRs, twenty-one schema versions,
-five packages, 284 tests, and one golden scenario later, these are the
-conclusions.
+pushed before the next began. Twenty ADRs, twenty-one schema versions,
+six packages (plus a React web app), 294 tests, and one golden scenario
+later, these are the conclusions.
 
 ## What worked — keep these
 
@@ -88,6 +88,30 @@ when ids are omitted. Documented, tested — and still the most likely
 place a future UI corrupts intent. The real project should require
 explicit `lineId`s at the API boundary.
 
+## What the web UI taught (ADR 0020, purview extended late)
+
+**The bigint-as-string wire contract held under a real client.** The React
+app formats every amount through `@accounts/core` in the browser —
+`BigInt(wireString)` at one edge, `formatMoney` from the same code the
+ledger uses, `Number` never touching money. The test suite pins an amount
+past 2^53 rendering exactly. Designing the wire format before any UI
+existed (Tier 3.4) meant zero precision machinery when one arrived.
+
+**"Core is pure" was almost true: the browser found the one Node-ism.**
+`import { randomUUID } from 'node:crypto'` — invisible to every Node
+consumer, fatal to the bundler on day one. One edit (the Web Crypto
+global, `src/ids.ts`) made core genuinely platform-neutral. Lesson: purity
+claims need a second platform to test them; a browser build in CI would
+have caught this eighteen ADRs earlier.
+
+**An API shaped by its own tests has UI-shaped holes.** The first screen
+that showed reconciliation state needed a read that didn't exist — active
+marks were derived internally but never exposed. The fix was six lines
+(`GET /bank/reconciliations`) *because* everything derives from
+append-only facts, but the lesson stands: every write path the API offers
+needs the read path a screen would ask for, and only building a screen
+reveals which are missing.
+
 ## Open gaps (recorded, not hidden)
 
 - Shrinkage/write-off posting (damage disposal, negative adjustments) —
@@ -100,13 +124,18 @@ explicit `lineId`s at the API boundary.
   should unify all cash movement under one payment-shaped fact.
 - ~~Bank import/reconciliation (WS3)~~ — shipped within its time-box
   (ADR 0019); OFX/rules/feeds remain plugin territory as designed.
-- Multi-currency, sandboxed plugins, web UI: Phase 2+ by plan, unchanged.
+- The web UI is read-plus-reconcile only: document editing forms are
+  deliberately blocked on the positional line-matching risk (cost #5) —
+  a UI finding, recorded in ADR 0020's cut list.
+- Multi-currency and sandboxed plugins: Phase 2+ by plan, unchanged.
 
 ## Verdict
 
-The method scales. Nineteen consecutive design-first features landed on an
-immutable core without a rewrite, without a migration failure, and without
-the plugin thesis needing a single retrofit. The two structural costs
+The method scales. Twenty consecutive design-first features — the last a
+whole UI layer added by a late scope extension — landed on an immutable
+core without a rewrite, without a migration failure, and with exactly one
+retrofit (the `node:crypto` seam) across the plugin *and* browser
+boundaries. The two structural costs
 (hand-mirrored storage, enum rebuilds) have known fixes that don't touch
 the method itself. For the real project: keep ADR cadence, keep
 event-sourced facts + derived views, keep conformance testing — replace

@@ -4,22 +4,23 @@ An open-source, moddable alternative to QuickBooks: a real double-entry
 ledger, local-first data you own, and a plugin system as the core
 architectural feature — *"the VS Code of accounting."*
 
-**Status: design spike, complete.** Nineteen design-first features (ADRs
-0001–0019) implemented, tested, and shipped in sequence. The books run a
+**Status: design spike, complete.** Twenty design-first features (ADRs
+0001–0020) implemented, tested, and shipped in sequence. The books run a
 real business end to end; a plugin extends the system through public API
-with zero core edits. Read the record:
+with zero core edits; a React UI consumes the same JSON API everything
+else uses. Read the record:
 
 | Document | What it tells you |
 |---|---|
 | **[docs/SPIKE-FINDINGS.md](docs/SPIKE-FINDINGS.md)** | The conclusions: what the manual-design method bought, what it cost, the verdict |
 | [docs/SPIKE.md](docs/SPIKE.md) | The plan the spike ran on: workstreams, cut lines, exit criteria |
-| [docs/adr/](docs/adr/README.md) | Nineteen ADRs — every feature's design, written before its code |
+| [docs/adr/](docs/adr/README.md) | Twenty ADRs — every feature's design, written before its code |
 | [PLAN.md](PLAN.md) | The full product plan the spike was proving out |
 
 ## The five-minute tour
 
 ```sh
-pnpm install && pnpm build && pnpm test   # 271 tests, all green
+pnpm install && pnpm build && pnpm test   # 294 tests, all green
 ```
 
 **The golden scenario** is the demo: one business's story — plugin-quoted
@@ -43,6 +44,15 @@ node $CLI post books.sqlite --date 2026-07-01 --memo "First sale" \
   --debit 1000:1500.00 --credit 4000:1500.00
 node $CLI report pnl books.sqlite --from 2026-07-01 --to 2026-07-31
 node $CLI report balance-sheet books.sqlite
+```
+
+**The web UI**, on the same books:
+
+```sh
+node $CLI serve books.sqlite --port 3000 --web packages/web/dist
+# http://127.0.0.1:3000/app  — React app (dashboard, documents, bank reconciliation)
+# http://127.0.0.1:3000/     — zero-dependency server-rendered dashboard
+# http://127.0.0.1:3000/api  — the JSON API both of them read
 ```
 
 **The plugin thesis**, demonstrated: [plugins/demo-supplier](plugins/demo-supplier/README.md)
@@ -71,6 +81,9 @@ events, and contributes a report — depending only on `@accounts/core`.
   hooks, and report contributions.
 - **Banking**: idempotent CSV import, suggestion-based reconciliation with
   reversal-only undo.
+- **Web UI**: React app over the JSON API — dashboard, document browsing,
+  interactive bank reconciliation — with `@accounts/core` running in the
+  browser so money stays bigint-exact end to end.
 
 ## Packages
 
@@ -80,6 +93,7 @@ events, and contributes a report — depending only on `@accounts/core`.
 | `@accounts/storage` | One business = one SQLite file (schema v21). Mirrors the in-memory reference engine; conformance-tested against it. |
 | `@accounts/server` | Dependency-free JSON HTTP API over one company file, plus a read-only HTML dashboard at `GET /`. |
 | `@accounts/cli` | `accounts` command: ledger ops, documents, reports, statements, serve. |
+| `@accounts/web` | React + Vite UI over the JSON API; served at `/app` by `accounts serve --web`. |
 | `@accounts/plugin-demo-supplier` | The dogfood plugin — proof the public API suffices. |
 
 Development ritual: `pnpm lint && pnpm typecheck && pnpm build && pnpm test`.
@@ -95,7 +109,7 @@ Development ritual: `pnpm lint && pnpm typecheck && pnpm build && pnpm test`.
    pre-migration backups, 21 in-place schema migrations and counting.
 4. **Money is exact** — bigint minor units everywhere; floats are lint errors.
 
-What comes next (web UI, sandboxed third-party plugins, multi-currency,
-QuickBooks import) is scoped in [PLAN.md](PLAN.md) phases 1–3; what the
-real project should do differently is in the
-[findings](docs/SPIKE-FINDINGS.md).
+What comes next (document editing in the UI, sandboxed third-party
+plugins, multi-currency, QuickBooks import) is scoped in
+[PLAN.md](PLAN.md) phases 1–3; what the real project should do
+differently is in the [findings](docs/SPIKE-FINDINGS.md).

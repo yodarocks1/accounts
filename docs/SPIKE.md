@@ -73,6 +73,17 @@ In-process, bundled-plugin host proving extension without core changes:
 **Cut line:** OFX parsing, auto-reconcile rules, bank feeds. If the clock
 runs out, WS3 drops entirely — it exercises no novel design.
 
+### WS5 — Web UI (ADR 0020) · *purview extended after WS4 shipped*
+- React + Vite `@accounts/web`, added when the spike's scope was widened
+  to test the last unconsumed boundary: a real interactive client on the
+  JSON API. Core runs in the browser; money stays bigint end to end.
+- Views: dashboard (reports), documents (list/detail), bank
+  reconciliation (import → suggest → confirm → undo).
+- `/api/*` alias + `serve --web <dist>` static hosting keep the whole
+  demo on one origin, one process.
+**Cut line:** document editing forms — blocked on findings #5 (positional
+line matching) by design, and recorded as such.
+
 ### WS4 — Golden scenario + findings · *the spike's actual deliverables*
 - One narrative end-to-end test telling a full business story across every
   subsystem (quote→order→deposit→PO→receipt→bill→invoice→payment→return→
@@ -93,6 +104,7 @@ runs out, WS3 drops entirely — it exercises no novel design.
 
 ## Deliberately out of spike scope
 
-Web UI shell, plugin sandboxing/registry, QuickBooks import, multi-currency,
+~~Web UI shell~~ (purview extended → WS5, ADR 0020),
+plugin sandboxing/registry, QuickBooks import, multi-currency,
 recurring transactions, payroll, e-invoicing, multi-user/Postgres — all
 recorded in PLAN.md phases 1–3 with their existing rationale.

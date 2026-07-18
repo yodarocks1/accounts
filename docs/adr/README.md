@@ -27,6 +27,7 @@ and why.
 | [0017](0017-reports.md) | P&L, balance sheet, aging summaries, inventory valuation — pure reads |
 | [0018](0018-plugin-host.md) | Plugin host v1: connectors, isolated hooks, report contributions — the thesis, demonstrated |
 | [0019](0019-bank-import.md) | Bank import & reconciliation: idempotent facts, pure suggestions, reversal-only marks |
+| [0020](0020-web-ui.md) | React web UI: core in the browser, bigint-exact wire edge, `/api` alias + `/app` hosting |
 
 Recurring patterns worth noticing across the set: **append-only facts with
 derived views** (0003, 0004, 0014, 0019), **snapshot-at-write so history

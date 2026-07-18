@@ -3328,6 +3328,15 @@ export class CompanyFile implements ItemCatalog {
     return active;
   }
 
+  /**
+   * Active (unreversed) reconciliation marks, one per bank line. Added for
+   * the web UI (ADR 0020) — the first read a real client needed that the
+   * API's own tests never did.
+   */
+  bankReconciliations(): { bankSeq: number; reconSeq: number; paymentId: string }[] {
+    return [...this.activeReconciliations().entries()].map(([bankSeq, entry]) => ({ bankSeq, ...entry }));
+  }
+
   /** Pure suggestions: nothing is written until the user confirms a match. */
   bankMatchSuggestions(source?: string, windowDays = 3): BankMatchSuggestion[] {
     const active = this.activeReconciliations();

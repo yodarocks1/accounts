@@ -1,4 +1,6 @@
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { extname, join, resolve, sep } from 'node:path';
 import { LedgerError, type LedgerErrorCode } from '@accounts/core';
 import type { CompanyFile } from '@accounts/storage';
 import { renderDashboard } from './dashboard.js';
@@ -496,6 +498,9 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     if (method === 'GET' && id === 'transactions') {
       return file.listBankTransactions(query.get('source') ?? undefined);
     }
+    if (method === 'GET' && id === 'reconciliations') {
+      return file.bankReconciliations();
+    }
     if (method === 'GET' && id === 'suggestions') {
       const window = query.get('windowDays');
       return file.bankMatchSuggestions(query.get('source') ?? undefined, window !== null ? Number(window) : undefined);
@@ -569,12 +574,49 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
   return undefined;
 }
 
+const STATIC_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.map': 'application/json',
+  '.json': 'application/json',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.png': 'image/png',
+  '.woff2': 'font/woff2',
+};
+
+/**
+ * Serve one file under /app from the built web bundle (ADR 0020): resolved
+ * paths must stay inside webRoot; unknown extensionless paths fall back to
+ * index.html so hash/deep links load the SPA.
+ */
+async function serveStatic(webRoot: string, rest: readonly string[], response: ServerResponse): Promise<void> {
+  const root = resolve(webRoot);
+  const requested = resolve(join(root, ...rest));
+  const safe = requested === root || requested.startsWith(root + sep) ? requested : root;
+  const target = extname(safe) === '' ? join(root, 'index.html') : safe;
+  try {
+    const content = await readFile(target);
+    response.writeHead(200, { 'content-type': STATIC_TYPES[extname(target)] ?? 'application/octet-stream' });
+    response.end(content);
+  } catch {
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(toJson({ error: 'NOT_FOUND', message: `No such asset under /app` }));
+  }
+}
+
+export interface ApiServerOptions {
+  /** Directory of the built @accounts/web bundle; enables GET /app/*. */
+  webRoot?: string;
+}
+
 /** Build (but do not start) the HTTP server for a company file. */
-export function createApiServer(file: CompanyFile): Server {
+export function createApiServer(file: CompanyFile, options: ApiServerOptions = {}): Server {
   return createHttpServer((request: IncomingMessage, response: ServerResponse) => {
     void (async () => {
       const url = new URL(request.url ?? '/', 'http://localhost');
-      const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
+      let segments = url.pathname.split('/').filter((segment) => segment.length > 0);
       try {
         // The human-facing surface: GET / (or /dashboard) renders HTML;
         // every other path stays JSON.
@@ -585,6 +627,13 @@ export function createApiServer(file: CompanyFile): Server {
           response.end(renderDashboard(file, url.searchParams));
           return;
         }
+        if (segments[0] === 'app' && options.webRoot !== undefined && request.method === 'GET') {
+          await serveStatic(options.webRoot, segments.slice(1), response);
+          return;
+        }
+        // The same API answers with and without the /api prefix (ADR 0020):
+        // the prefix gives dev servers one thing to proxy.
+        if (segments[0] === 'api') segments = segments.slice(1);
         const body = request.method === 'GET' ? {} : await readBody(request);
         const result = await route(file, request.method ?? 'GET', segments, url.searchParams, body);
         if (result === undefined) {

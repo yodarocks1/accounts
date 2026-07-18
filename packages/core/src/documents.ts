@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from './ids.js';
 import { allocateProportional } from './allocation.js';
 import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
