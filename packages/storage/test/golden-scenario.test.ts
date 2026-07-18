@@ -234,6 +234,38 @@ describe('the golden scenario', () => {
     assertBalanced();
   });
 
+  it('ch.11 — the bank agrees (and one honest gap shows itself)', () => {
+    // The month's bank export: all five cash events from the story.
+    const imported = file.importBankTransactions('first-national', [
+      'date,amount,description',
+      '2026-06-22,550.00,CHECK 101 ACME LLC',
+      '2026-06-24,-300.00,WIRE WIDGETS WHOLESALE',
+      '2026-07-03,-24.00,CHECK 78 WIDGETS WHOLESALE',
+      '2026-07-15,186.00,ACH ACME LLC',
+      '2026-07-21,-33.00,REFUND CHECK ACME LLC',
+    ].join('\n'));
+    expect(imported).toEqual({ imported: 5, skipped: 0 });
+
+    // Four lines match the four recorded payments, all on their exact dates.
+    const suggestions = file.bankMatchSuggestions('first-national');
+    expect(suggestions.map((entry) => entry.dayOffset)).toEqual([0, 0, 0, 0]);
+    for (const suggestion of suggestions) {
+      file.reconcileBankTransaction(suggestion.bankSeq, suggestion.paymentId);
+    }
+    expect(file.bankMatchSuggestions('first-national')).toHaveLength(0);
+
+    // The fifth line — the 33.00 refund — stays unmatched: refundCredit
+    // moves real cash but is an application record, not a Payment, so the
+    // matcher cannot see it. A recorded gap (SPIKE-FINDINGS), not a bug
+    // hidden by a forced match.
+    const unmatched = file
+      .listBankTransactions('first-national')
+      .filter((row) => !suggestions.some((entry) => entry.bankSeq === row.bankSeq));
+    expect(unmatched).toHaveLength(1);
+    expect(unmatched[0]!.amountMinor).toBe(-3300n);
+    assertBalanced();
+  });
+
   it('ch.10 — the reports tell the same story the ledger does', () => {
     const pnl = file.profitAndLoss('2026-06-01', '2026-07-31');
     expect(pnl.totalIncome).toBe(65_000n); // 680.00 sold − 30.00 returned

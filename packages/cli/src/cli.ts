@@ -626,5 +626,5 @@ function cmdServe(args: string[]): string {
       process.exit(0);
     });
   });
-  return `Serving ${path} on http://127.0.0.1:${port} (Ctrl-C to stop)`;
+  return `Serving ${path} on http://127.0.0.1:${port} (Ctrl-C to stop)\nDashboard: http://127.0.0.1:${port}/ — JSON API on every other path`;
 }

@@ -1,6 +1,7 @@
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { LedgerError, type LedgerErrorCode } from '@accounts/core';
 import type { CompanyFile } from '@accounts/storage';
+import { renderDashboard } from './dashboard.js';
 
 /**
  * The document-layer API (ADR 0010 part 4): a dependency-free JSON HTTP
@@ -575,6 +576,15 @@ export function createApiServer(file: CompanyFile): Server {
       const url = new URL(request.url ?? '/', 'http://localhost');
       const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
       try {
+        // The human-facing surface: GET / (or /dashboard) renders HTML;
+        // every other path stays JSON.
+        const wantsDashboard =
+          request.method === 'GET' && (segments.length === 0 || (segments.length === 1 && segments[0] === 'dashboard'));
+        if (wantsDashboard) {
+          response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          response.end(renderDashboard(file, url.searchParams));
+          return;
+        }
         const body = request.method === 'GET' ? {} : await readBody(request);
         const result = await route(file, request.method ?? 'GET', segments, url.searchParams, body);
         if (result === undefined) {

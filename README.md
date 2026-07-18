@@ -78,7 +78,7 @@ events, and contributes a report — depending only on `@accounts/core`.
 |---|---|
 | `@accounts/core` | The pure domain: money, journal, documents, inventory/FIFO, reports, plugin host. No I/O. |
 | `@accounts/storage` | One business = one SQLite file (schema v21). Mirrors the in-memory reference engine; conformance-tested against it. |
-| `@accounts/server` | Dependency-free JSON HTTP API over one company file. |
+| `@accounts/server` | Dependency-free JSON HTTP API over one company file, plus a read-only HTML dashboard at `GET /`. |
 | `@accounts/cli` | `accounts` command: ledger ops, documents, reports, statements, serve. |
 | `@accounts/plugin-demo-supplier` | The dogfood plugin — proof the public API suffices. |
 

@@ -374,4 +374,30 @@ describe('document API (Tier 3)', () => {
     const allowed = await post(`/documents/${doc.id}/void`, { approvedBy: 'owner' });
     expect(allowed.status).toBe(201);
   });
+
+  it('GET / serves the read-only HTML dashboard; JSON stays everywhere else', async () => {
+    const item = (await post('/items', { name: 'Widget <em>Pro</em>', currency: 'USD', unitPrice: '2500', kind: 'inventory' })).json as { id: string };
+    const doc = (await post('/documents', {
+      type: 'invoice', number: 'INV-1', date: '2026-07-01', customerName: 'Acme & Sons',
+      lines: [{ itemId: item.id, description: 'Widget', quantityMilli: '2000' }],
+    })).json as { id: string };
+    await post(`/documents/${doc.id}/send`, {});
+
+    for (const path of ['/', '/dashboard', '/?asOf=2026-07-15']) {
+      const response = await fetch(`${base}${path}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('text/html');
+      const html = await response.text();
+      expect(html).toContain('API Co');
+      expect(html).toContain('BALANCED');
+      // Interpolated names are escaped, never raw.
+      expect(html).toContain('Acme &amp; Sons');
+      expect(html).toContain('Widget &lt;em&gt;Pro&lt;/em&gt;');
+      expect(html).not.toContain('<em>Pro</em>');
+    }
+    // The JSON 404 contract is untouched for unknown paths.
+    const missing = await fetch(`${base}/nope`);
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get('content-type')).toContain('application/json');
+  });
 });

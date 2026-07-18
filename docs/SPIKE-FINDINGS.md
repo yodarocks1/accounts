@@ -3,7 +3,7 @@
 This project was a spike for **manual writing and design**: every feature
 began as a written ADR, was implemented against that ADR, tested, and
 pushed before the next began. Nineteen ADRs, twenty-one schema versions,
-five packages, 274 tests, and one golden scenario later, these are the
+five packages, 284 tests, and one golden scenario later, these are the
 conclusions.
 
 ## What worked — keep these
@@ -94,6 +94,10 @@ explicit `lineId`s at the API boundary.
   the one place FIFO valuation and the G/L legitimately diverge today.
 - Bill-correction FIFO vs G/L price variance in mixed-layer edge cases.
 - Negative-stock issues are costed at `costAt` and never retro-costed.
+- `refundCredit` moves real cash but is an application record, not a
+  `Payment` — so bank reconciliation cannot match refund lines (golden
+  scenario ch. 11 demonstrates the unmatched line). The real project
+  should unify all cash movement under one payment-shaped fact.
 - ~~Bank import/reconciliation (WS3)~~ — shipped within its time-box
   (ADR 0019); OFX/rules/feeds remain plugin territory as designed.
 - Multi-currency, sandboxed plugins, web UI: Phase 2+ by plan, unchanged.
