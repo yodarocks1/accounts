@@ -1882,9 +1882,13 @@ export class DocumentBook implements ItemCatalog {
     if (input.type === 'purchase_order') {
       this.validatePurchaseLinks(lines);
     }
-    // ADR 0022: a single-source document continues its family's numbering;
-    // multi-source or unlinked documents start fresh from the sequence.
-    const familySource = familySourceOf(input.sourceDocumentId, lines);
+    // ADR 0022: a document with one same-side source continues its
+    // family's numbering; anything else starts fresh from the sequence.
+    // Sales and purchase documents never share numbers.
+    const familySource = familySourceOf(input.sourceDocumentId, lines, (documentId) => {
+      const source = this.documents.get(documentId);
+      return source !== undefined && isPurchaseType(source.type) === purchase;
+    });
     const familyRoot = familySource !== null ? this.documents.get(familySource) : undefined;
     const number =
       input.number?.trim() ??

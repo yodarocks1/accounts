@@ -144,9 +144,10 @@ file.close();
 
 console.log(`Seeded ${PATH} — trial balance ${balanced ? 'BALANCED' : 'OUT OF BALANCE (bug!)'}`);
 console.log(`
-The story inside (one transaction = one number, ADR 0022):
+The story inside (one transaction = one number per side, ADR 0022):
   EST-0001 → EST-0001b (sales order) → EST-0001c (invoice: 6 of 10 widgets, ${acmePayment.number} applied)
-  EST-0001d — draft purchase order cross-linked to the order's open widgets; try sending it
+  PO-0002 — draft purchase order cross-linked to the order's open widgets (supply side
+            numbers separately); try sending it
   PO-0001 → PO-0001b (receipt) → PO-0001c (bill, paid) — 40 widgets in
   INV-0001 — a cash sale, unlinked, so it draws its own sequence
   One assembly built, two widgets damaged (one trashed)

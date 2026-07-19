@@ -7,17 +7,25 @@
  * sequence instead. An explicitly provided number always wins.
  */
 
-/** The single source document a new document continues, or null. */
+/**
+ * The single source document a new document continues, or null. Only
+ * same-side sources count: sales documents and purchase documents keep
+ * separate numbering, so a PO ordering for a sales order starts its own
+ * supply-side family rather than borrowing the customer's number.
+ */
 export function familySourceOf(
   documentSourceId: string | undefined,
   lines: readonly { sourceDocumentId: string | null }[],
+  sameSide: (documentId: string) => boolean,
 ): string | null {
   const sources = new Set<string>();
   if (documentSourceId !== undefined) sources.add(documentSourceId);
   for (const line of lines) {
     if (line.sourceDocumentId !== null) sources.add(line.sourceDocumentId);
   }
-  return sources.size === 1 ? [...sources][0]! : null;
+  // Cross-side links are references, not lineage: they never number.
+  const eligible = [...sources].filter(sameSide);
+  return eligible.length === 1 ? eligible[0]! : null;
 }
 
 /**

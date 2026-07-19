@@ -48,14 +48,16 @@ describe('family numbers in the book (ADR 0022)', () => {
     expect(second.number).toBe('412d');
   });
 
-  it('cross-linked documents join the family; explicit numbers still win', () => {
+  it('sales and supply sides number separately; explicit numbers still win', () => {
     const { book, widget, supplier } = setUp();
+    book.setNumberSequence('purchase_order', { prefix: 'PO-' });
     const order = book.createDocument({
       type: 'sales_order', number: 'SO-77', date: '2026-07-01', customerName: 'Acme',
       lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 10_000n, lineId: 'S1' }],
     });
     book.sendDocument(order.id);
-    // A PO ordering for this SO inherits the family number.
+    // A PO ordering for this SO is a supply-side transaction: it draws its
+    // own sequence, never the customer's family number.
     const po = book.createDocument({
       type: 'purchase_order', date: '2026-07-02', partyId: supplier.id,
       lines: [{
@@ -63,18 +65,22 @@ describe('family numbers in the book (ADR 0022)', () => {
         sourceDocumentId: order.id, sourceLineId: 'S1',
       }],
     });
-    expect(po.number).toBe('SO-77b');
-    // An explicit number opts out without consuming a letter for itself.
+    expect(po.number).toBe('PO-0001');
+    // …and the supply-side family grows off the PO's number.
+    book.sendDocument(po.id);
+    const receipt = book.convertDocument(po.id, { type: 'receipt', date: '2026-07-05' });
+    expect(receipt.number).toBe('PO-0001b');
+    // Sales side: an explicit number opts out without consuming a letter.
     const named = book.convertDocument(order.id, {
       type: 'invoice', number: 'INV-CUSTOM', date: '2026-07-03',
       lines: [{ sourceLineId: 'S1', quantityMilli: 1_000n }],
     });
     expect(named.number).toBe('INV-CUSTOM');
-    // The next automatic member continues from the highest letter in use.
+    // The next automatic sales member continues the SO family.
     const next = book.convertDocument(order.id, {
       type: 'invoice', date: '2026-07-04', lines: [{ sourceLineId: 'S1', quantityMilli: 1_000n }],
     });
-    expect(next.number).toBe('SO-77c');
+    expect(next.number).toBe('SO-77b');
   });
 
   it('multiple sources start a new transaction: fresh sequence number', () => {

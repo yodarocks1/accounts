@@ -1335,7 +1335,14 @@ export class CompanyFile implements ItemCatalog {
     }
     const id = randomUUID();
     this.db.transaction(() => {
-      const number = input.number?.trim() ?? this.familyOrDrawnNumber(input.type, familySourceOf(input.sourceDocumentId, lines));
+      // Sales and purchase documents never share numbers (ADR 0022).
+      const familySource = familySourceOf(input.sourceDocumentId, lines, (documentId) => {
+        const source = this.db.prepare(`SELECT type FROM documents WHERE id = ?`).get(documentId) as
+          | { type: DocumentType }
+          | undefined;
+        return source !== undefined && isPurchaseType(source.type) === purchase;
+      });
+      const number = input.number?.trim() ?? this.familyOrDrawnNumber(input.type, familySource);
       try {
         this.db
           .prepare(

@@ -59,14 +59,15 @@ Open **http://127.0.0.1:3000/app** and try, in order:
 1. **Dashboard** — the BALANCED badge is computed, not decorative; below
    it: P&L, balance sheet, A/R + A/P aging, and FIFO inventory from one
    seeded month of business.
-2. **Documents → EST-0001b** — one transaction, one number (ADR 0022):
-   the estimate EST-0001 became sales order EST-0001b, invoice EST-0001c,
-   and a cross-linked purchase order EST-0001d. The links panel shows the
-   family, per-line upstream/downstream chips, fulfillment (6 of 10
-   widgets billed), and purchase coverage. Click **Convert…** to invoice
-   the open 4 — it will be numbered EST-0001e — or **Order from
-   supplier…** to cross-link another PO.
-3. **Documents → EST-0001d** — the draft purchase order. Click **Send**
+2. **Documents → EST-0001b** — one transaction, one number per side
+   (ADR 0022): the estimate EST-0001 became sales order EST-0001b and
+   invoice EST-0001c; the cross-linked purchase order is PO-0002, because
+   the supply side numbers separately. The links panel shows the family,
+   per-line upstream/downstream chips, fulfillment (6 of 10 widgets
+   billed), and purchase coverage. Click **Convert…** to invoice the
+   open 4 — it will be numbered EST-0001d — or **Order from supplier…**
+   to cross-link another PO.
+3. **Documents → PO-0002** — the draft purchase order. Click **Send**
    and watch readiness gate against the supplier's 50.00 minimum
    (override checkbox provided).
 4. **Bank** — three imported lines match recorded payments at day-offset

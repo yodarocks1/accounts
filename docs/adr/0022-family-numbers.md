@@ -20,32 +20,44 @@ new transaction and gets a fresh number.
 1. **A single-source document inherits its family's number.** At
    creation, when no explicit number is given: if the document's sources
    (its document-level source plus every line-level link) name exactly
-   one document, its number is the family base plus the next letter.
-   Zero sources or two-plus sources → the type sequence, as before. An
-   explicitly provided number always wins — numbering is a default, never
-   a constraint.
-2. **The base is derived from the source's number, not the graph.** Strip
+   one document *on the same side*, its number is the family base plus
+   the next letter. Zero same-side sources or two-plus → the type
+   sequence, as before. An explicitly provided number always wins —
+   numbering is a default, never a constraint.
+2. **Sales and supply sides number separately.** Sales documents
+   (estimate, sales order, invoice, credit memo) and purchase documents
+   (purchase order, receipt, bill, vendor credit) never share a family
+   number. A special-order PO cross-linked to a sales order is a new
+   supply-side transaction: it draws the PO sequence, and *its* receipts
+   and bills suffix the PO's number (PO-0001 → PO-0001b → PO-0001c).
+   Cross-side links are references, not lineage — the link graph
+   (ADR 0021) still shows the connection; the numbers name the side's
+   own paper trail, matching how counterparties see it (your customer
+   never learns your PO numbers, your supplier never sees your invoice
+   numbers).
+3. **The base is derived from the source's number, not the graph.** Strip
    a trailing lowercase suffix when a digit precedes it ("412b" → "412";
    "EST-0412" stays itself), so chains extend the root rather than
    stacking letters ("412b" begets "412c", never "412bb"). Deriving from
    the number rather than the connected component keeps merged families
    sane: a multi-source document starts a new base, and its descendants
    suffix *that*.
-3. **Letters are assigned monotonically.** The root is the unsuffixed
+4. **Letters are assigned monotonically.** The root is the unsuffixed
    number (an implicit "a"); the next member takes the letter after the
    highest suffix in use anywhere in the books ("b", …, "z", "aa", …,
    bijective base 26). Voided members and explicitly numbered members
    keep their letters — gaps are possible, collisions are not.
-4. **The family scan crosses type boundaries** (number uniqueness is
-   per-type, but a family spans types by definition), so a receipt and a
-   bill converted from PO-0001 become PO-0001b and PO-0001c — the number
-   records where the transaction started, which is the point.
+5. **The family scan crosses type boundaries within a side** (number
+   uniqueness is per-type, but a family spans types by definition), so a
+   receipt and a bill converted from PO-0001 become PO-0001b and
+   PO-0001c — the number records where the transaction started, which is
+   the point.
 
 This applies uniformly to conversions (estimate→SO→invoice, PO→receipt→
-bill), returns (credit memo linked to one invoice), and cross-linked
-documents (a PO ordering for one sales order joins that family). The
+bill) and returns (credit memo linked to one invoice). The
 implementation is three pure functions in core (`family-numbers.ts`)
-called at the single number-resolution point of each engine.
+called at the single number-resolution point of each engine, with each
+engine supplying the same-side predicate (`isPurchaseType`).
 
 **Cut (recorded):** renumbering existing documents (numbers are
 snapshots; history does not drift — ADR 0004 applies to numbers too),
