@@ -4,8 +4,8 @@ An open-source, moddable alternative to QuickBooks: a real double-entry
 ledger, local-first data you own, and a plugin system as the core
 architectural feature — *"the VS Code of accounting."*
 
-**Status: design spike, complete.** Twenty-one design-first features
-(ADRs 0001–0021) implemented, tested, and shipped in sequence. The books run a
+**Status: design spike, complete.** Twenty-two design-first features
+(ADRs 0001–0022) implemented, tested, and shipped in sequence. The books run a
 real business end to end; a plugin extends the system through public API
 with zero core edits; a React UI consumes the same JSON API everything
 else uses. Read the record:
@@ -14,14 +14,14 @@ else uses. Read the record:
 |---|---|
 | **[docs/SPIKE-FINDINGS.md](docs/SPIKE-FINDINGS.md)** | The conclusions: what the manual-design method bought, what it cost, the verdict |
 | [docs/SPIKE.md](docs/SPIKE.md) | The plan the spike ran on: workstreams, cut lines, exit criteria |
-| [docs/adr/](docs/adr/README.md) | Twenty-one ADRs — every feature's design, written before its code |
+| [docs/adr/](docs/adr/README.md) | Twenty-two ADRs — every feature's design, written before its code |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | What's necessary next — every entry traced to spike evidence |
 | [PLAN.md](PLAN.md) | The full product plan the spike was proving out |
 
 ## The five-minute tour
 
 ```sh
-pnpm install && pnpm build && pnpm test   # 305 tests, all green
+pnpm install && pnpm build && pnpm test   # 311 tests, all green
 ```
 
 **The golden scenario** is the demo: one business's story — plugin-quoted
@@ -59,14 +59,16 @@ Open **http://127.0.0.1:3000/app** and try, in order:
 1. **Dashboard** — the BALANCED badge is computed, not decorative; below
    it: P&L, balance sheet, A/R + A/P aging, and FIFO inventory from one
    seeded month of business.
-2. **Documents → SO-0001** — the links panel: the sales order's family
-   (EST-0001 → SO-0001 → INV-0001, plus a cross-linked purchase order),
-   per-line upstream/downstream chips, fulfillment (6 of 10 widgets
-   billed), and purchase coverage. Click **Convert…** to invoice the open
-   4, or **Order from supplier…** to cross-link a new PO.
-3. **Documents → PO-0002** — a draft purchase order linked to the sales
-   order's open lines. Click **Send** and watch readiness gate against
-   the supplier's 50.00 minimum (override checkbox provided).
+2. **Documents → EST-0001b** — one transaction, one number (ADR 0022):
+   the estimate EST-0001 became sales order EST-0001b, invoice EST-0001c,
+   and a cross-linked purchase order EST-0001d. The links panel shows the
+   family, per-line upstream/downstream chips, fulfillment (6 of 10
+   widgets billed), and purchase coverage. Click **Convert…** to invoice
+   the open 4 — it will be numbered EST-0001e — or **Order from
+   supplier…** to cross-link another PO.
+3. **Documents → EST-0001d** — the draft purchase order. Click **Send**
+   and watch readiness gate against the supplier's 50.00 minimum
+   (override checkbox provided).
 4. **Bank** — three imported lines match recorded payments at day-offset
    zero; click **Reconcile** on each. The 12.00 SERVICE FEE finds no
    match — that's the system being honest, not broken.

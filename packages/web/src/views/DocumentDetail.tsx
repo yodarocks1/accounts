@@ -553,7 +553,7 @@ function ConvertForm({ targets, picks: initial, currency, onSubmit }: {
         <input id="convert-date" value={date} onChange={(event) => setDate(event.target.value)} size={10} />
         <input
           aria-label="document number"
-          placeholder="number (blank = sequence)"
+          placeholder="number (blank = family or sequence)"
           size={16}
           value={number}
           onChange={(event) => setNumber(event.target.value)}
@@ -610,7 +610,7 @@ function OrderForm({ parties, picks: initial, onSubmit }: {
         <input id="order-date" value={date} onChange={(event) => setDate(event.target.value)} size={10} />
         <input
           aria-label="document number"
-          placeholder="number (blank = sequence)"
+          placeholder="number (blank = family or sequence)"
           size={16}
           value={number}
           onChange={(event) => setNumber(event.target.value)}

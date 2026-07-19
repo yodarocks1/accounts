@@ -81,7 +81,7 @@ describe('document API (Tier 3)', () => {
     const invoice = (await post(`/documents/${order.id}/convert`, { type: 'invoice', date: '2026-07-03' })).json as {
       id: string; number: string;
     };
-    expect(invoice.number).toBe('INV-0001');
+    expect(invoice.number).toBe('SO-0001b'); // family number (ADR 0022), not the invoice sequence
     await post(`/documents/${invoice.id}/send`, {});
     const settlement = (await get(`/documents/${invoice.id}/settlement`)).json as { paid: string; open: string };
     expect(settlement.paid).toBe('5000');
@@ -92,7 +92,7 @@ describe('document API (Tier 3)', () => {
       invoices: { number: string; openAmount: string; dueDate: string }[];
       balance: string;
     };
-    expect(statement.invoices[0]!.number).toBe('INV-0001');
+    expect(statement.invoices[0]!.number).toBe('SO-0001b');
     expect(statement.invoices[0]!.dueDate).toBe('2026-08-02');
     expect(statement.balance).toBe('5825');
   });

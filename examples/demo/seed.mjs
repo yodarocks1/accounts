@@ -144,11 +144,12 @@ file.close();
 
 console.log(`Seeded ${PATH} — trial balance ${balanced ? 'BALANCED' : 'OUT OF BALANCE (bug!)'}`);
 console.log(`
-The story inside:
-  EST-0001 → SO-0001 → INV-0001 (6 of 10 widgets billed, ${acmePayment.number} applied)
-  PO-0001 → RCT-0001 → BILL-0001 (40 widgets received and paid)
-  PO-0002 draft, cross-linked to SO-0001's open widgets — try sending it
-  One cash sale, one assembly built, two widgets damaged (one trashed)
+The story inside (one transaction = one number, ADR 0022):
+  EST-0001 → EST-0001b (sales order) → EST-0001c (invoice: 6 of 10 widgets, ${acmePayment.number} applied)
+  EST-0001d — draft purchase order cross-linked to the order's open widgets; try sending it
+  PO-0001 → PO-0001b (receipt) → PO-0001c (bill, paid) — 40 widgets in
+  INV-0001 — a cash sale, unlinked, so it draws its own sequence
+  One assembly built, two widgets damaged (one trashed)
   Bank: 4 lines imported, 3 matches waiting for you, 1 fee that never matches
 
 Serve it:  node packages/cli/dist/main.js serve demo.sqlite --port 3000 --web packages/web/dist`);

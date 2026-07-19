@@ -2,8 +2,8 @@
 
 This project was a spike for **manual writing and design**: every feature
 began as a written ADR, was implemented against that ADR, tested, and
-pushed before the next began. Twenty-one ADRs, twenty-one schema
-versions, six packages (plus a React web app), 305 tests, and one golden
+pushed before the next began. Twenty-two ADRs, twenty-one schema
+versions, six packages (plus a React web app), 311 tests, and one golden
 scenario later, these are the conclusions.
 
 ## What worked — keep these
@@ -137,8 +137,8 @@ but the count is the argument for building one screen per subsystem
 
 ## Verdict
 
-The method scales. Twenty consecutive design-first features — the last a
-whole UI layer added by a late scope extension — landed on an immutable
+The method scales. Twenty-two consecutive design-first features — among
+them a whole UI layer added by a late scope extension — landed on an immutable
 core without a rewrite, without a migration failure, and with exactly one
 retrofit (the `node:crypto` seam) across the plugin *and* browser
 boundaries. The two structural costs

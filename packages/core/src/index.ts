@@ -206,6 +206,7 @@ export {
   parseBankCsv,
   matchBankTransactions,
 } from './bank.js';
+export { familyBaseOf, familySourceOf, nextFamilyNumber } from './family-numbers.js';
 export {
   type LinkEndpoint,
   type LinkKind,

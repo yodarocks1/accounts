@@ -9,6 +9,8 @@ import {
   buildReturnLine,
   computeDocumentLinks,
   computeFulfillment,
+  familySourceOf,
+  nextFamilyNumber,
   computeRateReview,
   computeRateSuggestions,
   computeStatement,
@@ -765,6 +767,25 @@ export class CompanyFile implements ItemCatalog {
     return { kind, prefix: row.prefix, next: Number(row.next), width: Number(row.width) };
   }
 
+  /**
+   * ADR 0022: a single-source document inherits its family's number with
+   * the next letter suffix; otherwise the type sequence is drawn.
+   */
+  private familyOrDrawnNumber(kind: SequenceKind, familySource: string | null): string {
+    if (familySource !== null) {
+      const source = this.db.prepare(`SELECT number FROM documents WHERE id = ?`).get(familySource) as
+        | { number: string }
+        | undefined;
+      if (source) {
+        const numbers = (this.db.prepare(`SELECT number FROM documents`).all() as { number: string }[]).map(
+          (row) => row.number,
+        );
+        return nextFamilyNumber(source.number, numbers);
+      }
+    }
+    return this.drawNumber(kind);
+  }
+
   /** Draw and consume the next number (call inside the insert transaction). */
   private drawNumber(kind: SequenceKind): string {
     const sequence = this.numberSequence(kind);
@@ -1314,7 +1335,7 @@ export class CompanyFile implements ItemCatalog {
     }
     const id = randomUUID();
     this.db.transaction(() => {
-      const number = input.number?.trim() ?? this.drawNumber(input.type);
+      const number = input.number?.trim() ?? this.familyOrDrawnNumber(input.type, familySourceOf(input.sourceDocumentId, lines));
       try {
         this.db
           .prepare(

@@ -104,10 +104,15 @@ describe('vendor bills persist (ADR 0012)', () => {
     void widget;
   });
 
-  it('bills draw from their own number sequence', () => {
-    const { po } = setUpPurchase();
+  it('a converted bill joins the PO family; an unlinked bill draws its sequence (ADR 0022)', () => {
+    const { po, supplier, widget } = setUpPurchase();
     file.setNumberSequence('bill', { prefix: 'BILL-', width: 3 });
     const bill = file.convertDocument(po.id, { type: 'bill', date: '2026-07-10' });
-    expect(bill.number).toBe('BILL-001');
+    expect(bill.number).toBe('PO-1b');
+    const standalone = file.createDocument({
+      type: 'bill', date: '2026-07-11', partyId: supplier.id,
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: 1000n, unitPrice: 900n }],
+    });
+    expect(standalone.number).toBe('BILL-001');
   });
 });

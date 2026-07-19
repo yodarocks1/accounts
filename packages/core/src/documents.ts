@@ -1,6 +1,7 @@
 import { randomUUID } from './ids.js';
 import { allocateProportional } from './allocation.js';
 import { computeDocumentLinks, type DocumentLinks } from './links.js';
+import { familySourceOf, nextFamilyNumber } from './family-numbers.js';
 import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
 import { divRoundHalf, PERCENT_SCALE, QUANTITY_SCALE } from './quantity.js';
@@ -1881,7 +1882,15 @@ export class DocumentBook implements ItemCatalog {
     if (input.type === 'purchase_order') {
       this.validatePurchaseLinks(lines);
     }
-    const number = input.number?.trim() ?? this.drawNumber(input.type);
+    // ADR 0022: a single-source document continues its family's numbering;
+    // multi-source or unlinked documents start fresh from the sequence.
+    const familySource = familySourceOf(input.sourceDocumentId, lines);
+    const familyRoot = familySource !== null ? this.documents.get(familySource) : undefined;
+    const number =
+      input.number?.trim() ??
+      (familyRoot !== undefined
+        ? nextFamilyNumber(familyRoot.number, [...this.documents.values()].map((record) => record.number))
+        : this.drawNumber(input.type));
     const numberKey = `${input.type}:${number}`;
     if (this.numbers.has(numberKey)) {
       throw new LedgerError('DUPLICATE_DOCUMENT_NUMBER', `Number already in use: ${number}`);

@@ -32,7 +32,7 @@ describe('auto-numbering (Tier 3)', () => {
     expect(formatSequenceNumber({ prefix: 'X-', width: 6 }, 42)).toBe('X-000042');
   });
 
-  it('no sequence and no number is an error; sequences flow through conversions and returns', () => {
+  it('no sequence and no number is an error; sequences number roots, families number members (ADR 0022)', () => {
     const { book, widget, lines } = setUp();
     expect(() =>
       book.createDocument({ type: 'estimate', date: '2026-07-01', ...acme, lines }),
@@ -40,19 +40,22 @@ describe('auto-numbering (Tier 3)', () => {
 
     book.setNumberSequence('estimate', { prefix: 'EST-' });
     book.setNumberSequence('sales_order', { prefix: 'SO-' });
-    book.setNumberSequence('credit_memo', { prefix: 'CR-' });
     book.setNumberSequence('invoice', { prefix: 'INV-' });
 
     const estimate = book.createDocument({ type: 'estimate', date: '2026-07-01', ...acme, lines });
     expect(estimate.number).toBe('EST-0001');
     book.sendDocument(estimate.id);
+    // Conversions continue the family, not the target type's sequence.
     const order = book.convertDocument(estimate.id, { type: 'sales_order', date: '2026-07-02' });
-    expect(order.number).toBe('SO-0001');
+    expect(order.number).toBe('EST-0001b');
 
+    // An unlinked document still draws from its own sequence…
     const invoice = book.createDocument({ type: 'invoice', date: '2026-07-01', ...acme, lines });
+    expect(invoice.number).toBe('INV-0001');
     book.sendDocument(invoice.id);
+    // …and a return linked to that one invoice joins its family.
     const credit = book.createReturn({ date: '2026-07-05', ...acme, items: [{ itemId: widget.id, quantityMilli: 1000n }] });
-    expect(credit.number).toBe('CR-0001');
+    expect(credit.number).toBe('INV-0001b');
   });
 
   it('rejects bad sequence parameters', () => {
