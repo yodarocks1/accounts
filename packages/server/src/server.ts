@@ -245,6 +245,7 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
   }
 
   if (head === 'parties') {
+    if (method === 'GET' && id === undefined) return file.listParties();
     if (method === 'POST' && id === undefined) {
       return file.createParty({
         name: str(body.name, 'name'),
@@ -316,6 +317,8 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
     if (method === 'GET' && sub === undefined) return file.viewDocument(id);
     if (method === 'GET' && sub === 'history') return file.documentHistory(id);
     if (method === 'GET' && sub === 'fulfillment') return file.fulfillment(id);
+    if (method === 'GET' && sub === 'links') return file.documentLinks(id);
+    if (method === 'GET' && sub === 'closures') return file.lineClosures(id);
     if (method === 'GET' && sub === 'suggestions') return file.suggestSpecialRates(id);
     if (method === 'GET' && sub === 'prepayments') return file.linePrepayments(id);
     if (method === 'POST' && sub === 'send') {

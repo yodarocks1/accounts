@@ -2,9 +2,9 @@
 
 This project was a spike for **manual writing and design**: every feature
 began as a written ADR, was implemented against that ADR, tested, and
-pushed before the next began. Twenty ADRs, twenty-one schema versions,
-six packages (plus a React web app), 294 tests, and one golden scenario
-later, these are the conclusions.
+pushed before the next began. Twenty-one ADRs, twenty-one schema
+versions, six packages (plus a React web app), 304 tests, and one golden
+scenario later, these are the conclusions.
 
 ## What worked — keep these
 
@@ -110,7 +110,13 @@ marks were derived internally but never exposed. The fix was six lines
 (`GET /bank/reconciliations`) *because* everything derives from
 append-only facts, but the lesson stands: every write path the API offers
 needs the read path a screen would ask for, and only building a screen
-reveals which are missing.
+reveals which are missing. The pattern repeated immediately: the links UI
+(ADR 0021) found the line-link graph itself unexposed (every consumer —
+fulfillment, coverage — answered a narrower question) and found no way to
+list parties for a supplier picker. Three screens, four holes, all
+additive and all cheap — the architecture keeps making these fixes small,
+but the count is the argument for building one screen per subsystem
+*during* API design, not after.
 
 ## Open gaps (recorded, not hidden)
 

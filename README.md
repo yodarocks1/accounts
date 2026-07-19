@@ -4,8 +4,8 @@ An open-source, moddable alternative to QuickBooks: a real double-entry
 ledger, local-first data you own, and a plugin system as the core
 architectural feature — *"the VS Code of accounting."*
 
-**Status: design spike, complete.** Twenty design-first features (ADRs
-0001–0020) implemented, tested, and shipped in sequence. The books run a
+**Status: design spike, complete.** Twenty-one design-first features
+(ADRs 0001–0021) implemented, tested, and shipped in sequence. The books run a
 real business end to end; a plugin extends the system through public API
 with zero core edits; a React UI consumes the same JSON API everything
 else uses. Read the record:
@@ -14,13 +14,13 @@ else uses. Read the record:
 |---|---|
 | **[docs/SPIKE-FINDINGS.md](docs/SPIKE-FINDINGS.md)** | The conclusions: what the manual-design method bought, what it cost, the verdict |
 | [docs/SPIKE.md](docs/SPIKE.md) | The plan the spike ran on: workstreams, cut lines, exit criteria |
-| [docs/adr/](docs/adr/README.md) | Twenty ADRs — every feature's design, written before its code |
+| [docs/adr/](docs/adr/README.md) | Twenty-one ADRs — every feature's design, written before its code |
 | [PLAN.md](PLAN.md) | The full product plan the spike was proving out |
 
 ## The five-minute tour
 
 ```sh
-pnpm install && pnpm build && pnpm test   # 294 tests, all green
+pnpm install && pnpm build && pnpm test   # 304 tests, all green
 ```
 
 **The golden scenario** is the demo: one business's story — plugin-quoted
@@ -81,9 +81,12 @@ events, and contributes a report — depending only on `@accounts/core`.
   hooks, and report contributions.
 - **Banking**: idempotent CSV import, suggestion-based reconciliation with
   reversal-only undo.
-- **Web UI**: React app over the JSON API — dashboard, document browsing,
-  interactive bank reconciliation — with `@accounts/core` running in the
-  browser so money stays bigint-exact end to end.
+- **Web UI**: React app over the JSON API — dashboard, document browsing
+  with the full link graph (upstream/downstream per line, family tree,
+  fulfillment, coverage, closures), link-creating flows (convert,
+  order-from-supplier, close line, send/void), and interactive bank
+  reconciliation — with `@accounts/core` running in the browser so money
+  stays bigint-exact end to end.
 
 ## Packages
 

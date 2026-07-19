@@ -98,6 +98,9 @@ export interface DocumentLineWire {
   unitPrice: string;
   adjustment: string;
   free: boolean;
+  substituted: boolean;
+  sourceDocumentId: string | null;
+  sourceLineId: string | null;
 }
 
 export interface DocumentWire {
@@ -105,6 +108,7 @@ export interface DocumentWire {
   type: string;
   number: string;
   status: string;
+  sourceDocumentId: string | null;
   label: string;
   currency: string;
   total: string;
@@ -125,6 +129,92 @@ export interface SettlementWire {
 export interface PluginsWire {
   plugins: { id: string; name: string; version: string }[];
   reports: string[];
+}
+
+export interface PartyWire {
+  id: string;
+  name: string;
+  accountNumber: string | null;
+  termsDays: number | null;
+  taxExempt: boolean;
+}
+
+export interface FulfillmentLineWire {
+  lineId: string;
+  description: string;
+  quantityMilli: string;
+  convertedMilli: string;
+  closedMilli: string;
+  openMilli: string;
+  status: 'open' | 'partial' | 'fulfilled' | 'closed';
+}
+
+export interface CoverageLineWire {
+  lineId: string;
+  description: string;
+  quantityMilli: string;
+  draftOrderedMilli: string;
+  sentOrderedMilli: string;
+  unorderedMilli: string;
+}
+
+export interface PrepaymentLineWire {
+  lineId: string;
+  description: string;
+  prepaid: string;
+  lineGross: string;
+}
+
+export interface ClosureWire {
+  closureSeq: number;
+  lineId: string;
+  kind: 'unfulfilled' | 'substituted';
+  quantityMilli: string;
+  reason: string | null;
+  at: string;
+}
+
+export interface ReadinessWire {
+  ready: boolean;
+  infoSeq: number | null;
+  shortfalls: { kind: string; itemId: string | null; message: string }[];
+}
+
+export type LinkKindWire = 'conversion' | 'cross';
+
+export interface LinkEndpointWire {
+  documentId: string;
+  type: string;
+  number: string;
+  label: string;
+  status: string;
+  lineId: string;
+  description: string;
+}
+
+export interface LineLinksWire {
+  lineId: string;
+  description: string;
+  quantityMilli: string;
+  upstream: (LinkEndpointWire & { kind: LinkKindWire }) | null;
+  downstream: (LinkEndpointWire & { kind: LinkKindWire; quantityMilli: string })[];
+}
+
+export interface DocumentLinksWire {
+  documentId: string;
+  lines: LineLinksWire[];
+  family: {
+    nodes: { documentId: string; type: string; number: string; label: string; status: string; date: string }[];
+    edges: {
+      from: string;
+      fromLineId: string | null;
+      to: string;
+      toLineId: string | null;
+      quantityMilli: string;
+      kind: LinkKindWire;
+      substituted: boolean;
+    }[];
+  };
 }
 
 export interface BankTransactionWire {

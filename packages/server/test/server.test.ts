@@ -405,6 +405,35 @@ describe('document API (Tier 3)', () => {
     expect(missing.headers.get('content-type')).toContain('application/json');
   });
 
+  it('links, closures, and the party list round-trip over HTTP (ADR 0021)', async () => {
+    const widget = (await post('/items', { name: 'Widget', currency: 'USD', unitPrice: '2500' })).json as { id: string };
+    await post('/parties', { name: 'Widgets Wholesale' });
+    const parties = (await get('/parties')).json as { name: string }[];
+    expect(parties.map((party) => party.name)).toEqual(['Widgets Wholesale']);
+
+    const order = (await post('/documents', {
+      type: 'sales_order', number: 'SO-1', date: '2026-07-01', customerName: 'Acme',
+      lines: [{ itemId: widget.id, description: 'Widget', quantityMilli: '10000', lineId: 'L1' }],
+    })).json as { id: string };
+    await post(`/documents/${order.id}/send`, {});
+    const invoice = (await post(`/documents/${order.id}/convert`, {
+      type: 'invoice', number: 'INV-1', date: '2026-07-02', lines: [{ sourceLineId: 'L1', quantityMilli: '4000' }],
+    })).json as { id: string };
+
+    const links = (await get(`/documents/${order.id}/links`)).json as {
+      lines: { downstream: { documentId: string; kind: string; quantityMilli: string }[] }[];
+      family: { nodes: unknown[]; edges: { kind: string }[] };
+    };
+    expect(links.lines[0]!.downstream).toEqual([
+      expect.objectContaining({ documentId: invoice.id, kind: 'conversion', quantityMilli: '4000' }),
+    ]);
+    expect(links.family.nodes).toHaveLength(2);
+
+    await post(`/documents/${order.id}/close-line`, { lineId: 'L1', kind: 'unfulfilled', quantityMilli: '2000', reason: 'short' });
+    const closures = (await get(`/documents/${order.id}/closures`)).json as { kind: string; reason: string }[];
+    expect(closures).toEqual([expect.objectContaining({ kind: 'unfulfilled', reason: 'short' })]);
+  });
+
   it('the same API answers under /api — one prefix for dev proxies (ADR 0020)', async () => {
     expect((await get('/api/company')).json).toEqual({ name: 'API Co', baseCurrency: 'USD' });
     const item = (await post('/api/items', { name: 'W', currency: 'USD', unitPrice: '100' })).json as { id: string };

@@ -84,6 +84,18 @@ runs out, WS3 drops entirely — it exercises no novel design.
 **Cut line:** document editing forms — blocked on findings #5 (positional
 line matching) by design, and recorded as such.
 
+### WS6 — Document links (ADR 0021) · *the graph made visible*
+- `computeDocumentLinks` in core: per-line upstream/downstream plus the
+  whole connected family, void documents visible and labeled.
+- New reads the UI demanded: `GET /documents/:id/links`, `/closures`,
+  `GET /parties`.
+- The UI shows every link fact (links, fulfillment, coverage,
+  prepayments, closures, readiness, family) and creates every safe link:
+  convert with explicit line ids, order-from-supplier cross-links, close
+  line, send/void with overrides.
+**Cut line:** unchanged from WS5 — no revision editing; links are created
+with lines, never mutated onto them.
+
 ### WS4 — Golden scenario + findings · *the spike's actual deliverables*
 - One narrative end-to-end test telling a full business story across every
   subsystem (quote→order→deposit→PO→receipt→bill→invoice→payment→return→

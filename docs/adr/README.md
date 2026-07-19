@@ -28,6 +28,7 @@ and why.
 | [0018](0018-plugin-host.md) | Plugin host v1: connectors, isolated hooks, report contributions — the thesis, demonstrated |
 | [0019](0019-bank-import.md) | Bank import & reconciliation: idempotent facts, pure suggestions, reversal-only marks |
 | [0020](0020-web-ui.md) | React web UI: core in the browser, bigint-exact wire edge, `/api` alias + `/app` hosting |
+| [0021](0021-document-links.md) | The link graph as a first-class read; UI shows every link fact and creates every safe link |
 
 Recurring patterns worth noticing across the set: **append-only facts with
 derived views** (0003, 0004, 0014, 0019), **snapshot-at-write so history

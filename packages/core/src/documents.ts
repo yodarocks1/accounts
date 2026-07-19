@@ -1,5 +1,6 @@
 import { randomUUID } from './ids.js';
 import { allocateProportional } from './allocation.js';
+import { computeDocumentLinks, type DocumentLinks } from './links.js';
 import { LedgerError } from './errors.js';
 import { currencyExponent } from './money.js';
 import { divRoundHalf, PERCENT_SCALE, QUANTITY_SCALE } from './quantity.js';
@@ -1462,6 +1463,11 @@ export class DocumentBook implements ItemCatalog {
     return this.parties.get(id);
   }
 
+  /** All parties, name order — the supplier/customer picker's read (ADR 0021). */
+  listParties(): Party[] {
+    return [...this.parties.values()].sort((a, b) => (a.name < b.name ? -1 : 1));
+  }
+
   partyNameHistory(id: string): readonly PartyName[] {
     return this.partyNames.get(id) ?? [];
   }
@@ -2478,6 +2484,11 @@ export class DocumentBook implements ItemCatalog {
 
   lineClosures(documentId: string): readonly LineClosure[] {
     return this.closures.get(documentId) ?? [];
+  }
+
+  /** The link graph around one document (ADR 0021). */
+  documentLinks(id: string): DocumentLinks {
+    return computeDocumentLinks(this.listDocuments(), id);
   }
 
   sendDocument(

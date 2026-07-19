@@ -55,3 +55,14 @@ button:hover { background: #f0f0f0; }
 textarea, input, select { font: inherit; padding: 0.3rem 0.5rem; border: 1px solid #ccc; border-radius: 0.4rem; }
 textarea { width: 100%; font-family: ui-monospace, monospace; }
 .row { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
+button.chip {
+  border: 1px solid #ccc;
+  border-radius: 1rem;
+  padding: 0.1rem 0.6rem;
+  font-size: 0.85rem;
+  margin: 0.1rem 0.25rem 0.1rem 0;
+  background: #f7f7f7;
+}
+button.chip.here { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+button.chip.void { text-decoration: line-through; color: #999; }
+h3 { margin-top: 1.5rem; }

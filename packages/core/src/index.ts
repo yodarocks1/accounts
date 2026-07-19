@@ -207,6 +207,15 @@ export {
   matchBankTransactions,
 } from './bank.js';
 export {
+  type LinkEndpoint,
+  type LinkKind,
+  type DocumentLinkEdge,
+  type LineLinks,
+  type FamilyNode,
+  type DocumentLinks,
+  computeDocumentLinks,
+} from './links.js';
+export {
   type PluginManifest,
   type DocumentEvent,
   type SupplierQuote,

@@ -7,6 +7,7 @@ import {
   appliedToInvoice,
   buildConversionLines,
   buildReturnLine,
+  computeDocumentLinks,
   computeFulfillment,
   computeRateReview,
   computeRateSuggestions,
@@ -54,6 +55,7 @@ import {
   type DocumentRecord,
   type DocumentRevision,
   type DocumentTag,
+  type DocumentLinks,
   type DocumentType,
   type DocumentView,
   type Item,
@@ -542,6 +544,25 @@ export class CompanyFile implements ItemCatalog {
       taxExempt: row.taxExempt === 1n,
       createdAt: row.createdAt,
     };
+  }
+
+  /** All parties, name order — the supplier/customer picker's read (ADR 0021). */
+  listParties(): Party[] {
+    const rows = this.db
+      .prepare(
+        `SELECT p.id, p.account_number AS accountNumber, p.terms_days AS termsDays, p.tax_exempt AS taxExempt, p.created_at AS createdAt,
+                (SELECT name FROM party_names WHERE party_id = p.id ORDER BY name_seq DESC LIMIT 1) AS name
+         FROM parties p ORDER BY name`,
+      )
+      .all() as { id: string; accountNumber: string | null; termsDays: bigint | null; taxExempt: bigint; createdAt: string; name: string }[];
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      accountNumber: row.accountNumber,
+      termsDays: row.termsDays === null ? null : Number(row.termsDays),
+      taxExempt: row.taxExempt === 1n,
+      createdAt: row.createdAt,
+    }));
   }
 
   partyNameHistory(id: string): PartyName[] {
@@ -1698,6 +1719,11 @@ export class CompanyFile implements ItemCatalog {
       .all(documentId) as { lineId: string; converted: bigint }[];
     const converted = new Map(rows.map((row) => [row.lineId, row.converted]));
     return computeFulfillment(document, converted, this.lineClosures(documentId));
+  }
+
+  /** The link graph around one document (ADR 0021); shared with the core engine. */
+  documentLinks(id: string): DocumentLinks {
+    return computeDocumentLinks(this.listDocuments(), id);
   }
 
   lineClosures(documentId: string): LineClosure[] {
