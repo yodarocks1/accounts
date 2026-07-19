@@ -3,7 +3,7 @@
 This project was a spike for **manual writing and design**: every feature
 began as a written ADR, was implemented against that ADR, tested, and
 pushed before the next began. Twenty-one ADRs, twenty-one schema
-versions, six packages (plus a React web app), 304 tests, and one golden
+versions, six packages (plus a React web app), 305 tests, and one golden
 scenario later, these are the conclusions.
 
 ## What worked — keep these

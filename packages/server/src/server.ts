@@ -130,24 +130,40 @@ function mapCashTransaction(body: Body): Record<string, unknown> {
   };
 }
 
+/**
+ * Error → HTTP status policy: UNKNOWN_* is 404 (the noun doesn't exist),
+ * APPROVAL_REQUIRED is 403 (the request is fine, you aren't), state
+ * conflicts are 409 (the request is well-formed but the books disagree),
+ * and anything else — a malformed request — defaults to 422.
+ */
 const STATUS_BY_CODE: Partial<Record<LedgerErrorCode, number>> = {
   UNKNOWN_ACCOUNT: 404,
   UNKNOWN_ENTRY: 404,
   UNKNOWN_ITEM: 404,
   UNKNOWN_DOCUMENT: 404,
+  UNKNOWN_PARTY: 404,
   UNKNOWN_LINE: 404,
   UNKNOWN_TAX_CODE: 404,
+  UNKNOWN_REPORT: 404,
+  APPROVAL_REQUIRED: 403,
   DUPLICATE_ACCOUNT_CODE: 409,
   DUPLICATE_DOCUMENT_NUMBER: 409,
   ALREADY_REVERSED: 409,
-  APPROVAL_REQUIRED: 403,
-  PLUGIN_ERROR: 409,
   ALREADY_RECONCILED: 409,
-  UNKNOWN_REPORT: 404,
+  DOCUMENT_LOCKED: 409,
+  ARCHIVED_ACCOUNT: 409,
+  INVALID_STATUS: 409,
+  INVALID_CONVERSION: 409,
+  LINE_OVERDRAWN: 409,
+  LINE_LINKED: 409,
+  NO_PURCHASE_HISTORY: 409,
+  RETURN_EXCEEDS_PURCHASE: 409,
+  RETURN_WINDOW: 409,
   DEPOSIT_REQUIRED: 409,
   MINIMUM_NOT_MET: 409,
   INSUFFICIENT_STOCK: 409,
   BOM_CYCLE: 409,
+  PLUGIN_ERROR: 409,
 };
 
 async function readBody(request: IncomingMessage): Promise<Body> {
@@ -162,10 +178,100 @@ async function readBody(request: IncomingMessage): Promise<Body> {
   }
 }
 
+/**
+ * The API's self-description, served at GET /api. Hand-maintained beside
+ * the routes it describes — a discoverability read, not an OpenAPI spec
+ * (that generation belongs to the real project; see docs/ROADMAP.md).
+ */
+const ROUTE_CATALOG: readonly { method: string; path: string; summary: string }[] = [
+  { method: 'GET', path: '/company', summary: 'Company name and base currency' },
+  { method: 'GET', path: '/items', summary: 'List items' },
+  { method: 'POST', path: '/items', summary: 'Create an item' },
+  { method: 'GET', path: '/items/:id/stock', summary: 'On-hand good/damaged quantities (?asOf)' },
+  { method: 'POST', path: '/items/:id/stock', summary: 'Set the in-stock flag' },
+  { method: 'GET', path: '/items/:id/movements', summary: 'The append-only stock ledger' },
+  { method: 'GET', path: '/items/:id/valuation', summary: 'FIFO layers and value (?asOf)' },
+  { method: 'POST', path: '/items/:id/stock-adjustments', summary: 'Signed count adjustment' },
+  { method: 'POST', path: '/items/:id/damage', summary: 'Move good stock to damaged' },
+  { method: 'POST', path: '/items/:id/dispose', summary: 'Resolve damaged stock (restock/recycle/trash)' },
+  { method: 'POST', path: '/items/:id/build', summary: 'Build assemblies from BOM components' },
+  { method: 'POST', path: '/items/:id/break', summary: 'Break assemblies back into components' },
+  { method: 'GET', path: '/items/:id/bom', summary: 'Bill of materials (?asOf)' },
+  { method: 'POST', path: '/items/:id/bom', summary: 'Set the bill of materials' },
+  { method: 'POST', path: '/items/:id/prices', summary: 'Price/cost effective from a date' },
+  { method: 'GET', path: '/parties', summary: 'List parties' },
+  { method: 'POST', path: '/parties', summary: 'Create a party' },
+  { method: 'GET', path: '/parties/:id', summary: 'One party' },
+  { method: 'GET', path: '/parties/:id/names', summary: 'Rename history' },
+  { method: 'POST', path: '/parties/:id/rename', summary: 'Rename (history kept)' },
+  { method: 'GET', path: '/parties/:id/supplier-info', summary: 'Effective supplier terms (?asOf)' },
+  { method: 'POST', path: '/parties/:id/supplier-info', summary: 'Record supplier terms snapshot' },
+  { method: 'GET', path: '/parties/:id/supplier-info-history', summary: 'All supplier-info snapshots' },
+  { method: 'POST', path: '/parties/:id/refresh-supplier-info', summary: 'Pull terms via the plugin connector' },
+  { method: 'GET', path: '/tax-rates', summary: 'List tax rates' },
+  { method: 'POST', path: '/tax-rates', summary: 'Set a tax rate effective from a date' },
+  { method: 'POST', path: '/sequences/:type', summary: 'Configure auto-numbering' },
+  { method: 'GET', path: '/documents', summary: 'List documents (?type)' },
+  { method: 'POST', path: '/documents', summary: 'Create a document (draft)' },
+  { method: 'GET', path: '/documents/:id', summary: 'Current view of one document' },
+  { method: 'GET', path: '/documents/:id/history', summary: 'Every revision' },
+  { method: 'GET', path: '/documents/:id/links', summary: 'Line links + the whole family graph' },
+  { method: 'GET', path: '/documents/:id/fulfillment', summary: 'Per-line open/converted/closed' },
+  { method: 'GET', path: '/documents/:id/closures', summary: 'Lines closed short' },
+  { method: 'GET', path: '/documents/:id/suggestions', summary: 'Special-rate suggestions' },
+  { method: 'GET', path: '/documents/:id/prepayments', summary: 'Per-line prepaid amounts' },
+  { method: 'GET', path: '/documents/:id/readiness', summary: 'PO readiness vs supplier terms' },
+  { method: 'GET', path: '/documents/:id/purchase-coverage', summary: 'SO lines on order with suppliers' },
+  { method: 'GET', path: '/documents/:id/settlement', summary: 'Paid/open for an owing document' },
+  { method: 'GET', path: '/documents/:id/deposit', summary: 'Deposit currently held' },
+  { method: 'POST', path: '/documents/:id/send', summary: 'Send (gates: deposit, supplier minimums)' },
+  { method: 'POST', path: '/documents/:id/submit', summary: 'Send a PO and deliver via its connector' },
+  { method: 'POST', path: '/documents/:id/void', summary: 'Void (stock and postings unwind)' },
+  { method: 'POST', path: '/documents/:id/change', summary: 'Append a revision (edit/correction/substitution)' },
+  { method: 'POST', path: '/documents/:id/convert', summary: 'Convert with explicit source line ids' },
+  { method: 'POST', path: '/documents/:id/charge-correction', summary: 'Reduce the charged total' },
+  { method: 'POST', path: '/documents/:id/close-line', summary: 'Close an open quantity short' },
+  { method: 'POST', path: '/returns', summary: 'Return priced at last purchase, linked' },
+  { method: 'GET', path: '/payments', summary: 'List payments' },
+  { method: 'POST', path: '/payments', summary: 'Record a payment (in/out) with applications' },
+  { method: 'POST', path: '/payments/:id/void', summary: 'Void a payment' },
+  { method: 'POST', path: '/refunds', summary: 'Refund unapplied credit' },
+  { method: 'POST', path: '/sales-receipts', summary: 'Cash sale: invoice + payment atomically' },
+  { method: 'POST', path: '/expenses', summary: 'Cash expense: bill + payment atomically' },
+  { method: 'GET', path: '/applications', summary: 'List credit applications' },
+  { method: 'POST', path: '/applications', summary: 'Apply credit to an owing document' },
+  { method: 'POST', path: '/applications/:seq/reverse', summary: 'Reverse an application' },
+  { method: 'GET', path: '/statements', summary: 'Customer statement (?partyId|customerName|accountNumber, ?asOf)' },
+  { method: 'GET', path: '/supplier-statements', summary: 'Supplier statement (same selectors)' },
+  { method: 'POST', path: '/bank/import', summary: 'Import a CSV export (idempotent)' },
+  { method: 'GET', path: '/bank/transactions', summary: 'Imported bank lines (?source)' },
+  { method: 'GET', path: '/bank/suggestions', summary: 'Ranked match suggestions (?source, ?windowDays)' },
+  { method: 'GET', path: '/bank/reconciliations', summary: 'Active reconciliation marks' },
+  { method: 'POST', path: '/bank/reconcile', summary: 'Confirm a match' },
+  { method: 'POST', path: '/bank/reconcile/:seq/reverse', summary: 'Undo a reconciliation' },
+  { method: 'GET', path: '/plugins', summary: 'Attached plugins and their reports' },
+  { method: 'GET', path: '/reports/pnl', summary: 'Profit & loss (?from, ?to)' },
+  { method: 'GET', path: '/reports/balance-sheet', summary: 'Balance sheet (?asOf)' },
+  { method: 'GET', path: '/reports/ar-aging', summary: 'A/R aging (?asOf)' },
+  { method: 'GET', path: '/reports/ap-aging', summary: 'A/P aging (?asOf)' },
+  { method: 'GET', path: '/reports/inventory', summary: 'Inventory valuation (?asOf)' },
+  { method: 'GET', path: '/reports/:plugin-report', summary: 'Plugin report contributions' },
+  { method: 'GET', path: '/rate-review', summary: 'Customer rates due for review (?asOf)' },
+  { method: 'GET', path: '/trial-balance', summary: 'Trial balance (?asOf)' },
+  { method: 'POST', path: '/posting-accounts/:role', summary: 'Map a ledger role to an account' },
+  { method: 'POST', path: '/policies/approval', summary: 'Gate actions behind approval' },
+  { method: 'POST', path: '/policies/return', summary: 'Return window and restocking fees' },
+];
+
 /** Route the request; returns the response payload or undefined for 404. */
 async function route(file: CompanyFile, method: string, segments: string[], query: URLSearchParams, body: Body): Promise<unknown> {
   const [head, id, sub] = segments;
   const asOf = query.get('asOf') ?? new Date().toISOString().slice(0, 10);
+
+  // GET /api with no further path: the API describes itself.
+  if (head === undefined && method === 'GET') {
+    return { service: 'accounts-api', routes: ROUTE_CATALOG };
+  }
 
   if (head === 'company' && method === 'GET') return file.info();
 
@@ -254,7 +360,11 @@ async function route(file: CompanyFile, method: string, segments: string[], quer
         ...(body.taxExempt !== undefined ? { taxExempt: Boolean(body.taxExempt) } : {}),
       });
     }
-    if (method === 'GET' && id !== undefined && sub === undefined) return file.getParty(id);
+    if (method === 'GET' && id !== undefined && sub === undefined) {
+      const party = file.getParty(id);
+      if (!party) throw new LedgerError('UNKNOWN_PARTY', `No such party: ${id}`);
+      return party;
+    }
     if (method === 'GET' && id !== undefined && sub === 'names') return file.partyNameHistory(id);
     if (method === 'POST' && id !== undefined && sub === 'rename') return file.renameParty(id, str(body.name, 'name'));
     if (method === 'POST' && id !== undefined && sub === 'supplier-info') {

@@ -582,7 +582,7 @@ export class CompanyFile implements ItemCatalog {
   private requireParty(id: string): Party {
     const party = this.getParty(id);
     if (!party) {
-      throw new LedgerError('UNKNOWN_DOCUMENT', `No such party: ${id}`);
+      throw new LedgerError('UNKNOWN_PARTY', `No such party: ${id}`);
     }
     return party;
   }

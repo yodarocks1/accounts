@@ -434,6 +434,30 @@ describe('document API (Tier 3)', () => {
     expect(closures).toEqual([expect.objectContaining({ kind: 'unfulfilled', reason: 'short' })]);
   });
 
+  it('GET /api is a route catalog; wrong nouns 404 with precise codes', async () => {
+    const catalog = (await get('/api')).json as { service: string; routes: { method: string; path: string; summary: string }[] };
+    expect(catalog.service).toBe('accounts-api');
+    expect(catalog.routes.length).toBeGreaterThan(70);
+    expect(catalog.routes).toContainEqual(
+      expect.objectContaining({ method: 'GET', path: '/documents/:id/links' }),
+    );
+    // Every catalog entry names a method and a path; summaries are for humans.
+    for (const entry of catalog.routes) {
+      expect(['GET', 'POST']).toContain(entry.method);
+      expect(entry.path.startsWith('/')).toBe(true);
+    }
+    // A missing party is UNKNOWN_PARTY 404 — not a mislabeled document.
+    const missingParty = await get('/parties/nope');
+    expect(missingParty.status).toBe(404);
+    expect((missingParty.json as { error: string }).error).toBe('UNKNOWN_PARTY');
+    const badRef = await post('/documents', {
+      type: 'invoice', date: '2026-07-01', partyId: 'nope',
+      lines: [{ description: 'x', quantityMilli: '1000', unitPrice: '100', currency: 'USD' }],
+    });
+    expect(badRef.status).toBe(404);
+    expect(badRef.json.error).toBe('UNKNOWN_PARTY');
+  });
+
   it('the same API answers under /api — one prefix for dev proxies (ADR 0020)', async () => {
     expect((await get('/api/company')).json).toEqual({ name: 'API Co', baseCurrency: 'USD' });
     const item = (await post('/api/items', { name: 'W', currency: 'USD', unitPrice: '100' })).json as { id: string };

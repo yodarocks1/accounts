@@ -14,6 +14,11 @@ export default tseslint.config(
     },
   },
   {
+    // Runnable examples are Node scripts.
+    files: ['examples/**/*.mjs'],
+    languageOptions: { globals: { console: 'readonly', process: 'readonly' } },
+  },
+  {
     // Financial code paths: money is bigint minor units. Floating-point
     // construction and float literals are banned outright (PLAN.md §3.4).
     files: ['packages/core/src/**/*.ts', 'packages/storage/src/**/*.ts'],

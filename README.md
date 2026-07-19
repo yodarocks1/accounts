@@ -15,12 +15,13 @@ else uses. Read the record:
 | **[docs/SPIKE-FINDINGS.md](docs/SPIKE-FINDINGS.md)** | The conclusions: what the manual-design method bought, what it cost, the verdict |
 | [docs/SPIKE.md](docs/SPIKE.md) | The plan the spike ran on: workstreams, cut lines, exit criteria |
 | [docs/adr/](docs/adr/README.md) | Twenty-one ADRs — every feature's design, written before its code |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | What's necessary next — every entry traced to spike evidence |
 | [PLAN.md](PLAN.md) | The full product plan the spike was proving out |
 
 ## The five-minute tour
 
 ```sh
-pnpm install && pnpm build && pnpm test   # 304 tests, all green
+pnpm install && pnpm build && pnpm test   # 305 tests, all green
 ```
 
 **The golden scenario** is the demo: one business's story — plugin-quoted
@@ -46,14 +47,35 @@ node $CLI report pnl books.sqlite --from 2026-07-01 --to 2026-07-31
 node $CLI report balance-sheet books.sqlite
 ```
 
-**The web UI**, on the same books:
+## See the end product
 
 ```sh
-node $CLI serve books.sqlite --port 3000 --web packages/web/dist
-# http://127.0.0.1:3000/app  — React app (dashboard, documents, bank reconciliation)
-# http://127.0.0.1:3000/     — zero-dependency server-rendered dashboard
-# http://127.0.0.1:3000/api  — the JSON API both of them read
+pnpm install && pnpm build   # once
+pnpm demo                    # seeds demo.sqlite (first run only), then serves it
 ```
+
+Open **http://127.0.0.1:3000/app** and try, in order:
+
+1. **Dashboard** — the BALANCED badge is computed, not decorative; below
+   it: P&L, balance sheet, A/R + A/P aging, and FIFO inventory from one
+   seeded month of business.
+2. **Documents → SO-0001** — the links panel: the sales order's family
+   (EST-0001 → SO-0001 → INV-0001, plus a cross-linked purchase order),
+   per-line upstream/downstream chips, fulfillment (6 of 10 widgets
+   billed), and purchase coverage. Click **Convert…** to invoice the open
+   4, or **Order from supplier…** to cross-link a new PO.
+3. **Documents → PO-0002** — a draft purchase order linked to the sales
+   order's open lines. Click **Send** and watch readiness gate against
+   the supplier's 50.00 minimum (override checkbox provided).
+4. **Bank** — three imported lines match recorded payments at day-offset
+   zero; click **Reconcile** on each. The 12.00 SERVICE FEE finds no
+   match — that's the system being honest, not broken.
+5. **http://127.0.0.1:3000/** — the zero-dependency server-rendered
+   dashboard; **http://127.0.0.1:3000/api** — the API's own route
+   catalog (77 routes, self-described).
+
+Delete `demo.sqlite` to reseed from scratch. To serve your own books:
+`node packages/cli/dist/main.js serve books.sqlite --port 3000 --web packages/web/dist`.
 
 **The plugin thesis**, demonstrated: [plugins/demo-supplier](plugins/demo-supplier/README.md)
 quotes supplier costs and terms, submits purchase orders, observes document
